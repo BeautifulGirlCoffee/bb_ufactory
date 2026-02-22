@@ -13,7 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # BB.Ufactory
 
-BB integration for UFactory xArm robotic arms (xArm5, xArm6, xArm7, Lite6, xArm850).
+BB integration for UFactory xArm robotic arms.
 
 This library provides controller, actuator, and sensor modules for integrating UFactory
 xArm arms with the Beam Bots robotics framework. The arm is commanded over two TCP
@@ -33,8 +33,11 @@ a real-time report socket (port 30003) that pushes joint state at ~100Hz.
 
 ## Supported Arms
 
-- xArm5 (5 joints)
 - xArm6 (6 joints)
+
+## Support Coming Soon
+
+- xArm5 (5 joints)
 - xArm7 (7 joints)
 - Lite6 (6 joints)
 - xArm850 (6 joints)
@@ -54,7 +57,7 @@ end
 ## Requirements
 
 - UFactory xArm arm connected via Ethernet
-- BB framework (`~> 0.13`)
+- BB framework (`~> 0.15`)
 
 ## Usage
 

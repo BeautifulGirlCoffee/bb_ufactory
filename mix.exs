@@ -24,7 +24,14 @@ defmodule BB.Ufactory.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       package: package(),
       start_permanent: Mix.env() == :prod,
+      test_coverage: [tool: ExCoveralls],
       version: @version
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [coveralls: :test, "coveralls.detail": :test, "coveralls.html": :test]
     ]
   end
 
@@ -72,6 +79,7 @@ defmodule BB.Ufactory.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:doctor, "~> 0.22", only: [:dev, :test], runtime: false},
       {:ex_check, "~> 0.16", only: [:dev, :test], runtime: false},
+      {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:git_ops, "~> 2.9", only: [:dev, :test], runtime: false},
       {:igniter, "~> 0.7", only: [:dev, :test], runtime: false},

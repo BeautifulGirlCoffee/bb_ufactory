@@ -5,6 +5,7 @@
 [
   tools: [
     {:credo, "mix credo --strict"},
+    {:excoveralls, "mix coveralls"},
     {:reuse, command: ["pipx", "run", "reuse", "lint", "-q"]}
   ]
 ]
