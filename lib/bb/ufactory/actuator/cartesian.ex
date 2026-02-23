@@ -63,12 +63,19 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     speed = Keyword.get(opts, :speed, 100.0)
     acceleration = Keyword.get(opts, :acceleration, 2000.0)
 
+    ets =
+      case BB.Process.call(bb.robot, controller, :get_ets) do
+        ref when is_reference(ref) or is_atom(ref) -> ref
+        _ -> nil
+      end
+
     {:ok,
      %{
        bb: bb,
        controller: controller,
        speed: speed * 1.0,
-       acceleration: acceleration * 1.0
+       acceleration: acceleration * 1.0,
+       ets: ets
      }}
   end
 
@@ -108,9 +115,11 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   defp publish_begin_motion({x, y, z, _roll, _pitch, _yaw}, state) do
     actuator_name = List.last(state.bb.path)
-    # Use Euclidean distance (mm) as a travel proxy for expected_arrival estimation.
-    # The arm's motion planner may deviate from this, but it gives a reasonable upper bound.
-    distance_mm = :math.sqrt(x * x + y * y + z * z)
+    {cx, cy, cz} = current_position(state)
+    dx = x - cx
+    dy = y - cy
+    dz = z - cz
+    distance_mm = :math.sqrt(dx * dx + dy * dy + dz * dz)
     travel_ms = round(distance_mm / max(state.speed, 0.001) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
@@ -129,4 +138,15 @@ defmodule BB.Ufactory.Actuator.Cartesian do
         )
     end
   end
+
+  defp current_position(%{ets: ets}) when not is_nil(ets) do
+    case :ets.lookup(ets, :arm) do
+      [{:arm, _state, _mode, {x, y, z, _roll, _pitch, _yaw}}] -> {x, y, z}
+      _ -> {0.0, 0.0, 0.0}
+    end
+  rescue
+    ArgumentError -> {0.0, 0.0, 0.0}
+  end
+
+  defp current_position(_state), do: {0.0, 0.0, 0.0}
 end

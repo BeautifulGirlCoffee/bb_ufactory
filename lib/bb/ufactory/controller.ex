@@ -232,6 +232,7 @@ defmodule BB.Ufactory.Controller do
         bb: bb,
         host: host,
         port: port,
+        report_port: report_port,
         model_config: model_config,
         controller_name: controller_name,
         loop_interval_ms: loop_interval_ms,
@@ -244,6 +245,7 @@ defmodule BB.Ufactory.Controller do
         txn_id: 0,
         last_error_code: 0,
         last_arm_status: nil,
+        reconnect_attempts: 0,
         # Hardware config opts — read once during apply_hardware_config/1
         tcp_offset: Keyword.get(opts, :tcp_offset),
         tcp_load: Keyword.get(opts, :tcp_load),
@@ -285,7 +287,8 @@ defmodule BB.Ufactory.Controller do
 
   def handle_info({:tcp_closed, _socket}, state) do
     Logger.warning("[BB.Ufactory.Controller] Report socket closed for #{state.controller_name}")
-    {:noreply, %{state | report_socket: nil}}
+    Process.send_after(self(), :reconnect_report, 1_000)
+    {:noreply, %{state | report_socket: nil, reconnect_attempts: 0}}
   end
 
   def handle_info({:tcp_error, _socket, reason}, state) do
@@ -293,8 +296,35 @@ defmodule BB.Ufactory.Controller do
       "[BB.Ufactory.Controller] Report socket error for #{state.controller_name}: #{inspect(reason)}"
     )
 
-    {:noreply, %{state | report_socket: nil}}
+    Process.send_after(self(), :reconnect_report, 1_000)
+    {:noreply, %{state | report_socket: nil, reconnect_attempts: 0}}
   end
+
+  def handle_info(:reconnect_report, %{report_socket: nil} = state) do
+    host = String.to_charlist(state.host)
+
+    case :gen_tcp.connect(host, state.report_port, [:binary, active: true, packet: :raw], 2_000) do
+      {:ok, socket} ->
+        Logger.info(
+          "[BB.Ufactory.Controller] Report socket reconnected for #{state.controller_name}"
+        )
+
+        {:noreply, %{state | report_socket: socket, buffer: <<>>, reconnect_attempts: 0}}
+
+      {:error, reason} ->
+        attempts = state.reconnect_attempts + 1
+        delay = min(30_000, 1_000 * trunc(:math.pow(2, attempts)))
+
+        Logger.warning(
+          "[BB.Ufactory.Controller] Report reconnect failed for #{state.controller_name}: #{inspect(reason)}, retrying in #{delay}ms"
+        )
+
+        Process.send_after(self(), :reconnect_report, delay)
+        {:noreply, %{state | reconnect_attempts: attempts}}
+    end
+  end
+
+  def handle_info(:reconnect_report, state), do: {:noreply, state}
 
   # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
@@ -308,6 +338,8 @@ defmodule BB.Ufactory.Controller do
           "[BB.Ufactory.Controller] Heartbeat send failed for #{state.controller_name}: #{inspect(reason)}"
         )
     end
+
+    state = poll_error_code(state)
 
     Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
     {:noreply, state}
@@ -652,6 +684,23 @@ defmodule BB.Ufactory.Controller do
       %{state | last_arm_status: current}
     else
       state
+    end
+  end
+
+  # Polls register 0x0F (GET_ERROR) on the command socket. Port 30003 real-time
+  # reports never include error_code, so this is the only way to detect hardware
+  # faults without connecting to port 30001.
+  defp poll_error_code(state) do
+    frame = Protocol.cmd_get_error(state.txn_id)
+
+    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
+         {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, 500),
+         {:ok, {_register, _status, <<error_code::8, _rest::binary>>}, _tail} <-
+           Protocol.parse_response(data) do
+      state = %{state | txn_id: next_txn(state.txn_id)}
+      maybe_report_error(%{error_code: error_code}, state)
+    else
+      _ -> %{state | txn_id: next_txn(state.txn_id)}
     end
   end
 

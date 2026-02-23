@@ -23,10 +23,9 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
   ## Disarm
 
-  On disarm, the actuator opens a **fresh** TCP connection directly to the arm
-  and sends `cmd_gripper_enable(false)`. This mirrors the controller's own
-  `disarm/1` pattern so gripper release is reliable even if the controller
-  GenServer has crashed.
+  On disarm, the actuator sends `cmd_gripper_enable(false)` through the
+  controller via `BB.Process.call/3`, avoiding the need for `host`/`port`
+  in the actuator's init opts.
   """
 
   use BB.Actuator,
@@ -70,26 +69,31 @@ defmodule BB.Ufactory.Actuator.Gripper do
         )
     end
 
+    speed_frame = Protocol.cmd_gripper_speed(0, speed)
+
+    case BB.Process.call(bb.robot, controller, {:send_command, speed_frame}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Actuator.Gripper] gripper_speed(#{speed}) failed: #{inspect(reason)}"
+        )
+    end
+
     {:ok, %{bb: bb, controller: controller, speed: speed}}
   end
 
-  # ── disarm/1 — fresh TCP connection to release gripper ──────────────────────
+  # ── disarm/1 — disable gripper via controller ───────────────────────────────
 
   @impl BB.Actuator
   def disarm(opts) do
-    host = Keyword.fetch!(opts, :host)
-    port = Keyword.get(opts, :port, 502)
+    bb = Keyword.fetch!(opts, :bb)
+    controller = Keyword.fetch!(opts, :controller)
+    frame = Protocol.cmd_gripper_enable(0, false)
 
     try do
-      case :gen_tcp.connect(String.to_charlist(host), port, [:binary, active: false], 2_000) do
-        {:ok, sock} ->
-          frame = Protocol.cmd_gripper_enable(0, false)
-          :gen_tcp.send(sock, frame)
-          :gen_tcp.close(sock)
-
-        {:error, _reason} ->
-          :ok
-      end
+      BB.Process.call(bb.robot, controller, {:send_command, frame})
     catch
       _, _ -> :ok
     end

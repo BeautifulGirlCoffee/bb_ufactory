@@ -14,18 +14,32 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
   alias BB.Ufactory.Protocol
 
   defp make_state(opts \\ []) do
+    ets = Keyword.get_lazy(opts, :ets, fn -> make_ets() end)
+
     %{
       bb: %{robot: TestRobot, path: [:cartesian]},
       controller: :xarm,
       speed: Keyword.get(opts, :speed, 100.0),
-      acceleration: Keyword.get(opts, :acceleration, 2000.0)
+      acceleration: Keyword.get(opts, :acceleration, 2000.0),
+      ets: ets
     }
+  end
+
+  defp make_ets(pose \\ nil) do
+    ets = :ets.new(:test_cartesian_ets, [:public, :set])
+    :ets.insert(ets, {:arm, 0, 0, pose})
+    ets
   end
 
   # ── init/1 ───────────────────────────────────────────────────────────────────
 
   describe "init/1" do
-    test "stores bb, controller, speed, and acceleration in state" do
+    test "stores bb, controller, speed, acceleration, and ets in state" do
+      ets = make_ets()
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, :get_ets -> ets end)
+
       opts = [
         bb: %{robot: TestRobot, path: [:cartesian]},
         controller: :xarm,
@@ -38,9 +52,13 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       assert state.controller == :xarm
       assert state.speed == 150.0
       assert state.acceleration == 3000.0
+      assert state.ets == ets
     end
 
     test "uses default speed and acceleration when not provided" do
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, :get_ets -> nil end)
+
       opts = [bb: %{robot: TestRobot, path: [:cartesian]}, controller: :xarm]
 
       assert {:ok, state} = Cartesian.init(opts)

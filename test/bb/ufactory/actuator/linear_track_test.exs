@@ -49,14 +49,14 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       assert actual_units == expected_units
     end
 
-    test "encodes speed as unsigned 16-bit in the speed frame" do
+    test "encodes speed as round(mm_s * 6.667) unsigned 16-bit in the speed frame" do
       speed = 350
       {_pos_frame, spd_frame} = Protocol.cmd_linear_track_move(1, 500.0, speed)
 
       <<_header::binary-size(7), rs485_payload::binary>> = spd_frame
       <<_rs485_header::binary-size(8), spd_bytes::binary-size(2)>> = rs485_payload
       <<actual_speed::unsigned-16>> = spd_bytes
-      assert actual_speed == speed
+      assert actual_speed == round(speed * 6.667)
     end
 
     test "handles zero position correctly" do

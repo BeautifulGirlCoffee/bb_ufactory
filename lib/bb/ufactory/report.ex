@@ -21,8 +21,8 @@ defmodule BB.Ufactory.Report do
 
   ```
   Bytes 0–3:    frame_length  u32 big-endian (total bytes of the frame INCLUDING
-                              these 4 bytes — the payload is frame_length bytes,
-                              not frame_length - 4)
+                              these 4 bytes — the payload is frame_length - 4
+                              bytes)
   Byte  4:      state_mode    lower nibble = state (0..5), upper nibble = mode (0..3)
   Bytes 5–6:    cmd_count     u16 big-endian
   Bytes 7–34:   angles        7× fp32 little-endian (radians, J1–J7)

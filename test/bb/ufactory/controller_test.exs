@@ -112,6 +112,7 @@ defmodule BB.Ufactory.ControllerTest do
       bb: %{robot: TestRobot, path: [:xarm]},
       host: "127.0.0.1",
       port: 502,
+      report_port: 30_003,
       model_config: %{joints: 6, max_speed_rads: :math.pi(), limits: []},
       controller_name: :xarm,
       loop_interval_ms: 10,
@@ -124,6 +125,7 @@ defmodule BB.Ufactory.ControllerTest do
       txn_id: 0,
       last_error_code: 0,
       last_arm_status: nil,
+      reconnect_attempts: 0,
       tcp_offset: nil,
       tcp_load: nil,
       reduced_mode: false,
@@ -705,12 +707,19 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state, cmd_server: cmd_server}
     end
 
-    test "sends the 8-byte heartbeat frame over the command socket",
+    test "sends the 8-byte heartbeat frame and polls error code over the command socket",
          %{state: state, cmd_server: cmd_server} do
-      assert {:noreply, _new_state} = Controller.handle_info(:heartbeat, state)
+      # Respond to the GET_ERROR poll with a zero error/warn code
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
 
-      assert {:ok, data} = recv_all(cmd_server, 200)
-      assert data == Protocol.heartbeat()
+      spawn_link(fn ->
+        # Wait for heartbeat + error poll frames to arrive
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.txn_id == 1
     end
   end
 

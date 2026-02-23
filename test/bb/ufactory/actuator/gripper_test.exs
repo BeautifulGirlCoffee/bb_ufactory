@@ -29,12 +29,18 @@ defmodule BB.Ufactory.Actuator.GripperTest do
   # ── init/1 ───────────────────────────────────────────────────────────────────
 
   describe "init/1" do
-    test "sends cmd_gripper_enable(true) via controller call on init" do
-      expected_frame = Protocol.cmd_gripper_enable(0, true)
+    test "sends cmd_gripper_enable(true) then cmd_gripper_speed via controller call on init" do
+      expected_enable = Protocol.cmd_gripper_enable(0, true)
+      expected_speed = Protocol.cmd_gripper_speed(0, 1500)
+      test_pid = self()
 
       BB.Process
       |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        assert frame == expected_frame
+        send(test_pid, {:frame, :first, frame})
+        :ok
+      end)
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        send(test_pid, {:frame, :second, frame})
         :ok
       end)
 
@@ -42,15 +48,27 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       assert {:ok, state} = Gripper.init(opts)
       assert state.controller == :xarm
       assert state.speed == 1500
+
+      assert_receive {:frame, :first, ^expected_enable}
+      assert_receive {:frame, :second, ^expected_speed}
     end
 
-    test "stores custom speed from options" do
+    test "stores custom speed from options and sends it to hardware" do
+      expected_speed = Protocol.cmd_gripper_speed(0, 800)
+      test_pid = self()
+
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _} -> :ok end)
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, _} -> :ok end)
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        send(test_pid, {:speed_frame, frame})
+        :ok
+      end)
 
       opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm, speed: 800]
       assert {:ok, state} = Gripper.init(opts)
       assert state.speed == 800
+
+      assert_receive {:speed_frame, ^expected_speed}
     end
 
     test "completes init even when enable command fails" do
@@ -192,29 +210,36 @@ defmodule BB.Ufactory.Actuator.GripperTest do
   # ── disarm/1 ────────────────────────────────────────────────────────────────
 
   describe "disarm/1" do
-    test "sends cmd_gripper_enable(false) over a fresh TCP connection" do
-      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
-      {:ok, port} = :inet.port(listen)
+    test "sends cmd_gripper_enable(false) via controller call" do
+      expected_frame = Protocol.cmd_gripper_enable(0, false)
 
-      task =
-        Task.async(fn ->
-          {:ok, server} = :gen_tcp.accept(listen, 2_000)
-          {:ok, data} = :gen_tcp.recv(server, 0, 1_000)
-          data
-        end)
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        assert frame == expected_frame
+        :ok
+      end)
 
-      opts = [host: "127.0.0.1", port: port]
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
       assert :ok = Gripper.disarm(opts)
-
-      received = Task.await(task, 3_000)
-      expected = Protocol.cmd_gripper_enable(0, false)
-      assert received == expected
-
-      :gen_tcp.close(listen)
     end
 
-    test "returns :ok even when TCP connection fails" do
-      opts = [host: "127.0.0.1", port: 1]
+    test "returns :ok even when controller call fails" do
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+        {:error, :noproc}
+      end)
+
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
+      assert :ok = Gripper.disarm(opts)
+    end
+
+    test "returns :ok even when controller process is down" do
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+        raise "process down"
+      end)
+
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
       assert :ok = Gripper.disarm(opts)
     end
   end

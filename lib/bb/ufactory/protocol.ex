@@ -61,6 +61,7 @@ defmodule BB.Ufactory.Protocol do
   @reg_get_tcp_pose 0x29
   @reg_get_joints 0x2A
   @reg_rs485_rtu 0x7C
+  @reg_get_error 0x0F
   @reg_ft_get_data 0xC8
   @reg_ft_enable 0xC9
 
@@ -87,14 +88,17 @@ defmodule BB.Ufactory.Protocol do
   # Gripper servo register addresses (from XCONF.ServoConf)
   @gripper_reg_con_en 0x0100
   @gripper_reg_taget_pos 0x0700
+  @gripper_reg_speed 0x0303
 
-  # Linear track RS485 device ID and register addresses (from xarm/x3/linear_motor.py)
+  # Linear track RS485 device ID and servo register addresses (from XCONF.ServoConf)
   # device_id 1 = linear track bus address (LINEAR_TRACK_ID)
   @linear_track_device_id 0x01
-  # Position register: int32 big-endian / 2000 = mm (spans two 16-bit registers)
-  @linear_track_reg_pos 0x0A20
-  # Speed register: int16 big-endian (mm/s)
-  @linear_track_reg_speed 0x0A26
+  # Write position: TAGET_POS register, int32 big-endian / 2000 = mm (spans two 16-bit registers)
+  # Note: 0x0A20 is the *read* address; writes go to 0x0700 via RS485 proxy.
+  @linear_track_reg_pos 0x0700
+  # Write speed: POS_SPD register, int16 big-endian (internal units = mm/s * 6.667)
+  # Note: 0x0A26 is the *read* address; writes go to 0x0303 via RS485 proxy.
+  @linear_track_reg_speed 0x0303
 
   @doc "Raw heartbeat frame. Send on the command socket once per second."
   @spec heartbeat() :: binary()
@@ -259,6 +263,16 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
+  Requests the current error and warning codes from the arm (register 0x0F).
+
+  The arm responds with 2 bytes: `<<error_code::8, warn_code::8>>`.
+  """
+  @spec cmd_get_error(non_neg_integer()) :: binary()
+  def cmd_get_error(txn_id) do
+    build_frame(txn_id, @reg_get_error, <<>>)
+  end
+
+  @doc """
   Commands a joint-space move to the given angles.
 
   `angles` must have at most 7 elements (one per joint J1..J7). If fewer than
@@ -338,6 +352,21 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
+  Sets the gripper speed in pulse units per second.
+
+  The speed is sent as an unsigned 16-bit integer to the POS_SPD register
+  (0x0303) on the gripper device. No scaling factor is applied — the value
+  is the raw servo speed in pulse/s (matching the Python SDK's
+  `gripper_modbus_set_posspd`).
+  """
+  @spec cmd_gripper_speed(non_neg_integer(), non_neg_integer()) :: binary()
+  def cmd_gripper_speed(txn_id, speed) do
+    spd_bytes = <<speed::unsigned-16>>
+    params = rs485_write_registers(@gripper_device_id, @gripper_reg_speed, spd_bytes)
+    build_frame(txn_id, @reg_rs485_rtu, params)
+  end
+
+  @doc """
   Enables or disables the force-torque sensor (register 0xC9).
   """
   @spec cmd_ft_sensor_enable(non_neg_integer(), boolean()) :: binary()
@@ -360,17 +389,20 @@ defmodule BB.Ufactory.Protocol do
   Returns `{pos_frame, spd_frame}` — two frames to move the linear track to
   `position_mm` at `speed` mm/s.
 
-  The position register (`0x0A20`) and speed register (`0x0A26`) are at
-  non-contiguous RS485 addresses, so they require separate write frames. The
-  caller (actuator) sends the speed frame first, then the position frame.
+  The position register (`TAGET_POS`, `0x0700`) and speed register (`POS_SPD`,
+  `0x0303`) are at non-contiguous RS485 servo addresses, so they require
+  separate write frames. The caller (actuator) sends the speed frame first,
+  then the position frame.
 
   Position encoding: `round(position_mm * 2000)` as a signed 32-bit
-  **big-endian** integer spanning two 16-bit registers (`0x0A20`/`0x0A21`).
+  **big-endian** integer spanning two 16-bit registers (`0x0700`/`0x0701`).
   This is the **only** place in the UFactory protocol where position is
   big-endian int32 rather than little-endian fp32 — a documented exception in
   the Python SDK (`xarm/x3/linear_motor.py`).
 
-  Speed encoding: unsigned 16-bit integer to register `0x0A26`.
+  Speed encoding: `round(speed_mm_s * 6.667)` as an unsigned 16-bit integer.
+  The `6.667` factor converts from mm/s to the servo's internal speed units
+  (matching the Python SDK's `set_linear_motor_speed`).
 
   ## Examples
 
@@ -383,7 +415,8 @@ defmodule BB.Ufactory.Protocol do
   def cmd_linear_track_move(txn_id, position_mm, speed) do
     pos_units = round(position_mm * 2000)
     pos_bytes = <<pos_units::signed-32>>
-    spd_bytes = <<speed::unsigned-16>>
+    spd_units = round(speed * 6.667)
+    spd_bytes = <<spd_units::unsigned-16>>
 
     pos_frame =
       build_frame(
