@@ -121,7 +121,7 @@ live in `test/support/`.
 
 ## Dependencies
 
-- `bb ~> 0.13` — The Beam Bots robotics framework
+- `bb ~> 0.15` — The Beam Bots robotics framework
 
 ## Reference Material
 
