@@ -379,4 +379,291 @@ defmodule BB.Ufactory.ProtocolTest do
       assert binary_part(frame, 6, 1) == <<0xC8>>
     end
   end
+
+  # ── cmd_set_tcp_offset ───────────────────────────────────────────────────────
+
+  describe "cmd_set_tcp_offset/7" do
+    test "produces a 31-byte frame (6 header + 1 register + 6×4 params)" do
+      assert byte_size(Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 172.0, 0.0, 0.0, 0.0)) == 31
+    end
+
+    test "uses register 0x23" do
+      frame = Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+      assert binary_part(frame, 6, 1) == <<0x23>>
+    end
+
+    test "encodes all six pose fields as fp32 LE" do
+      frame = Protocol.cmd_set_tcp_offset(0, 10.0, 20.0, 172.0, 0.1, 0.2, 0.3)
+      params = binary_part(frame, 7, 24)
+      [x, y, z, roll, pitch, yaw] = Protocol.decode_fp32s(params, 6)
+      assert_in_delta x, 10.0, 0.001
+      assert_in_delta y, 20.0, 0.001
+      assert_in_delta z, 172.0, 0.001
+      assert_in_delta roll, 0.1, 1.0e-6
+      assert_in_delta pitch, 0.2, 1.0e-6
+      assert_in_delta yaw, 0.3, 1.0e-6
+    end
+
+    test "two different offsets produce different frames" do
+      f1 = Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+      f2 = Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 172.0, 0.0, 0.0, 0.0)
+      refute f1 == f2
+    end
+  end
+
+  # ── cmd_set_tcp_load ─────────────────────────────────────────────────────────
+
+  describe "cmd_set_tcp_load/5" do
+    test "produces a 23-byte frame (6 header + 1 register + 4×4 params)" do
+      assert byte_size(Protocol.cmd_set_tcp_load(0, 0.82, 0.0, 0.0, 48.0)) == 23
+    end
+
+    test "uses register 0x24" do
+      frame = Protocol.cmd_set_tcp_load(0, 0.0, 0.0, 0.0, 0.0)
+      assert binary_part(frame, 6, 1) == <<0x24>>
+    end
+
+    test "encodes mass and center of mass as fp32 LE" do
+      frame = Protocol.cmd_set_tcp_load(0, 0.82, 1.0, 2.0, 48.0)
+      params = binary_part(frame, 7, 16)
+      [mass, cx, cy, cz] = Protocol.decode_fp32s(params, 4)
+      assert_in_delta mass, 0.82, 0.001
+      assert_in_delta cx, 1.0, 0.001
+      assert_in_delta cy, 2.0, 0.001
+      assert_in_delta cz, 48.0, 0.001
+    end
+  end
+
+  # ── cmd_set_reduced_mode ─────────────────────────────────────────────────────
+
+  describe "cmd_set_reduced_mode/2" do
+    test "produces an 8-byte frame" do
+      assert byte_size(Protocol.cmd_set_reduced_mode(0, true)) == 8
+    end
+
+    test "uses register 0x32" do
+      frame = Protocol.cmd_set_reduced_mode(0, true)
+      assert binary_part(frame, 6, 1) == <<0x32>>
+    end
+
+    test "enable byte is 1 when enabling" do
+      frame = Protocol.cmd_set_reduced_mode(0, true)
+      assert binary_part(frame, 7, 1) == <<0x01>>
+    end
+
+    test "enable byte is 0 when disabling" do
+      frame = Protocol.cmd_set_reduced_mode(0, false)
+      assert binary_part(frame, 7, 1) == <<0x00>>
+    end
+  end
+
+  # ── cmd_set_reduced_tcp_speed ────────────────────────────────────────────────
+
+  describe "cmd_set_reduced_tcp_speed/2" do
+    test "produces an 11-byte frame (6 header + 1 register + 4 fp32)" do
+      assert byte_size(Protocol.cmd_set_reduced_tcp_speed(0, 250.0)) == 11
+    end
+
+    test "uses register 0x2F" do
+      frame = Protocol.cmd_set_reduced_tcp_speed(0, 250.0)
+      assert binary_part(frame, 6, 1) == <<0x2F>>
+    end
+
+    test "encodes speed as fp32 LE" do
+      frame = Protocol.cmd_set_reduced_tcp_speed(0, 250.0)
+      <<speed::float-little-32>> = binary_part(frame, 7, 4)
+      assert_in_delta speed, 250.0, 0.001
+    end
+  end
+
+  # ── cmd_set_reduced_joint_speed ──────────────────────────────────────────────
+
+  describe "cmd_set_reduced_joint_speed/2" do
+    test "produces an 11-byte frame" do
+      assert byte_size(Protocol.cmd_set_reduced_joint_speed(0, 1.0)) == 11
+    end
+
+    test "uses register 0x30" do
+      frame = Protocol.cmd_set_reduced_joint_speed(0, 1.0)
+      assert binary_part(frame, 6, 1) == <<0x30>>
+    end
+
+    test "encodes speed as fp32 LE" do
+      frame = Protocol.cmd_set_reduced_joint_speed(0, 1.5708)
+      <<speed::float-little-32>> = binary_part(frame, 7, 4)
+      assert_in_delta speed, 1.5708, 0.001
+    end
+  end
+
+  # ── cmd_set_reduced_joint_ranges ─────────────────────────────────────────────
+
+  describe "cmd_set_reduced_joint_ranges/2" do
+    setup do
+      ranges = [
+        {-6.2832, 6.2832},
+        {-2.059, 2.094},
+        {-3.927, 0.192},
+        {-6.2832, 6.2832},
+        {-1.693, 3.142},
+        {-6.2832, 6.2832},
+        {-6.2832, 6.2832}
+      ]
+
+      {:ok, ranges: ranges}
+    end
+
+    test "produces a 63-byte frame (6 header + 1 register + 14×4 params)", %{ranges: ranges} do
+      assert byte_size(Protocol.cmd_set_reduced_joint_ranges(0, ranges)) == 63
+    end
+
+    test "uses register 0x3A", %{ranges: ranges} do
+      frame = Protocol.cmd_set_reduced_joint_ranges(0, ranges)
+      assert binary_part(frame, 6, 1) == <<0x3A>>
+    end
+
+    test "flattens pairs to 14× fp32 LE in [j1_min, j1_max, ...] order", %{ranges: ranges} do
+      frame = Protocol.cmd_set_reduced_joint_ranges(0, ranges)
+      floats = Protocol.decode_fp32s(binary_part(frame, 7, 56), 14)
+
+      assert length(floats) == 14
+      # J1 pair
+      [j1_min, j1_max | _] = floats
+      assert_in_delta j1_min, -6.2832, 0.001
+      assert_in_delta j1_max, 6.2832, 0.001
+      # J2 pair
+      [_, _, j2_min, j2_max | _] = floats
+      assert_in_delta j2_min, -2.059, 0.001
+      assert_in_delta j2_max, 2.094, 0.001
+    end
+  end
+
+  # ── cmd_set_tcp_boundary ─────────────────────────────────────────────────────
+
+  describe "cmd_set_tcp_boundary/7" do
+    test "produces a 31-byte frame (6 header + 1 register + 6×4 int32)" do
+      assert byte_size(Protocol.cmd_set_tcp_boundary(0, -400, 400, -400, 400, 0, 800)) == 31
+    end
+
+    test "uses register 0x34" do
+      frame = Protocol.cmd_set_tcp_boundary(0, 0, 0, 0, 0, 0, 0)
+      assert binary_part(frame, 6, 1) == <<0x34>>
+    end
+
+    test "encodes boundary values as signed 32-bit big-endian integers" do
+      frame = Protocol.cmd_set_tcp_boundary(0, -400, 400, -300, 300, 0, 800)
+      params = binary_part(frame, 7, 24)
+
+      <<x_min::signed-32, x_max::signed-32, y_min::signed-32, y_max::signed-32, z_min::signed-32,
+        z_max::signed-32>> = params
+
+      assert x_min == -400
+      assert x_max == 400
+      assert y_min == -300
+      assert y_max == 300
+      assert z_min == 0
+      assert z_max == 800
+    end
+
+    test "handles negative z_min correctly" do
+      frame = Protocol.cmd_set_tcp_boundary(0, 0, 0, 0, 0, -100, 100)
+      params = binary_part(frame, 7, 24)
+      <<_::64, _::64, z_min::signed-32, z_max::signed-32>> = params
+      assert z_min == -100
+      assert z_max == 100
+    end
+  end
+
+  # ── cmd_set_fence_on ────────────────────────────────────────────────────────
+
+  describe "cmd_set_fence_on/2" do
+    test "produces an 8-byte frame" do
+      assert byte_size(Protocol.cmd_set_fence_on(0, true)) == 8
+    end
+
+    test "uses register 0x3B" do
+      frame = Protocol.cmd_set_fence_on(0, true)
+      assert binary_part(frame, 6, 1) == <<0x3B>>
+    end
+
+    test "enable byte is 1 when enabling" do
+      frame = Protocol.cmd_set_fence_on(0, true)
+      assert binary_part(frame, 7, 1) == <<0x01>>
+    end
+
+    test "enable byte is 0 when disabling" do
+      frame = Protocol.cmd_set_fence_on(0, false)
+      assert binary_part(frame, 7, 1) == <<0x00>>
+    end
+  end
+
+  # ── cmd_set_collision_sensitivity ────────────────────────────────────────────
+
+  describe "cmd_set_collision_sensitivity/2" do
+    test "produces an 8-byte frame" do
+      assert byte_size(Protocol.cmd_set_collision_sensitivity(0, 3)) == 8
+    end
+
+    test "uses register 0x25" do
+      frame = Protocol.cmd_set_collision_sensitivity(0, 3)
+      assert binary_part(frame, 6, 1) == <<0x25>>
+    end
+
+    for level <- 0..5 do
+      test "encodes sensitivity level #{level} as u8" do
+        frame = Protocol.cmd_set_collision_sensitivity(0, unquote(level))
+        assert binary_part(frame, 7, 1) == <<unquote(level)::8>>
+      end
+    end
+
+    test "level 0 and level 5 produce different frames" do
+      refute Protocol.cmd_set_collision_sensitivity(0, 0) ==
+               Protocol.cmd_set_collision_sensitivity(0, 5)
+    end
+  end
+
+  # ── cmd_set_collision_rebound ────────────────────────────────────────────────
+
+  describe "cmd_set_collision_rebound/2" do
+    test "produces an 8-byte frame" do
+      assert byte_size(Protocol.cmd_set_collision_rebound(0, true)) == 8
+    end
+
+    test "uses register 0x3C" do
+      frame = Protocol.cmd_set_collision_rebound(0, true)
+      assert binary_part(frame, 6, 1) == <<0x3C>>
+    end
+
+    test "enable byte is 1 when enabling" do
+      frame = Protocol.cmd_set_collision_rebound(0, true)
+      assert binary_part(frame, 7, 1) == <<0x01>>
+    end
+
+    test "enable byte is 0 when disabling" do
+      frame = Protocol.cmd_set_collision_rebound(0, false)
+      assert binary_part(frame, 7, 1) == <<0x00>>
+    end
+  end
+
+  # ── cmd_set_self_collision_check ─────────────────────────────────────────────
+
+  describe "cmd_set_self_collision_check/2" do
+    test "produces an 8-byte frame" do
+      assert byte_size(Protocol.cmd_set_self_collision_check(0, true)) == 8
+    end
+
+    test "uses register 0x4D" do
+      frame = Protocol.cmd_set_self_collision_check(0, true)
+      assert binary_part(frame, 6, 1) == <<0x4D>>
+    end
+
+    test "enable byte is 1 when enabling" do
+      frame = Protocol.cmd_set_self_collision_check(0, true)
+      assert binary_part(frame, 7, 1) == <<0x01>>
+    end
+
+    test "enable byte is 0 when disabling" do
+      frame = Protocol.cmd_set_self_collision_check(0, false)
+      assert binary_part(frame, 7, 1) == <<0x00>>
+    end
+  end
 end

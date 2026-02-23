@@ -64,6 +64,20 @@ defmodule BB.Ufactory.Protocol do
   @reg_ft_get_data 0xC8
   @reg_ft_enable 0xC9
 
+  # ── Registers for hardware configuration (TCP offset, load, reduced mode,
+  #    collision detection) ─────────────────────────────────────────────────
+  @reg_set_tcp_offset 0x23
+  @reg_set_load_param 0x24
+  @reg_set_collis_sens 0x25
+  @reg_set_reduced_trsv 0x2F
+  @reg_set_reduced_p2pv 0x30
+  @reg_set_reduced_mode 0x32
+  @reg_set_limit_xyz 0x34
+  @reg_set_reduced_jrange 0x3A
+  @reg_set_fense_on 0x3B
+  @reg_set_collis_reb 0x3C
+  @reg_set_self_collis_check 0x4D
+
   # ── RS485 proxy IDs used for accessories ──────────────────────────────────
   # host_id 9 = robot-side RS485 bus (ROBOT_RS485_HOST_ID)
   @rs485_host_id 0x09
@@ -386,6 +400,198 @@ defmodule BB.Ufactory.Protocol do
       )
 
     {pos_frame, spd_frame}
+  end
+
+  # ── TCP tool offset and payload ─────────────────────────────────────────────
+
+  @doc """
+  Sets the tool center point (TCP) offset relative to the flange.
+
+  Tells the arm where the tool tip is, enabling accurate Cartesian motion and
+  force-torque readings in tool coordinates. Applied immediately and persisted
+  in the arm's NVRAM.
+
+  Position in millimetres; orientation in radians. Payload: 6× fp32 LE.
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 172.0, 0.0, 0.0, 0.0)
+      iex> byte_size(frame)
+      31
+  """
+  @spec cmd_set_tcp_offset(
+          non_neg_integer(),
+          float(),
+          float(),
+          float(),
+          float(),
+          float(),
+          float()
+        ) ::
+          binary()
+  def cmd_set_tcp_offset(txn_id, x, y, z, roll, pitch, yaw) do
+    build_frame(txn_id, @reg_set_tcp_offset, encode_fp32s([x, y, z, roll, pitch, yaw]))
+  end
+
+  @doc """
+  Sets the TCP payload (tool mass and center of gravity).
+
+  Accurate payload configuration improves motion planning, collision detection,
+  and force-torque readings. Applied immediately and persisted in NVRAM.
+
+  - `mass_kg` — tool mass in kilograms
+  - `com_x/y/z` — center of mass offset from flange, in millimetres
+
+  Payload: 4× fp32 LE `[mass, com_x, com_y, com_z]`.
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_set_tcp_load(0, 0.82, 0.0, 0.0, 48.0)
+      iex> byte_size(frame)
+      23
+  """
+  @spec cmd_set_tcp_load(non_neg_integer(), float(), float(), float(), float()) :: binary()
+  def cmd_set_tcp_load(txn_id, mass_kg, com_x, com_y, com_z) do
+    build_frame(txn_id, @reg_set_load_param, encode_fp32s([mass_kg, com_x, com_y, com_z]))
+  end
+
+  # ── Reduced / safe mode ──────────────────────────────────────────────────────
+
+  @doc """
+  Enables or disables the arm's firmware reduced mode.
+
+  In reduced mode, the arm enforces lower speed limits and optionally a
+  Cartesian workspace fence. Configure limits with `cmd_set_reduced_tcp_speed/2`,
+  `cmd_set_reduced_joint_speed/2`, and `cmd_set_tcp_boundary/7` before enabling.
+
+  Payload: 1× u8 (0 = off, 1 = on).
+  """
+  @spec cmd_set_reduced_mode(non_neg_integer(), boolean()) :: binary()
+  def cmd_set_reduced_mode(txn_id, enable) do
+    value = if enable, do: 1, else: 0
+    build_frame(txn_id, @reg_set_reduced_mode, <<value::8>>)
+  end
+
+  @doc """
+  Sets the maximum TCP linear speed used in reduced mode.
+
+  `speed_mm_s` — maximum end-effector speed in mm/s. Payload: 1× fp32 LE.
+  """
+  @spec cmd_set_reduced_tcp_speed(non_neg_integer(), float()) :: binary()
+  def cmd_set_reduced_tcp_speed(txn_id, speed_mm_s) do
+    build_frame(txn_id, @reg_set_reduced_trsv, encode_fp32(speed_mm_s))
+  end
+
+  @doc """
+  Sets the maximum joint speed used in reduced mode.
+
+  `speed_rad_s` — maximum joint speed in rad/s. Payload: 1× fp32 LE.
+  """
+  @spec cmd_set_reduced_joint_speed(non_neg_integer(), float()) :: binary()
+  def cmd_set_reduced_joint_speed(txn_id, speed_rad_s) do
+    build_frame(txn_id, @reg_set_reduced_p2pv, encode_fp32(speed_rad_s))
+  end
+
+  @doc """
+  Sets per-joint angle ranges enforced in reduced mode.
+
+  `ranges` must be a list of exactly 7 `{lower_rad, upper_rad}` tuples (J1..J7).
+  Pairs are flattened to 14× fp32 LE: `[j1_min, j1_max, j2_min, j2_max, ...]`.
+
+  For arms with fewer than 7 joints, the unused joints' ranges are ignored by
+  firmware but must still be included in the frame.
+  """
+  @spec cmd_set_reduced_joint_ranges(non_neg_integer(), [{float(), float()}]) :: binary()
+  def cmd_set_reduced_joint_ranges(txn_id, ranges) when length(ranges) == 7 do
+    floats = Enum.flat_map(ranges, fn {lo, hi} -> [lo, hi] end)
+    build_frame(txn_id, @reg_set_reduced_jrange, encode_fp32s(floats))
+  end
+
+  @doc """
+  Sets the Cartesian workspace boundary (fence) in millimetres.
+
+  When the fence is enabled via `cmd_set_fence_on/2`, the arm stops if the
+  TCP pose exceeds these limits.
+
+  Encoded as 6× signed 32-bit **big-endian** integers (same endianness
+  exception as the linear track position register).
+  """
+  @spec cmd_set_tcp_boundary(
+          non_neg_integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer()
+        ) :: binary()
+  def cmd_set_tcp_boundary(txn_id, x_min, x_max, y_min, y_max, z_min, z_max) do
+    payload =
+      <<x_min::signed-32, x_max::signed-32, y_min::signed-32, y_max::signed-32, z_min::signed-32,
+        z_max::signed-32>>
+
+    build_frame(txn_id, @reg_set_limit_xyz, payload)
+  end
+
+  @doc """
+  Enables or disables the Cartesian workspace fence.
+
+  The fence limits must first be set with `cmd_set_tcp_boundary/7`. When on,
+  motion that would move the TCP outside the boundary is rejected by firmware.
+
+  Payload: 1× u8 (0 = off, 1 = on).
+  """
+  @spec cmd_set_fence_on(non_neg_integer(), boolean()) :: binary()
+  def cmd_set_fence_on(txn_id, enable) do
+    value = if enable, do: 1, else: 0
+    build_frame(txn_id, @reg_set_fense_on, <<value::8>>)
+  end
+
+  # ── Collision detection ──────────────────────────────────────────────────────
+
+  @doc """
+  Sets the collision detection sensitivity level.
+
+  `sensitivity` must be in the range `0..5`:
+
+  - `0` — collision detection disabled
+  - `1` — lowest sensitivity (hardest to trigger)
+  - `5` — highest sensitivity (easiest to trigger)
+
+  Payload: 1× u8.
+  """
+  @spec cmd_set_collision_sensitivity(non_neg_integer(), 0..5) :: binary()
+  def cmd_set_collision_sensitivity(txn_id, sensitivity)
+      when is_integer(sensitivity) and sensitivity in 0..5 do
+    build_frame(txn_id, @reg_set_collis_sens, <<sensitivity::8>>)
+  end
+
+  @doc """
+  Enables or disables collision rebound.
+
+  When enabled, the arm briefly moves back along its path after detecting a
+  collision, helping to clear the contact. When disabled, the arm stops in place.
+
+  Payload: 1× u8 (0 = off, 1 = on).
+  """
+  @spec cmd_set_collision_rebound(non_neg_integer(), boolean()) :: binary()
+  def cmd_set_collision_rebound(txn_id, enable) do
+    value = if enable, do: 1, else: 0
+    build_frame(txn_id, @reg_set_collis_reb, <<value::8>>)
+  end
+
+  @doc """
+  Enables or disables the self-collision geometric model check.
+
+  When enabled, the firmware computes forward kinematics on each planned
+  trajectory point and rejects moves where arm links would intersect.
+
+  Payload: 1× u8 (0 = off, 1 = on).
+  """
+  @spec cmd_set_self_collision_check(non_neg_integer(), boolean()) :: binary()
+  def cmd_set_self_collision_check(txn_id, enable) do
+    value = if enable, do: 1, else: 0
+    build_frame(txn_id, @reg_set_self_collis_check, <<value::8>>)
   end
 
   # ── Private helpers ─────────────────────────────────────────────────────────

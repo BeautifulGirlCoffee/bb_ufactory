@@ -123,10 +123,89 @@ defmodule BB.Ufactory.ControllerTest do
       ets: ets,
       txn_id: 0,
       last_error_code: 0,
-      last_arm_status: nil
+      last_arm_status: nil,
+      tcp_offset: nil,
+      tcp_load: nil,
+      reduced_mode: false,
+      reduced_tcp_speed: nil,
+      reduced_joint_speed: nil,
+      reduced_joint_ranges: nil,
+      tcp_boundary: nil,
+      fence_on: false
     }
 
     Map.merge(base, extra)
+  end
+
+  # Starts stub TCP listeners for both cmd and report ports, calls Controller.init/1
+  # with `extra_opts`, and returns all bytes received by the cmd server during init.
+  #
+  # Since apply_hardware_config/1 runs synchronously inside init/1, all config frames
+  # have been sent by the time Controller.init returns. We accept the connection in a
+  # background task (so the listener is ready before init connects), then drain the
+  # server socket after init returns to collect everything at once.
+  defp init_for_config_test(extra_opts) do
+    {:ok, cmd_listen} =
+      :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
+
+    {:ok, cmd_port} = :inet.port(cmd_listen)
+
+    {:ok, report_listen} =
+      :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
+
+    {:ok, report_port} = :inet.port(report_listen)
+
+    # Accept both connections asynchronously; return the cmd server socket so we can
+    # drain it after init has finished sending all config frames.
+    # We transfer controlling_process to the parent before the Task exits so the
+    # socket is not closed when the task process terminates.
+    parent = self()
+
+    cmd_accept_task =
+      Task.async(fn ->
+        {:ok, server} = :gen_tcp.accept(cmd_listen, 2_000)
+        :ok = :gen_tcp.controlling_process(server, parent)
+        server
+      end)
+
+    Task.start(fn -> :gen_tcp.accept(report_listen, 2_000) end)
+
+    BB
+    |> stub(:subscribe, fn _robot, _path -> :ok end)
+
+    BB.Safety
+    |> stub(:register, fn _module, _opts -> :ok end)
+
+    base_opts = [
+      bb: %{robot: TestRobot, path: [:xarm]},
+      host: "127.0.0.1",
+      port: cmd_port,
+      report_port: report_port,
+      model: :xarm6
+    ]
+
+    assert {:ok, state} = Controller.init(base_opts ++ extra_opts)
+
+    # init has returned — all config frames have been sent synchronously
+    cmd_server = Task.await(cmd_accept_task, 3_000)
+
+    # Drain the server socket with a short timeout; loop until nothing arrives.
+    received = drain_socket(cmd_server, <<>>, 100)
+
+    :gen_tcp.close(cmd_server)
+    :gen_tcp.close(cmd_listen)
+    :gen_tcp.close(report_listen)
+    :gen_tcp.close(state.cmd_socket)
+    :gen_tcp.close(state.report_socket)
+
+    received
+  end
+
+  defp drain_socket(socket, acc, timeout_ms) do
+    case :gen_tcp.recv(socket, 0, timeout_ms) do
+      {:ok, data} -> drain_socket(socket, acc <> data, timeout_ms)
+      {:error, _} -> acc
+    end
   end
 
   # ── disarm/1 ────────────────────────────────────────────────────────────────
@@ -746,6 +825,110 @@ defmodule BB.Ufactory.ControllerTest do
                Controller.handle_call(:get_ets, {self(), make_ref()}, state)
 
       assert ets == state.ets
+    end
+  end
+
+  # ── apply_hardware_config (via init/1) ───────────────────────────────────────
+
+  describe "hardware config options applied during init/1" do
+    test "sends cmd_set_tcp_offset when tcp_offset is provided" do
+      offset = {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}
+      received = init_for_config_test(tcp_offset: offset)
+
+      expected = Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 172.0, 0.0, 0.0, 0.0)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_tcp_load when tcp_load is provided" do
+      load = {0.82, 0.0, 0.0, 48.0}
+      received = init_for_config_test(tcp_load: load)
+
+      expected = Protocol.cmd_set_tcp_load(0, 0.82, 0.0, 0.0, 48.0)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_tcp_offset before cmd_set_tcp_load when both are provided" do
+      received =
+        init_for_config_test(
+          tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0},
+          tcp_load: {0.82, 0.0, 0.0, 48.0}
+        )
+
+      offset_frame = Protocol.cmd_set_tcp_offset(0, 0.0, 0.0, 172.0, 0.0, 0.0, 0.0)
+      offset_size = byte_size(offset_frame)
+
+      assert binary_part(received, 0, offset_size) == offset_frame
+
+      # Second frame uses txn_id 1
+      load_frame = Protocol.cmd_set_tcp_load(1, 0.82, 0.0, 0.0, 48.0)
+      assert binary_part(received, offset_size, byte_size(load_frame)) == load_frame
+    end
+
+    test "sends cmd_set_reduced_tcp_speed when provided" do
+      received = init_for_config_test(reduced_tcp_speed: 250.0)
+
+      expected = Protocol.cmd_set_reduced_tcp_speed(0, 250.0)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_reduced_joint_speed when provided" do
+      received = init_for_config_test(reduced_joint_speed: 1.0)
+
+      expected = Protocol.cmd_set_reduced_joint_speed(0, 1.0)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_reduced_joint_ranges when provided" do
+      ranges = [
+        {-6.2832, 6.2832},
+        {-2.059, 2.094},
+        {-3.927, 0.192},
+        {-6.2832, 6.2832},
+        {-1.693, 3.142},
+        {-6.2832, 6.2832},
+        {-6.2832, 6.2832}
+      ]
+
+      received = init_for_config_test(reduced_joint_ranges: ranges)
+
+      expected = Protocol.cmd_set_reduced_joint_ranges(0, ranges)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_tcp_boundary when provided" do
+      boundary = {-400, 400, -400, 400, 0, 800}
+      received = init_for_config_test(tcp_boundary: boundary)
+
+      expected = Protocol.cmd_set_tcp_boundary(0, -400, 400, -400, 400, 0, 800)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_fence_on when fence_on is true" do
+      received = init_for_config_test(fence_on: true)
+
+      expected = Protocol.cmd_set_fence_on(0, true)
+      assert binary_part(received, 0, byte_size(expected)) == expected
+    end
+
+    test "sends cmd_set_reduced_mode last, after speed limits, when reduced_mode is true" do
+      received =
+        init_for_config_test(
+          reduced_mode: true,
+          reduced_tcp_speed: 250.0
+        )
+
+      speed_frame = Protocol.cmd_set_reduced_tcp_speed(0, 250.0)
+      speed_size = byte_size(speed_frame)
+
+      assert binary_part(received, 0, speed_size) == speed_frame
+
+      reduced_frame = Protocol.cmd_set_reduced_mode(1, true)
+      assert binary_part(received, speed_size, byte_size(reduced_frame)) == reduced_frame
+    end
+
+    test "sends no config frames when no hardware config options are provided" do
+      received = init_for_config_test([])
+      assert received == <<>>
     end
   end
 

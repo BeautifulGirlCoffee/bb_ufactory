@@ -77,6 +77,63 @@ defmodule BB.Ufactory.Controller do
         type: {:in, [:stop, :hold]},
         default: :stop,
         doc: "Action taken when robot is disarmed: :stop clears motion, :hold holds position"
+      ],
+      tcp_offset: [
+        type: :any,
+        default: nil,
+        doc:
+          "Tool center point offset from flange as `{x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}`. " <>
+            "Sent to the arm on init (register 0x23, 6× fp32 LE). `nil` skips the command."
+      ],
+      tcp_load: [
+        type: :any,
+        default: nil,
+        doc:
+          "Tool payload as `{mass_kg, com_x_mm, com_y_mm, com_z_mm}`. " <>
+            "Sent to the arm on init (register 0x24, 4× fp32 LE). `nil` skips the command."
+      ],
+      reduced_mode: [
+        type: :boolean,
+        default: false,
+        doc:
+          "Enable the arm's firmware reduced mode, which enforces lower speed limits " <>
+            "and an optional workspace fence. Configure limits with the `reduced_tcp_speed`, " <>
+            "`reduced_joint_speed`, `reduced_joint_ranges`, and `tcp_boundary` options."
+      ],
+      reduced_tcp_speed: [
+        type: :any,
+        default: nil,
+        doc:
+          "Maximum TCP linear speed in mm/s enforced in reduced mode (register 0x2F, 1× fp32 LE). " <>
+            "`nil` skips the command."
+      ],
+      reduced_joint_speed: [
+        type: :any,
+        default: nil,
+        doc:
+          "Maximum joint speed in rad/s enforced in reduced mode (register 0x30, 1× fp32 LE). " <>
+            "`nil` skips the command."
+      ],
+      reduced_joint_ranges: [
+        type: :any,
+        default: nil,
+        doc:
+          "Per-joint angle limits enforced in reduced mode. Must be a list of exactly 7 " <>
+            "`{lower_rad, upper_rad}` tuples (J1..J7). Register 0x3A, 14× fp32 LE. `nil` skips."
+      ],
+      tcp_boundary: [
+        type: :any,
+        default: nil,
+        doc:
+          "Cartesian workspace fence as `{x_min, x_max, y_min, y_max, z_min, z_max}` in mm. " <>
+            "Activate with `fence_on: true`. Register 0x34, 6× int32 BE. `nil` skips."
+      ],
+      fence_on: [
+        type: :boolean,
+        default: false,
+        doc:
+          "Enable the Cartesian workspace fence defined by `tcp_boundary`. " <>
+            "Has no effect if `tcp_boundary` is nil (register 0x3B)."
       ]
     ]
 
@@ -186,8 +243,19 @@ defmodule BB.Ufactory.Controller do
         ets: ets,
         txn_id: 0,
         last_error_code: 0,
-        last_arm_status: nil
+        last_arm_status: nil,
+        # Hardware config opts — read once during apply_hardware_config/1
+        tcp_offset: Keyword.get(opts, :tcp_offset),
+        tcp_load: Keyword.get(opts, :tcp_load),
+        reduced_mode: Keyword.get(opts, :reduced_mode, false),
+        reduced_tcp_speed: Keyword.get(opts, :reduced_tcp_speed),
+        reduced_joint_speed: Keyword.get(opts, :reduced_joint_speed),
+        reduced_joint_ranges: Keyword.get(opts, :reduced_joint_ranges),
+        tcp_boundary: Keyword.get(opts, :tcp_boundary),
+        fence_on: Keyword.get(opts, :fence_on, false)
       }
+
+      state = apply_hardware_config(state)
 
       {:ok, state}
     else
@@ -299,6 +367,104 @@ defmodule BB.Ufactory.Controller do
   end
 
   # ── Private helpers ───────────────────────────────────────────────────────────
+
+  # ── Hardware configuration ────────────────────────────────────────────────────
+  #
+  # Sends persistent arm configuration commands immediately after TCP connections
+  # are established. Each helper is a no-op when the corresponding opt is nil/false.
+  # Failures are logged as warnings — a misconfigured offset or load is non-fatal,
+  # and the operator should be alerted rather than preventing the controller from
+  # starting.
+
+  defp apply_hardware_config(state) do
+    state
+    |> maybe_send_tcp_offset()
+    |> maybe_send_tcp_load()
+    |> maybe_send_reduced_tcp_speed()
+    |> maybe_send_reduced_joint_speed()
+    |> maybe_send_reduced_joint_ranges()
+    |> maybe_send_tcp_boundary()
+    |> maybe_send_fence_on()
+    |> maybe_send_reduced_mode()
+  end
+
+  defp maybe_send_tcp_offset(%{tcp_offset: {x, y, z, roll, pitch, yaw}} = state) do
+    frame = Protocol.cmd_set_tcp_offset(state.txn_id, x, y, z, roll, pitch, yaw)
+    log_config_send("tcp_offset", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_tcp_offset(state), do: state
+
+  defp maybe_send_tcp_load(%{tcp_load: {mass, cx, cy, cz}} = state) do
+    frame = Protocol.cmd_set_tcp_load(state.txn_id, mass, cx, cy, cz)
+    log_config_send("tcp_load", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_tcp_load(state), do: state
+
+  defp maybe_send_reduced_tcp_speed(%{reduced_tcp_speed: speed} = state) when not is_nil(speed) do
+    frame = Protocol.cmd_set_reduced_tcp_speed(state.txn_id, speed * 1.0)
+    log_config_send("reduced_tcp_speed", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_reduced_tcp_speed(state), do: state
+
+  defp maybe_send_reduced_joint_speed(%{reduced_joint_speed: speed} = state)
+       when not is_nil(speed) do
+    frame = Protocol.cmd_set_reduced_joint_speed(state.txn_id, speed * 1.0)
+    log_config_send("reduced_joint_speed", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_reduced_joint_speed(state), do: state
+
+  defp maybe_send_reduced_joint_ranges(%{reduced_joint_ranges: ranges} = state)
+       when is_list(ranges) and length(ranges) == 7 do
+    frame = Protocol.cmd_set_reduced_joint_ranges(state.txn_id, ranges)
+    log_config_send("reduced_joint_ranges", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_reduced_joint_ranges(state), do: state
+
+  defp maybe_send_tcp_boundary(
+         %{tcp_boundary: {x_min, x_max, y_min, y_max, z_min, z_max}} = state
+       ) do
+    frame =
+      Protocol.cmd_set_tcp_boundary(state.txn_id, x_min, x_max, y_min, y_max, z_min, z_max)
+
+    log_config_send("tcp_boundary", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_tcp_boundary(state), do: state
+
+  defp maybe_send_fence_on(%{fence_on: true} = state) do
+    frame = Protocol.cmd_set_fence_on(state.txn_id, true)
+    log_config_send("fence_on", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_fence_on(state), do: state
+
+  defp maybe_send_reduced_mode(%{reduced_mode: true} = state) do
+    frame = Protocol.cmd_set_reduced_mode(state.txn_id, true)
+    log_config_send("reduced_mode", :gen_tcp.send(state.cmd_socket, frame), state)
+    %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  defp maybe_send_reduced_mode(state), do: state
+
+  defp log_config_send(_key, :ok, _state), do: :ok
+
+  defp log_config_send(key, {:error, reason}, state) do
+    Logger.warning(
+      "[BB.Ufactory.Controller] #{key} config send failed for #{state.controller_name}: #{inspect(reason)}"
+    )
+  end
 
   defp create_ets(robot, controller_name, joint_count) do
     # Build the ETS table name from known module atoms to avoid dynamic atom creation.
