@@ -6,6 +6,6 @@
   tools: [
     {:credo, "mix credo --strict"},
     {:excoveralls, "mix coveralls"},
-    {:reuse, command: ["pipx", "run", "reuse", "lint", "-q"]}
+    {:reuse, command: ["docker", "run", "--rm", "-v", "#{File.cwd!()}:/data", "fsfe/reuse", "lint"]}
   ]
 ]

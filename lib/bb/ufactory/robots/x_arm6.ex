@@ -45,7 +45,8 @@ defmodule BB.Ufactory.Robots.XArm6 do
   controllers do
     controller(
       :xarm,
-      {BB.Ufactory.Controller, host: "192.168.1.111", model: :xarm6, loop_hz: 100}
+      {BB.Ufactory.Controller, host: "192.168.1.111", model: :xarm6, loop_hz: 100},
+      simulation: :mock
     )
   end
 
