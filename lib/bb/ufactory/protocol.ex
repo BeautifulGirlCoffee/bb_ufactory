@@ -74,6 +74,14 @@ defmodule BB.Ufactory.Protocol do
   @gripper_reg_con_en 0x0100
   @gripper_reg_taget_pos 0x0700
 
+  # Linear track RS485 device ID and register addresses (from xarm/x3/linear_motor.py)
+  # device_id 1 = linear track bus address (LINEAR_TRACK_ID)
+  @linear_track_device_id 0x01
+  # Position register: int32 big-endian / 2000 = mm (spans two 16-bit registers)
+  @linear_track_reg_pos 0x0A20
+  # Speed register: int16 big-endian (mm/s)
+  @linear_track_reg_speed 0x0A26
+
   @doc "Raw heartbeat frame. Send on the command socket once per second."
   @spec heartbeat() :: binary()
   def heartbeat, do: @heartbeat
@@ -332,6 +340,52 @@ defmodule BB.Ufactory.Protocol do
   @spec cmd_get_ft_data(non_neg_integer()) :: binary()
   def cmd_get_ft_data(txn_id) do
     build_frame(txn_id, @reg_ft_get_data, <<>>)
+  end
+
+  @doc """
+  Returns `{pos_frame, spd_frame}` — two frames to move the linear track to
+  `position_mm` at `speed` mm/s.
+
+  The position register (`0x0A20`) and speed register (`0x0A26`) are at
+  non-contiguous RS485 addresses, so they require separate write frames. The
+  caller (actuator) sends the speed frame first, then the position frame.
+
+  Position encoding: `round(position_mm * 2000)` as a signed 32-bit
+  **big-endian** integer spanning two 16-bit registers (`0x0A20`/`0x0A21`).
+  This is the **only** place in the UFactory protocol where position is
+  big-endian int32 rather than little-endian fp32 — a documented exception in
+  the Python SDK (`xarm/x3/linear_motor.py`).
+
+  Speed encoding: unsigned 16-bit integer to register `0x0A26`.
+
+  ## Examples
+
+      iex> {pos_frame, spd_frame} = BB.Ufactory.Protocol.cmd_linear_track_move(1, 500.0, 200)
+      iex> is_binary(pos_frame) and is_binary(spd_frame)
+      true
+  """
+  @spec cmd_linear_track_move(non_neg_integer(), float(), non_neg_integer()) ::
+          {binary(), binary()}
+  def cmd_linear_track_move(txn_id, position_mm, speed) do
+    pos_units = round(position_mm * 2000)
+    pos_bytes = <<pos_units::signed-32>>
+    spd_bytes = <<speed::unsigned-16>>
+
+    pos_frame =
+      build_frame(
+        txn_id,
+        @reg_rs485_rtu,
+        rs485_write_registers(@linear_track_device_id, @linear_track_reg_pos, pos_bytes)
+      )
+
+    spd_frame =
+      build_frame(
+        txn_id,
+        @reg_rs485_rtu,
+        rs485_write_registers(@linear_track_device_id, @linear_track_reg_speed, spd_bytes)
+      )
+
+    {pos_frame, spd_frame}
   end
 
   # ── Private helpers ─────────────────────────────────────────────────────────

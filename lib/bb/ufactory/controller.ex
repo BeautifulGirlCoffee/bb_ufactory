@@ -280,6 +280,12 @@ defmodule BB.Ufactory.Controller do
     {:reply, state.ets, state}
   end
 
+  # ── handle_call: model config for actuators ──────────────────────────────────
+
+  def handle_call(:get_model_config, _from, state) do
+    {:reply, state.model_config, state}
+  end
+
   # ── terminate ─────────────────────────────────────────────────────────────────
 
   @impl BB.Controller
