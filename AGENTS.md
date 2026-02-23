@@ -40,44 +40,61 @@ The project uses `ex_check` — always prefer `mix check --no-retry` over runnin
 ```
 Controller (GenServer)
     |
-    +-- command socket (port 502) — sends frames, heartbeat
-    +-- report socket (port 30003) — receives pushed state at 100Hz
+    +-- command socket (port 502) — sends frames, heartbeat, polls error code (0x0F)
+    +-- report socket (port 30003) — active: true, receives pushed state at ~100Hz
     +-- ETS table — shared state between controller and actuators
     |
     v
-Actuator.Joint     — writes set_position to ETS (joint-space)
-Actuator.Cartesian — sends cmd_move_cartesian via controller call
-Actuator.Gripper   — sends gripper commands via controller call
+Actuator.Joint       — writes set_position to ETS (joint-space)
+Actuator.Cartesian   — sends cmd_move_cartesian via controller call
+Actuator.Gripper     — sends gripper commands via controller call
 Actuator.LinearTrack — RS485-proxied track position via controller call
     |
-    v publishes
-BB.Message.Actuator.BeginMotion
-BB.Message.Sensor.JointState  (published by controller from report data)
+    v publishes (from report frames)
+BB.Message.Sensor.JointState         → [:sensor, controller_name]
+BB.Ufactory.Message.CartesianPose    → [:sensor, controller_name, :tcp_pose]
+BB.Ufactory.Message.ArmStatus        → [:sensor, controller_name, :arm_status] (on change)
+BB.Ufactory.Message.Wrench           → [:sensor, controller_name, :wrench] (135+ byte frames)
 
-Sensor.ForceTorque — polls register 0xC8, publishes BB.Ufactory.Message.Wrench
+Sensor.ForceTorque — enables F/T on init, forwards Wrench from controller pubsub
+Sensor.Collision   — configures collision detection on init, forwards ArmStatus on fault
+
+BB.Error.Protocol.Ufactory.HardwareFault  — raised via BB.Safety.report_error
+BB.Error.Protocol.Ufactory.CommandRejected
+BB.Error.Protocol.Ufactory.ConnectionError
 ```
 
-### Key Modules (planned)
+### Key Modules
 
 - **`BB.Ufactory.Protocol`** (`lib/bb/ufactory/protocol.ex`) — Frame builder/parser for
   port 502 commands. Handles the Modbus-TCP variant header (transaction ID u16 BE,
   protocol 0x0002 u16 BE, length u16 BE, register u8, params as little-endian fp32s).
+  Includes builders for: `cmd_enable`, `cmd_set_state`, `cmd_stop`, `cmd_move_joints`,
+  `cmd_move_cartesian`, `cmd_gripper_move`, `cmd_linear_track_set_pos`,
+  `cmd_ft_sensor_enable`, `cmd_set_tcp_offset`, `cmd_set_tcp_load`,
+  `cmd_set_reduced_mode`, `cmd_set_tcp_boundary`, `cmd_set_fence_on`,
+  `cmd_set_collision_sensitivity`, `cmd_set_collision_rebound`,
+  `cmd_set_self_collision_check`, `cmd_get_error`, and `heartbeat`.
 
 - **`BB.Ufactory.Report`** (`lib/bb/ufactory/report.ex`) — Parser for auto-push report
   frames from port 30003. Each frame: 4-byte length, state/mode byte, cmd count u16,
   7× joint angles fp32 LE, 6× Cartesian pose fp32 LE, 7× torques fp32 LE, optional
-  force-torque data.
+  force-torque data (in 135+ byte frames).
 
 - **`BB.Ufactory.Registers`** (`lib/bb/ufactory/registers.ex`) — Module-attribute
   constants for all register addresses (0x0B enable, 0x0C set_state, 0x15 move_cart,
   0x17 move_joints, 0x2A get_joints, 0x7C gripper, 0xC8 ft_get, etc.).
 
-- **`BB.Ufactory.Model`** (`lib/bb/ufactory/model.ex`) — Per-model joint counts and
-  limits for xArm5/6/7, Lite6, xArm850.
+- **`BB.Ufactory.Model`** (`lib/bb/ufactory/model.ex`) — Per-model joint counts,
+  max speed, and per-joint radian limits for all five supported variants:
+  xArm5, xArm6, xArm7, Lite6, xArm850.
 
 - **`BB.Ufactory.Controller`** (`lib/bb/ufactory/controller.ex`) — `BB.Controller`
-  GenServer. Manages both TCP sockets, ETS table, 100Hz control loop, heartbeat (every
-  1s), and state machine pubsub. Publishes `JointState` from report data.
+  GenServer. Manages both TCP sockets, ETS table, 100Hz control loop, 1s heartbeat,
+  error code polling, report socket reconnection with exponential backoff, and state
+  machine pubsub. Publishes `JointState`, `CartesianPose`, `ArmStatus`, and `Wrench`
+  from report data. Applies hardware configuration on init (TCP offset, payload,
+  reduced mode, workspace fence, collision settings).
 
 - **`BB.Ufactory.Actuator.Joint`** — Writes `set_position` to ETS; controller loop
   batches all joints into a single `cmd_move_joints` frame at 100Hz.
@@ -89,8 +106,38 @@ Sensor.ForceTorque — polls register 0xC8, publishes BB.Ufactory.Message.Wrench
 
 - **`BB.Ufactory.Actuator.LinearTrack`** — Linear track (RS485 proxied; int32 BE / 2000 = mm).
 
-- **`BB.Ufactory.Sensor.ForceTorque`** — Polls register 0xC8 at 50Hz, publishes
-  `BB.Ufactory.Message.Wrench`.
+- **`BB.Ufactory.Sensor.ForceTorque`** — Enables the arm's built-in F/T sensor on
+  init via `cmd_ft_sensor_enable`. Subscribes to `[:sensor, controller_name, :wrench]`
+  and re-publishes to its own sensor-scoped pubsub path. Disarms by sending
+  `cmd_ft_sensor_enable(false)`.
+
+- **`BB.Ufactory.Sensor.Collision`** — Configures collision detection sensitivity,
+  rebound behaviour, and self-collision check on init. Subscribes to
+  `[:sensor, controller_name, :arm_status]` and re-publishes events where
+  `error_code` is 22 (self-collision), 31 (external contact), or 35 (fence violation)
+  to its own sensor-scoped pubsub path.
+
+- **`BB.Ufactory.Message.ArmStatus`** — Arm state/mode/error_code/warn_code snapshot,
+  published on change.
+
+- **`BB.Ufactory.Message.CartesianPose`** — TCP position (mm) and orientation (radians
+  RPY), published on every report frame.
+
+- **`BB.Ufactory.Message.Wrench`** — 6-axis F/T reading (Fx/Fy/Fz/Tx/Ty/Tz), present
+  only in 135+ byte report frames when F/T sensor is enabled.
+
+- **`BB.Ufactory.Robots.XArm6`** (`lib/bb/ufactory/robots/x_arm6.ex`) — Ready-to-use
+  BB robot definition for the xArm6 with correct joint limits, effort values, and
+  actuator wiring. Use with `use BB.Ufactory.Robots.XArm6` as a starting point.
+
+- **`BB.Error.Protocol.Ufactory.HardwareFault`** — Structured exception for arm
+  hardware error codes (full code table included). Raised via `BB.Safety.report_error`.
+
+- **`BB.Error.Protocol.Ufactory.CommandRejected`** — Raised when a response frame
+  carries a non-zero status byte.
+
+- **`BB.Error.Protocol.Ufactory.ConnectionError`** — Raised on TCP connect failure
+  during `init/1`.
 
 ### BB Framework Integration
 
@@ -118,6 +165,18 @@ The library uses BB's:
 Tests use Mimic to mock `BB`, `BB.Process`, `BB.Robot`, and `BB.Safety`. Hardware tests
 are tagged `@tag :hardware` and excluded from `mix test` by default. Test support modules
 live in `test/support/`.
+
+Test files mirror the `lib/` structure:
+- `test/bb/ufactory/controller_test.exs` — controller lifecycle, ETS, pubsub, error handling
+- `test/bb/ufactory/protocol_test.exs` — frame encoding/parsing
+- `test/bb/ufactory/report_test.exs` — report frame parsing
+- `test/bb/ufactory/model_test.exs` — model config
+- `test/bb/ufactory/error_test.exs` — error structs
+- `test/bb/ufactory/actuator/` — one file per actuator
+- `test/bb/ufactory/sensor/` — one file per sensor
+- `test/bb/ufactory/robots/x_arm6_test.exs` — robot definition
+- `test/bb/ufactory/hardware_test.exs` — `@tag :hardware` integration tests
+- `test/bb/ufactory/sim_test.exs` — simulation mode tests
 
 ## Dependencies
 
