@@ -13,6 +13,7 @@ defmodule BB.Ufactory.ControllerTest do
   alias BB.StateMachine.Transition
   alias BB.Ufactory.Controller
   alias BB.Ufactory.Message.CartesianPose
+  alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Protocol
 
   setup :verify_on_exit!
@@ -68,6 +69,33 @@ defmodule BB.Ufactory.ControllerTest do
 
     state_mode = mode <<< 4 ||| (state &&& 0x0F)
     payload = <<state_mode::8, cmd_count::16>> <> fp32s(angles) <> fp32s(pose) <> fp32s(torques)
+    frame_length = byte_size(payload) + 4
+    <<frame_length::32>> <> payload
+  end
+
+  # Builds a 135-byte real-time report frame that includes ft_filtered and ft_raw
+  # fields (bytes 87–110 and 111–134 respectively). This is the format sent by the
+  # arm when the F/T sensor is enabled.
+  defp build_135_byte_frame(opts \\ []) do
+    state = Keyword.get(opts, :state, 0)
+    mode = Keyword.get(opts, :mode, 0)
+    cmd_count = Keyword.get(opts, :cmd_count, 0)
+    angles = Keyword.get(opts, :angles, List.duplicate(0.0, 7))
+    pose = Keyword.get(opts, :pose, List.duplicate(0.0, 6))
+    torques = Keyword.get(opts, :torques, List.duplicate(0.0, 7))
+    ft_filtered = Keyword.get(opts, :ft_filtered, List.duplicate(0.0, 6))
+    ft_raw = Keyword.get(opts, :ft_raw, List.duplicate(0.0, 6))
+
+    state_mode = mode <<< 4 ||| (state &&& 0x0F)
+
+    payload =
+      <<state_mode::8, cmd_count::16>> <>
+        fp32s(angles) <>
+        fp32s(pose) <>
+        fp32s(torques) <>
+        fp32s(ft_filtered) <>
+        fp32s(ft_raw)
+
     frame_length = byte_size(payload) + 4
     <<frame_length::32>> <> payload
   end
@@ -435,6 +463,43 @@ defmodule BB.Ufactory.ControllerTest do
           assert_in_delta cp.y, 200.0, 1.0e-3
           assert_in_delta cp.z, 300.0, 1.0e-3
           :ok
+
+        _robot, _path, _msg ->
+          :ok
+      end)
+
+      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+    end
+
+    test "publishes Wrench message when ft_filtered data is present", %{state: state} do
+      ft_values = [1.0, 2.0, 3.0, 0.1, 0.2, 0.3]
+      frame = build_135_byte_frame(ft_filtered: ft_values)
+
+      BB
+      |> stub(:publish, fn
+        TestRobot, [:sensor, :xarm, :wrench], %Message{payload: %Wrench{} = w} ->
+          assert_in_delta w.fx, 1.0, 1.0e-4
+          assert_in_delta w.fy, 2.0, 1.0e-4
+          assert_in_delta w.fz, 3.0, 1.0e-4
+          assert_in_delta w.tx, 0.1, 1.0e-4
+          assert_in_delta w.ty, 0.2, 1.0e-4
+          assert_in_delta w.tz, 0.3, 1.0e-4
+          :ok
+
+        _robot, _path, _msg ->
+          :ok
+      end)
+
+      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+    end
+
+    test "does not publish Wrench when ft_filtered is absent (87-byte frame)", %{state: state} do
+      frame = build_87_byte_frame()
+
+      BB
+      |> stub(:publish, fn
+        TestRobot, [:sensor, :xarm, :wrench], _msg ->
+          flunk("Wrench should not be published for 87-byte frames")
 
         _robot, _path, _msg ->
           :ok

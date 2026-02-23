@@ -86,6 +86,7 @@ defmodule BB.Ufactory.Controller do
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
   alias BB.Ufactory.Message.CartesianPose
+  alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Model
   alias BB.Ufactory.Protocol
   alias BB.Ufactory.Report
@@ -388,9 +389,16 @@ defmodule BB.Ufactory.Controller do
     [x, y, z, roll, pitch, yaw] = report.pose
     :ets.insert(state.ets, {:arm, report.state, report.mode, {x, y, z, roll, pitch, yaw}})
 
-    # Publish JointState
     joint_names = Enum.take(@all_joint_names, joint_count)
+    publish_joint_state(joint_names, angles, torques, state)
+    publish_cartesian_pose(x, y, z, roll, pitch, yaw, state)
+    maybe_publish_wrench(report, state)
 
+    # Report errors on normal-report frames that include error_code
+    maybe_report_error(report, state)
+  end
+
+  defp publish_joint_state(joint_names, angles, torques, state) do
     case JointState.new(state.controller_name,
            names: joint_names,
            positions: angles,
@@ -404,8 +412,9 @@ defmodule BB.Ufactory.Controller do
           "[BB.Ufactory.Controller] Failed to build JointState message: #{inspect(reason)}"
         )
     end
+  end
 
-    # Publish CartesianPose
+  defp publish_cartesian_pose(x, y, z, roll, pitch, yaw, state) do
     case CartesianPose.new(state.controller_name,
            x: x,
            y: y,
@@ -422,12 +431,31 @@ defmodule BB.Ufactory.Controller do
           "[BB.Ufactory.Controller] Failed to build CartesianPose message: #{inspect(reason)}"
         )
     end
-
-    # Report errors on normal-report frames that include error_code
-    state = maybe_report_error(report, state)
-
-    state
   end
+
+  # Publishes a Wrench message when ft_filtered data is present in the real-time
+  # report. ft_filtered is only populated when the arm firmware sends 135+ byte
+  # frames, which requires the F/T sensor to be enabled via cmd_ft_sensor_enable/2.
+  defp maybe_publish_wrench(%{ft_filtered: [fx, fy, fz, tx, ty, tz]}, state) do
+    case Wrench.new(state.controller_name,
+           fx: fx,
+           fy: fy,
+           fz: fz,
+           tx: tx,
+           ty: ty,
+           tz: tz
+         ) do
+      {:ok, msg} ->
+        BB.publish(state.bb.robot, [:sensor, state.controller_name, :wrench], msg)
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Controller] Failed to build Wrench message: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp maybe_publish_wrench(_report, _state), do: :ok
 
   defp maybe_report_error(%{error_code: error_code} = _report, state)
        when is_integer(error_code) and error_code != 0 and
