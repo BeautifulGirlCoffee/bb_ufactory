@@ -82,9 +82,12 @@ defmodule BB.Ufactory.Controller do
 
   require Logger
 
+  alias BB.Error.Protocol.Ufactory.ConnectionError
+  alias BB.Error.Protocol.Ufactory.HardwareFault
   alias BB.Message
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
+  alias BB.Ufactory.Message.ArmStatus
   alias BB.Ufactory.Message.CartesianPose
   alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Model
@@ -182,17 +185,16 @@ defmodule BB.Ufactory.Controller do
         buffer: <<>>,
         ets: ets,
         txn_id: 0,
-        last_error_code: 0
+        last_error_code: 0,
+        last_arm_status: nil
       }
 
       {:ok, state}
     else
       {:error, reason} ->
-        Logger.error(
-          "[BB.Ufactory.Controller] TCP connect failed for #{inspect(bb.path)}: #{inspect(reason)}"
-        )
-
-        {:stop, reason}
+        error = ConnectionError.exception(host: host, port: port, reason: reason)
+        Logger.error("[BB.Ufactory.Controller] #{Exception.message(error)}")
+        {:stop, error}
     end
   end
 
@@ -394,8 +396,8 @@ defmodule BB.Ufactory.Controller do
     publish_cartesian_pose(x, y, z, roll, pitch, yaw, state)
     maybe_publish_wrench(report, state)
 
-    # Report errors on normal-report frames that include error_code
-    maybe_report_error(report, state)
+    state = maybe_report_error(report, state)
+    maybe_publish_arm_status(report, state)
   end
 
   defp publish_joint_state(joint_names, angles, torques, state) do
@@ -457,15 +459,46 @@ defmodule BB.Ufactory.Controller do
 
   defp maybe_publish_wrench(_report, _state), do: :ok
 
+  # Publishes ArmStatus when state, mode, error_code, or warn_code changes.
+  # error_code and warn_code are only present in normal-report frames (>= 133 bytes);
+  # they default to 0 for real-time frames that lack these fields.
+  defp maybe_publish_arm_status(report, state) do
+    error_code = Map.get(report, :error_code, 0) || 0
+    warn_code = Map.get(report, :warn_code, 0) || 0
+    current = {report.state, report.mode, error_code, warn_code}
+
+    if current != state.last_arm_status do
+      case ArmStatus.new(state.controller_name,
+             state: report.state,
+             mode: report.mode,
+             error_code: error_code,
+             warn_code: warn_code
+           ) do
+        {:ok, msg} ->
+          BB.publish(state.bb.robot, [:sensor, state.controller_name, :arm_status], msg)
+
+        {:error, reason} ->
+          Logger.warning(
+            "[BB.Ufactory.Controller] Failed to build ArmStatus message: #{inspect(reason)}"
+          )
+      end
+
+      %{state | last_arm_status: current}
+    else
+      state
+    end
+  end
+
   defp maybe_report_error(%{error_code: error_code} = _report, state)
        when is_integer(error_code) and error_code != 0 and
               error_code != state.last_error_code do
-    BB.Safety.report_error(
-      state.bb.robot,
-      state.bb.path,
-      %{error_code: error_code, description: "xArm hardware error code #{error_code}"}
-    )
+    error =
+      HardwareFault.exception(
+        error_code: error_code,
+        description: HardwareFault.describe(error_code)
+      )
 
+    BB.Safety.report_error(state.bb.robot, state.bb.path, error)
     %{state | last_error_code: error_code}
   end
 

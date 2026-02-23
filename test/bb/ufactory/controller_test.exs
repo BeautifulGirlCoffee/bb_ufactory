@@ -122,7 +122,8 @@ defmodule BB.Ufactory.ControllerTest do
       buffer: <<>>,
       ets: ets,
       txn_id: 0,
-      last_error_code: 0
+      last_error_code: 0,
+      last_arm_status: nil
     }
 
     Map.merge(base, extra)
@@ -527,9 +528,10 @@ defmodule BB.Ufactory.ControllerTest do
       frame = build_87_byte_frame()
       two_frames = frame <> frame
 
-      # Two frames → 2× JointState + 2× CartesianPose = 4 publish calls total
+      # Two frames → 2× JointState + 2× CartesianPose + 1× ArmStatus (only on first frame,
+      # second frame has same state/mode so ArmStatus is not re-published) = 5 publish calls total
       BB
-      |> expect(:publish, 4, fn TestRobot, _path, %Message{} -> :ok end)
+      |> expect(:publish, 5, fn TestRobot, _path, %Message{} -> :ok end)
 
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, two_frames}, state)
       assert new_state.buffer == <<>>
