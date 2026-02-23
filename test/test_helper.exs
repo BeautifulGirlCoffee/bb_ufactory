@@ -4,7 +4,7 @@
 
 Application.ensure_all_started(:mimic)
 
-ExUnit.start()
+ExUnit.start(exclude: [:hardware])
 
 Mimic.copy(BB)
 Mimic.copy(BB.Process)

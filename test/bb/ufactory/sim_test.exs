@@ -166,6 +166,54 @@ defmodule BB.Ufactory.SimTest do
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert_in_delta bm.target_position, 1.0, 1.0e-4
     end
+
+    test "J3 upper limit (~0.192 rad / 11°) clamps an out-of-range position" do
+      BB.Actuator.set_position!(@robot, :j3_motor, 1.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j3_motor in path
+      assert bm.target_position <= 0.193
+    end
+
+    test "J3 lower limit (~-3.927 rad / -225°) clamps an out-of-range position" do
+      BB.Actuator.set_position!(@robot, :j3_motor, -4.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j3_motor in path
+      assert bm.target_position >= -3.928
+    end
+
+    test "J4 symmetric ±2π limits do not clamp 5.0 rad" do
+      BB.Actuator.set_position!(@robot, :j4_motor, 5.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j4_motor in path
+      assert_in_delta bm.target_position, 5.0, 1.0e-4
+    end
+
+    test "J5 upper limit (π rad / 180°) clamps 4.0 rad" do
+      BB.Actuator.set_position!(@robot, :j5_motor, 4.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j5_motor in path
+      assert bm.target_position <= @pi + 0.001
+    end
+
+    test "J5 lower limit (~-1.693 rad / -97°) clamps -2.0 rad" do
+      BB.Actuator.set_position!(@robot, :j5_motor, -2.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j5_motor in path
+      assert bm.target_position >= -1.694
+    end
+
+    test "J6 symmetric ±2π limits do not clamp 3.0 rad" do
+      BB.Actuator.set_position!(@robot, :j6_motor, 3.0)
+
+      assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert :j6_motor in path
+      assert_in_delta bm.target_position, 3.0, 1.0e-4
+    end
   end
 
   # ── OpenLoopPositionEstimator ─────────────────────────────────────────────────
@@ -199,7 +247,89 @@ defmodule BB.Ufactory.SimTest do
     end
   end
 
+  # ── Concurrent commands ─────────────────────────────────────────────────────
+
+  describe "concurrent position commands on multiple joints" do
+    setup do
+      BB.Safety.arm(@robot)
+      BB.subscribe(@robot, [:actuator])
+      on_exit(fn -> BB.Safety.disarm(@robot) end)
+      :ok
+    end
+
+    test "commanding all 6 joints simultaneously produces 6 BeginMotion messages" do
+      for {motor, pos} <- [
+            {:j1_motor, 0.1},
+            {:j2_motor, 0.1},
+            {:j3_motor, -0.1},
+            {:j4_motor, 0.1},
+            {:j5_motor, 0.1},
+            {:j6_motor, 0.1}
+          ] do
+        BB.Actuator.set_position!(@robot, motor, pos)
+      end
+
+      motors_received = collect_begin_motion_motors(6, 2_000)
+      assert length(motors_received) == 6
+
+      for motor <- [:j1_motor, :j2_motor, :j3_motor, :j4_motor, :j5_motor, :j6_motor] do
+        assert motor in motors_received
+      end
+    end
+  end
+
+  # ── Arm/disarm cycle ─────────────────────────────────────────────────────────
+
+  describe "arm/disarm cycle" do
+    test "re-arming after disarm allows new commands" do
+      BB.Safety.arm(@robot)
+      BB.subscribe(@robot, [:actuator])
+
+      BB.Actuator.set_position!(@robot, :j1_motor, 0.5)
+      assert_receive {:bb, _path, %Message{payload: %BeginMotion{}}}, 1_000
+
+      BB.Safety.disarm(@robot)
+      BB.Safety.arm(@robot)
+
+      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
+      assert_in_delta bm.target_position, 1.0, 1.0e-4
+
+      BB.Safety.disarm(@robot)
+    end
+  end
+
   # ── Helpers ───────────────────────────────────────────────────────────────────
+
+  defp collect_begin_motion_motors(expected_count, timeout_ms) do
+    collect_begin_motion_motors(
+      [],
+      expected_count,
+      timeout_ms,
+      System.monotonic_time(:millisecond)
+    )
+  end
+
+  defp collect_begin_motion_motors(acc, expected_count, _timeout_ms, _start_ms)
+       when length(acc) >= expected_count do
+    acc
+  end
+
+  defp collect_begin_motion_motors(acc, expected_count, timeout_ms, start_ms) do
+    remaining = timeout_ms - (System.monotonic_time(:millisecond) - start_ms)
+
+    if remaining <= 0 do
+      acc
+    else
+      receive do
+        {:bb, path, %Message{payload: %BeginMotion{}}} ->
+          motor = List.last(path)
+          collect_begin_motion_motors([motor | acc], expected_count, timeout_ms, start_ms)
+      after
+        remaining -> acc
+      end
+    end
+  end
 
   # Collects all JointState position values published within `timeout_ms`.
   defp collect_joint_state_positions(timeout_ms) do

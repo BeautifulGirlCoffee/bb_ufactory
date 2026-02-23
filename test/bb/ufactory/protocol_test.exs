@@ -50,6 +50,22 @@ defmodule BB.Ufactory.ProtocolTest do
     test "encode_fp32 is little-endian (1.0 = 0x3F800000 LE = <<0, 0, 128, 63>>)" do
       assert Protocol.encode_fp32(1.0) == <<0x00, 0x00, 0x80, 0x3F>>
     end
+
+    test "round-trips very small positive float (1.0e-38)" do
+      val = 1.0e-38
+      assert_in_delta Protocol.decode_fp32(Protocol.encode_fp32(val)), val, 1.0e-44
+    end
+
+    test "round-trips very large positive float (1.0e+38)" do
+      val = 1.0e+38
+      assert_in_delta Protocol.decode_fp32(Protocol.encode_fp32(val)), val, 1.0e+32
+    end
+
+    test "round-trips negative zero" do
+      encoded = Protocol.encode_fp32(-0.0)
+      decoded = Protocol.decode_fp32(encoded)
+      assert decoded == 0.0 or decoded == -0.0
+    end
   end
 
   # ── decode_fp32s ────────────────────────────────────────────────────────────
@@ -150,6 +166,20 @@ defmodule BB.Ufactory.ProtocolTest do
     test "returns {:error, {:bad_protocol_id, id}} for wrong protocol" do
       bad = <<0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0C, 0x00>>
       assert {:error, {:bad_protocol_id, 0x0000}} = Protocol.parse_response(bad)
+    end
+
+    test "parses a response with non-zero status byte" do
+      response = <<0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x0B, 0x01>>
+      assert {:ok, {0x0B, 0x01, <<>>}, <<>>} = Protocol.parse_response(response)
+    end
+
+    test "returns {:error, ...} for standard Modbus protocol ID 0x0000" do
+      bad = <<0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0C, 0x00>>
+      assert {:error, {:bad_protocol_id, 0x0000}} = Protocol.parse_response(bad)
+    end
+
+    test "returns {:more} for exactly 6 bytes (header only, no body)" do
+      assert Protocol.parse_response(<<0x00, 0x01, 0x00, 0x02, 0x00, 0x02>>) == {:more}
     end
   end
 
@@ -276,6 +306,24 @@ defmodule BB.Ufactory.ProtocolTest do
       params = binary_part(frame, 7, 40)
       floats = Protocol.decode_fp32s(params, 10)
       assert_in_delta List.last(floats), 0.0, 1.0e-9
+    end
+
+    test "truncates angle list longer than 7 to exactly 7 joints" do
+      angles = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+      frame = Protocol.cmd_move_joints(0, angles, 1.0, 10.0)
+      params = binary_part(frame, 7, 40)
+      floats = Protocol.decode_fp32s(params, 10)
+
+      assert_in_delta Enum.at(floats, 6), 7.0, 1.0e-6
+      assert_in_delta Enum.at(floats, 7), 1.0, 1.0e-6
+    end
+
+    test "produces the same 47-byte frame size regardless of input angle count" do
+      for count <- [0, 3, 6, 7, 10] do
+        angles = List.duplicate(0.5, count)
+        frame = Protocol.cmd_move_joints(0, angles, 1.0, 1.0)
+        assert byte_size(frame) == 47, "expected 47 bytes for #{count} angles"
+      end
     end
   end
 

@@ -619,6 +619,175 @@ defmodule BB.Ufactory.ControllerTest do
     end
   end
 
+  # ── handle_info — report socket error paths ──────────────────────────────────
+
+  describe "handle_info({:tcp_closed, ...})" do
+    setup do
+      {cmd_client, _cmd_server} = tcp_pair()
+      state = make_state(cmd_client, %{report_socket: :fake_report_socket})
+      on_exit(fn -> :gen_tcp.close(cmd_client) end)
+      %{state: state}
+    end
+
+    test "sets report_socket to nil and schedules reconnect", %{state: state} do
+      assert {:noreply, new_state} =
+               Controller.handle_info({:tcp_closed, :fake_report_socket}, state)
+
+      assert new_state.report_socket == nil
+      assert new_state.reconnect_attempts == 0
+      assert_receive :reconnect_report, 2_000
+    end
+  end
+
+  describe "handle_info({:tcp_error, ...})" do
+    setup do
+      {cmd_client, _cmd_server} = tcp_pair()
+      state = make_state(cmd_client, %{report_socket: :fake_report_socket})
+      on_exit(fn -> :gen_tcp.close(cmd_client) end)
+      %{state: state}
+    end
+
+    test "sets report_socket to nil and schedules reconnect", %{state: state} do
+      assert {:noreply, new_state} =
+               Controller.handle_info({:tcp_error, :fake_report_socket, :econnreset}, state)
+
+      assert new_state.report_socket == nil
+      assert new_state.reconnect_attempts == 0
+      assert_receive :reconnect_report, 2_000
+    end
+  end
+
+  describe "handle_info(:reconnect_report)" do
+    test "does nothing if report_socket is already connected" do
+      {cmd_client, _cmd_server} = tcp_pair()
+      state = make_state(cmd_client, %{report_socket: :some_socket})
+      on_exit(fn -> :gen_tcp.close(cmd_client) end)
+
+      assert {:noreply, ^state} = Controller.handle_info(:reconnect_report, state)
+    end
+
+    test "increments reconnect_attempts on failure" do
+      {cmd_client, _cmd_server} = tcp_pair()
+
+      state =
+        make_state(cmd_client, %{
+          report_socket: nil,
+          report_port: 1,
+          reconnect_attempts: 0
+        })
+
+      on_exit(fn -> :gen_tcp.close(cmd_client) end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:reconnect_report, state)
+      assert new_state.reconnect_attempts == 1
+      assert new_state.report_socket == nil
+    end
+  end
+
+  describe "handle_info({:tcp, ...}) — malformed report data" do
+    setup do
+      {cmd_client, _cmd_server} = tcp_pair()
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      BB.Safety
+      |> stub(:armed?, fn _robot -> false end)
+
+      state = make_state(cmd_client)
+      on_exit(fn -> :gen_tcp.close(cmd_client) end)
+      %{state: state}
+    end
+
+    test "buffers data that cannot form a complete frame without corruption", %{state: state} do
+      garbage = <<0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x10>>
+
+      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, garbage}, state)
+      assert byte_size(new_state.buffer) > 0
+    end
+
+    test "valid frame after partial garbage is processed normally", %{state: state} do
+      valid_frame = build_87_byte_frame(angles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+
+      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, valid_frame}, state)
+      assert new_state.buffer == <<>>
+
+      [{1, pos, _torq, _set}] = :ets.lookup(new_state.ets, 1)
+      assert_in_delta pos, 0.1, 1.0e-5
+    end
+  end
+
+  describe "error code in report triggers safety reporting" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "calls BB.Safety.report_error when heartbeat poll returns non-zero error code",
+         %{state: state, cmd_server: cmd_server} do
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.__struct__ == BB.Error.Protocol.Ufactory.HardwareFault
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+
+    test "does not re-report the same error code on consecutive heartbeats",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | last_error_code: 22}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> reject(:report_error, 3)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+
+    test "clears last_error_code when heartbeat poll returns zero",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | last_error_code: 22}
+
+      ok_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0, 0x00>>
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, ok_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 0
+    end
+  end
+
   # ── handle_info(:loop) — control loop ────────────────────────────────────────
 
   describe "handle_info(:loop)" do
