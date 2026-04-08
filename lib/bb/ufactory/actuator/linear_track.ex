@@ -14,6 +14,14 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   commands are forwarded immediately to the controller via
   `BB.Process.call/3`.
 
+  ## Lifecycle
+
+  The track motor is **not** enabled during `init/1`. Instead, the actuator
+  subscribes to state machine transitions and enables the track when the
+  robot transitions to `:armed`. This avoids sending RS485 commands before
+  the arm controller is fully initialized (mode 0, state 0), which can
+  trigger spurious servo motor faults on the controller bus.
+
   ## Protocol Note
 
   The linear track uses big-endian int32 encoding for position — the only
@@ -47,6 +55,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.StateMachine.Transition
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -57,13 +66,27 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     controller = Keyword.fetch!(opts, :controller)
     speed = Keyword.get(opts, :speed, 200)
 
+    BB.subscribe(bb.robot, [:state_machine])
+
     {:ok, %{bb: bb, controller: controller, speed: speed}}
   end
 
-  # ── disarm/1 — track coasts when arm disarms ─────────────────────────────────
+  # ── disarm/1 — disable track motor when arm disarms ──────────────────────────
 
   @impl BB.Actuator
-  def disarm(_opts), do: :ok
+  def disarm(opts) do
+    bb = Keyword.fetch!(opts, :bb)
+    controller = Keyword.fetch!(opts, :controller)
+    frame = Protocol.cmd_linear_track_enable(0, false)
+
+    try do
+      BB.Process.call(bb.robot, controller, {:send_command, frame})
+    catch
+      _, _ -> :ok
+    end
+
+    :ok
+  end
 
   # ── handle_cast position commands ────────────────────────────────────────────
 
@@ -75,7 +98,18 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   def handle_cast(_request, state), do: {:noreply, state}
 
-  # ── handle_info pubsub delivery ──────────────────────────────────────────────
+  # ── handle_info — state machine transitions ─────────────────────────────────
+
+  @impl BB.Actuator
+  def handle_info(
+        {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
+        state
+      ) do
+    enable_track(state.bb.robot, state.controller)
+    {:noreply, state}
+  end
+
+  # ── handle_info — pubsub delivery ──────────────────────────────────────────
 
   @impl BB.Actuator
   def handle_info(
@@ -91,12 +125,13 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   # ── Private helpers ──────────────────────────────────────────────────────────
 
   defp apply_track_position(pos_mm, state) do
+    initial_position = read_track_position(state.bb.robot, state.controller)
     {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, state.speed)
 
     # Speed must be set before position so the arm uses the new speed for this move.
     with :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, spd_frame}),
          :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, pos_frame}) do
-      publish_begin_motion(pos_mm, state)
+      publish_begin_motion(pos_mm, initial_position, state)
     else
       {:error, reason} ->
         Logger.warning(
@@ -107,13 +142,43 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     state
   end
 
-  defp publish_begin_motion(pos_mm, state) do
+  defp enable_track(robot, controller) do
+    frame = Protocol.cmd_linear_track_enable(0, true)
+
+    case BB.Process.call(robot, controller, {:send_command, frame}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Actuator.LinearTrack] track enable failed: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp read_track_position(robot, controller) do
+    frame = Protocol.cmd_linear_track_read_position(0)
+
+    case BB.Process.call(robot, controller, {:send_and_recv, frame}) do
+      {:ok, {_reg, 0x00, params}, _rest} ->
+        case Protocol.parse_linear_track_position(params) do
+          {:ok, pos_mm} -> pos_mm
+          _ -> 0.0
+        end
+
+      _ ->
+        0.0
+    end
+  end
+
+  defp publish_begin_motion(pos_mm, initial_position, state) do
     actuator_name = List.last(state.bb.path)
-    travel_ms = round(abs(pos_mm) / max(state.speed, 1) * 1000)
+    travel_distance = abs(pos_mm - initial_position)
+    travel_ms = round(travel_distance / max(state.speed, 1) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
     case Message.new(BeginMotion, actuator_name,
-           initial_position: 0.0,
+           initial_position: initial_position * 1.0,
            target_position: pos_mm * 1.0,
            expected_arrival: expected_arrival,
            command_type: :position

@@ -32,10 +32,10 @@ defmodule BB.Ufactory.Controller do
 
   ## Safety
 
-  On arm transition → `:armed`, the controller sends `cmd_enable(true)` then
-  `cmd_set_state(3)` (play/motion-ready). On any transition away from `:armed`
-  it sends `cmd_enable(false)` (hold) or `cmd_stop` depending on
-  `disarm_action`.
+  On arm transition → `:armed`, the controller runs the full xArm init
+  sequence: `cmd_clean_error` → `cmd_enable(true)` → `cmd_set_mode(0)` →
+  `cmd_set_state(0)`. On any transition away from `:armed` it sends
+  `cmd_enable(false)` (hold) or `cmd_stop` depending on `disarm_action`.
 
   The `disarm/1` safety callback opens a **fresh** TCP connection so it can
   send `cmd_stop` even if the GenServer process has crashed. It never raises.
@@ -134,6 +134,33 @@ defmodule BB.Ufactory.Controller do
         doc:
           "Enable the Cartesian workspace fence defined by `tcp_boundary`. " <>
             "Has no effect if `tcp_boundary` is nil (register 0x3B)."
+      ],
+      auto_clear_errors: [
+        type: :boolean,
+        default: true,
+        doc:
+          "Automatically clear stale error codes during the arm sequence on each " <>
+            "`:armed` transition. When true, `cmd_clean_error` is sent before " <>
+            "enabling motors. Set to false to require manual error clearing."
+      ],
+      error_report_grace_ms: [
+        type: :non_neg_integer,
+        default: 3_000,
+        doc:
+          "Milliseconds after arming during which polled error codes are tracked " <>
+            "but not forwarded to `BB.Safety.report_error/3`. Prevents the " <>
+            "clean-error → transient-zero → re-detect feedback loop that causes " <>
+            "flapping auto-disarm cycles when a persistent hardware fault returns " <>
+            "immediately after clearing."
+      ],
+      ignore_error_codes: [
+        type: {:list, :non_neg_integer},
+        default: [],
+        doc:
+          "Error codes that are logged as warnings but never forwarded to " <>
+            "`BB.Safety.report_error/3`. Useful for persistent conditions " <>
+            "(e.g., `[11]` to suppress a recurring linear-track servo fault) " <>
+            "that would otherwise trigger continuous auto-disarm cycles."
       ]
     ]
 
@@ -246,6 +273,10 @@ defmodule BB.Ufactory.Controller do
         last_error_code: 0,
         last_arm_status: nil,
         reconnect_attempts: 0,
+        auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
+        error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
+        error_report_grace_until: nil,
+        ignore_error_codes: Keyword.get(opts, :ignore_error_codes, []),
         # Hardware config opts — read once during apply_hardware_config/1
         tcp_offset: Keyword.get(opts, :tcp_offset),
         tcp_load: Keyword.get(opts, :tcp_load),
@@ -351,10 +382,7 @@ defmodule BB.Ufactory.Controller do
         {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
         state
       ) do
-    # send_command increments txn_id after each send, so the second frame
-    # uses state.txn_id (already updated to 1 after the first send).
-    state = send_command(Protocol.cmd_enable(state.txn_id, true), state)
-    state = send_command(Protocol.cmd_set_state(state.txn_id, 3), state)
+    state = arm_init_sequence(state)
     {:noreply, state}
   end
 
@@ -374,6 +402,30 @@ defmodule BB.Ufactory.Controller do
   @impl BB.Controller
   def handle_call({:send_command, frame}, _from, state) do
     result = :gen_tcp.send(state.cmd_socket, frame)
+    {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
+  end
+
+  def handle_call({:send_and_recv, frame}, _from, state) do
+    drain_recv_buffer(state.cmd_socket)
+
+    result =
+      with :ok <- :gen_tcp.send(state.cmd_socket, frame),
+           {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, 5_000) do
+        Protocol.parse_response(data)
+      end
+
+    {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
+  end
+
+  def handle_call({:send_and_recv, frame, timeout}, _from, state) do
+    drain_recv_buffer(state.cmd_socket)
+
+    result =
+      with :ok <- :gen_tcp.send(state.cmd_socket, frame),
+           {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, timeout) do
+        Protocol.parse_response(data)
+      end
+
     {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
   end
 
@@ -690,12 +742,21 @@ defmodule BB.Ufactory.Controller do
   # Polls register 0x0F (GET_ERROR) on the command socket. Port 30003 real-time
   # reports never include error_code, so this is the only way to detect hardware
   # faults without connecting to port 30001.
+  #
+  # Drains stale responses before sending to prevent desynchronization: fire-and-
+  # forget operations (100Hz cmd_move_joints, RS485 actuator writes) generate
+  # responses nobody reads, and those accumulate in the TCP receive buffer. Without
+  # draining, recv would read a stale response — e.g. an RS485 response whose
+  # host_id byte (0x0B = 11) would be misinterpreted as error code 11 ("Servo motor
+  # 1 error"). The register is also validated to guard against any remaining
+  # desynchronization.
   defp poll_error_code(state) do
+    drain_recv_buffer(state.cmd_socket)
     frame = Protocol.cmd_get_error(state.txn_id)
 
     with :ok <- :gen_tcp.send(state.cmd_socket, frame),
          {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, 500),
-         {:ok, {_register, _status, <<error_code::8, _rest::binary>>}, _tail} <-
+         {:ok, {0x0F, _status, <<error_code::8, _rest::binary>>}, _tail} <-
            Protocol.parse_response(data) do
       state = %{state | txn_id: next_txn(state.txn_id)}
       maybe_report_error(%{error_code: error_code}, state)
@@ -707,14 +768,32 @@ defmodule BB.Ufactory.Controller do
   defp maybe_report_error(%{error_code: error_code} = _report, state)
        when is_integer(error_code) and error_code != 0 and
               error_code != state.last_error_code do
-    error =
-      HardwareFault.exception(
-        error_code: error_code,
-        description: HardwareFault.describe(error_code)
-      )
+    cond do
+      error_code in state.ignore_error_codes ->
+        Logger.debug(
+          "[BB.Ufactory.Controller] Ignoring error code #{error_code} (#{HardwareFault.describe(error_code)}) for #{state.controller_name}"
+        )
 
-    BB.Safety.report_error(state.bb.robot, state.bb.path, error)
-    %{state | last_error_code: error_code}
+        %{state | last_error_code: error_code}
+
+      state.error_report_grace_until != nil and
+          System.monotonic_time(:millisecond) < state.error_report_grace_until ->
+        Logger.debug(
+          "[BB.Ufactory.Controller] Suppressing error code #{error_code} during post-arm grace period for #{state.controller_name}"
+        )
+
+        %{state | last_error_code: error_code}
+
+      true ->
+        error =
+          HardwareFault.exception(
+            error_code: error_code,
+            description: HardwareFault.describe(error_code)
+          )
+
+        BB.Safety.report_error(state.bb.robot, state.bb.path, error)
+        %{state | last_error_code: error_code}
+    end
   end
 
   defp maybe_report_error(%{error_code: 0}, state) do
@@ -722,6 +801,27 @@ defmodule BB.Ufactory.Controller do
   end
 
   defp maybe_report_error(_report, state), do: state
+
+  # Full xArm init sequence: clear stale errors, enable motors, set position
+  # control mode, set state to ready. Without this sequence (especially
+  # set_mode(0) and set_state(0)), the arm may remain in a stopped state
+  # after recovering from faults.
+  defp arm_init_sequence(state) do
+    state =
+      if state.auto_clear_errors do
+        grace_until =
+          System.monotonic_time(:millisecond) + state.error_report_grace_ms
+
+        state = send_command(Protocol.cmd_clean_error(state.txn_id), state)
+        %{state | error_report_grace_until: grace_until}
+      else
+        state
+      end
+
+    state = send_command(Protocol.cmd_enable(state.txn_id, true), state)
+    state = send_command(Protocol.cmd_set_mode(state.txn_id, 0), state)
+    send_command(Protocol.cmd_set_state(state.txn_id, 0), state)
+  end
 
   defp send_command(frame, state) do
     case :gen_tcp.send(state.cmd_socket, frame) do
@@ -735,6 +835,19 @@ defmodule BB.Ufactory.Controller do
     end
 
     %{state | txn_id: next_txn(state.txn_id)}
+  end
+
+  # Drains any stale unread responses from a TCP socket's receive buffer.
+  # Fire-and-forget operations (100Hz cmd_move_joints, RS485 actuator writes)
+  # generate responses the controller never reads. Left uncleared, these
+  # desynchronize subsequent recv calls — a send_and_recv for GET_ERROR could
+  # read a stale RS485 response whose host_id byte (0x0B = 11) gets
+  # misinterpreted as error code 11 ("Servo motor 1 error").
+  defp drain_recv_buffer(socket) do
+    case :gen_tcp.recv(socket, 0, 0) do
+      {:ok, _data} -> drain_recv_buffer(socket)
+      {:error, _} -> :ok
+    end
   end
 
   defp next_txn(txn_id), do: rem(txn_id + 1, 65_536)

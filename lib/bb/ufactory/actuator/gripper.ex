@@ -10,10 +10,14 @@ defmodule BB.Ufactory.Actuator.Gripper do
   0x7C). Position is expressed in **pulse units** (0–840). The G2 range is
   0–840, capped at 840 in `BB.Ufactory.Protocol.cmd_gripper_position/2`.
 
-  ## Initialisation
+  ## Lifecycle
 
-  On `init/1`, the actuator sends `cmd_gripper_enable(true)` to the controller
-  so the gripper is ready to receive position commands immediately.
+  The gripper is **not** enabled during `init/1`. Instead, the actuator
+  subscribes to state machine transitions and sends `cmd_gripper_enable(true)`
+  and `cmd_gripper_speed` when the robot transitions to `:armed`. This avoids
+  sending RS485 commands before the arm controller is fully initialized
+  (mode 0, state 0), which can trigger spurious servo motor faults on the
+  controller bus.
 
   ## Command Interface
 
@@ -47,6 +51,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.StateMachine.Transition
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -57,29 +62,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
     controller = Keyword.fetch!(opts, :controller)
     speed = Keyword.get(opts, :speed, 1500)
 
-    enable_frame = Protocol.cmd_gripper_enable(0, true)
-
-    case BB.Process.call(bb.robot, controller, {:send_command, enable_frame}) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Actuator.Gripper] gripper_enable(true) failed: #{inspect(reason)}"
-        )
-    end
-
-    speed_frame = Protocol.cmd_gripper_speed(0, speed)
-
-    case BB.Process.call(bb.robot, controller, {:send_command, speed_frame}) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Actuator.Gripper] gripper_speed(#{speed}) failed: #{inspect(reason)}"
-        )
-    end
+    BB.subscribe(bb.robot, [:state_machine])
 
     {:ok, %{bb: bb, controller: controller, speed: speed}}
   end
@@ -111,7 +94,18 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
   def handle_cast(_request, state), do: {:noreply, state}
 
-  # ── handle_info pubsub delivery ──────────────────────────────────────────────
+  # ── handle_info — state machine transitions ─────────────────────────────────
+
+  @impl BB.Actuator
+  def handle_info(
+        {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
+        state
+      ) do
+    enable_gripper(state.bb.robot, state.controller, state.speed)
+    {:noreply, state}
+  end
+
+  # ── handle_info — pubsub delivery ──────────────────────────────────────────
 
   @impl BB.Actuator
   def handle_info(
@@ -125,6 +119,32 @@ defmodule BB.Ufactory.Actuator.Gripper do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ── Private helpers ──────────────────────────────────────────────────────────
+
+  defp enable_gripper(robot, controller, speed) do
+    enable_frame = Protocol.cmd_gripper_enable(0, true)
+
+    case BB.Process.call(robot, controller, {:send_command, enable_frame}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Actuator.Gripper] gripper_enable(true) failed: #{inspect(reason)}"
+        )
+    end
+
+    speed_frame = Protocol.cmd_gripper_speed(0, speed)
+
+    case BB.Process.call(robot, controller, {:send_command, speed_frame}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Actuator.Gripper] gripper_speed(#{speed}) failed: #{inspect(reason)}"
+        )
+    end
+  end
 
   defp apply_gripper_position(pos, state) do
     pos_int = round(pos) |> max(0) |> min(840)

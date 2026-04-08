@@ -62,6 +62,9 @@ defmodule BB.Ufactory.Protocol do
   @reg_get_joints 0x2A
   @reg_rs485_rtu 0x7C
   @reg_get_error 0x0F
+  @reg_clean_err 0x10
+  @reg_clean_war 0x11
+  @reg_set_mode 0x13
   @reg_ft_get_data 0xC8
   @reg_ft_enable 0xC9
 
@@ -80,8 +83,10 @@ defmodule BB.Ufactory.Protocol do
   @reg_set_self_collis_check 0x4D
 
   # ── RS485 proxy IDs used for accessories ──────────────────────────────────
-  # host_id 9 = robot-side RS485 bus (ROBOT_RS485_HOST_ID)
+  # host_id 9 = robot-side RS485 bus (ROBOT_RS485_HOST_ID / TGPIO)
   @rs485_host_id 0x09
+  # host_id 11 = controller-box RS485 bus (CONTROL_BOX_RS485_HOST_ID)
+  @control_box_rs485_host_id 0x0B
   # device_id 8 = xArm gripper bus address (GRIPPER_ID)
   @gripper_device_id 0x08
 
@@ -273,6 +278,42 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
+  Clears the current error code on the arm (register 0x10, CLEAN_ERR).
+
+  After clearing, the typical recovery sequence is:
+  1. `cmd_enable/2` — re-enable motors
+  2. `cmd_set_mode/2` — set mode 0 (position control)
+  3. `cmd_set_state/2` — set state 0 (ready)
+  """
+  @spec cmd_clean_error(non_neg_integer()) :: binary()
+  def cmd_clean_error(txn_id) do
+    build_frame(txn_id, @reg_clean_err, <<>>)
+  end
+
+  @doc """
+  Clears the current warning code on the arm (register 0x11, CLEAN_WAR).
+  """
+  @spec cmd_clean_warn(non_neg_integer()) :: binary()
+  def cmd_clean_warn(txn_id) do
+    build_frame(txn_id, @reg_clean_war, <<>>)
+  end
+
+  @doc """
+  Sets the arm control mode (register 0x13, SET_MODE).
+
+  Mode values:
+  - `0` — position control (default)
+  - `1` — servo/direct-drive mode
+  - `2` — joint teaching mode
+
+  Must be followed by `cmd_set_state(txn_id, 0)` to take effect.
+  """
+  @spec cmd_set_mode(non_neg_integer(), non_neg_integer()) :: binary()
+  def cmd_set_mode(txn_id, mode) do
+    build_frame(txn_id, @reg_set_mode, <<mode::8>>)
+  end
+
+  @doc """
   Commands a joint-space move to the given angles.
 
   `angles` must have at most 7 elements (one per joint J1..J7). If fewer than
@@ -386,6 +427,28 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
+  Enables or disables the linear track motor (RS485 proxy, controller-box bus).
+
+  Writes register `CON_EN` (0x0100) on the linear track servo (device 0x01)
+  via the controller-box RS485 bus (host_id 0x0B).
+  """
+  @spec cmd_linear_track_enable(non_neg_integer(), boolean()) :: binary()
+  def cmd_linear_track_enable(txn_id, enable) do
+    value = if enable, do: 1, else: 0
+
+    build_frame(
+      txn_id,
+      @reg_rs485_rtu,
+      rs485_write_registers(
+        @linear_track_device_id,
+        @gripper_reg_con_en,
+        <<0x00, value>>,
+        @control_box_rs485_host_id
+      )
+    )
+  end
+
+  @doc """
   Returns `{pos_frame, spd_frame}` — two frames to move the linear track to
   `position_mm` at `speed` mm/s.
 
@@ -422,18 +485,65 @@ defmodule BB.Ufactory.Protocol do
       build_frame(
         txn_id,
         @reg_rs485_rtu,
-        rs485_write_registers(@linear_track_device_id, @linear_track_reg_pos, pos_bytes)
+        rs485_write_registers(
+          @linear_track_device_id,
+          @linear_track_reg_pos,
+          pos_bytes,
+          @control_box_rs485_host_id
+        )
       )
 
     spd_frame =
       build_frame(
         txn_id,
         @reg_rs485_rtu,
-        rs485_write_registers(@linear_track_device_id, @linear_track_reg_speed, spd_bytes)
+        rs485_write_registers(
+          @linear_track_device_id,
+          @linear_track_reg_speed,
+          spd_bytes,
+          @control_box_rs485_host_id
+        )
       )
 
     {pos_frame, spd_frame}
   end
+
+  @doc """
+  Builds an RS485 read frame to query the linear track's current position.
+
+  Reads 2 registers (4 bytes) starting at address `0x0A20` on the controller-box
+  RS485 bus. The response contains a signed 32-bit big-endian integer that
+  encodes position as `raw / 2000 = mm`.
+
+  Use `parse_linear_track_position/1` to decode the response params.
+  """
+  @spec cmd_linear_track_read_position(non_neg_integer()) :: binary()
+  def cmd_linear_track_read_position(txn_id) do
+    read_payload =
+      <<@control_box_rs485_host_id::8, @linear_track_device_id::8, 0x03::8, 0x0A::8, 0x20::8,
+        0x00::8, 0x02::8>>
+
+    build_frame(txn_id, @reg_rs485_rtu, read_payload)
+  end
+
+  @doc """
+  Decodes the response params from a linear track position read.
+
+  Returns the position in millimetres.
+
+  ## Examples
+
+      iex> BB.Ufactory.Protocol.parse_linear_track_position(<<0x0B, 0x01, 0x03, 0x04, 0x00, 0x1E, 0x84, 0x80>>)
+      {:ok, 1.0}
+  """
+  @spec parse_linear_track_position(binary()) :: {:ok, float()} | {:error, :invalid_response}
+  def parse_linear_track_position(
+        <<_host::8, _dev::8, _func::8, _bc::8, pos_raw::signed-32, _rest::binary>>
+      ) do
+    {:ok, pos_raw / 2000}
+  end
+
+  def parse_linear_track_position(_), do: {:error, :invalid_response}
 
   # ── TCP tool offset and payload ─────────────────────────────────────────────
 
@@ -648,11 +758,11 @@ defmodule BB.Ufactory.Protocol do
   #   count_hi (1) | count_lo (1) | byte_count (1) | value_bytes (n)
   #
   # `value_bytes` must be an even number of bytes (16-bit registers).
-  defp rs485_write_registers(device_id, reg_addr, value_bytes) do
+  defp rs485_write_registers(device_id, reg_addr, value_bytes, host_id \\ @rs485_host_id) do
     byte_count = byte_size(value_bytes)
     reg_count = div(byte_count, 2)
 
-    <<@rs485_host_id::8, device_id::8, 0x10::8, reg_addr::16, reg_count::16, byte_count::8>> <>
+    <<host_id::8, device_id::8, 0x10::8, reg_addr::16, reg_count::16, byte_count::8>> <>
       value_bytes
   end
 end

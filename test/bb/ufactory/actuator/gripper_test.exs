@@ -11,6 +11,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.StateMachine.Transition
   alias BB.Ufactory.Actuator.Gripper
   alias BB.Ufactory.Protocol
 
@@ -29,7 +30,42 @@ defmodule BB.Ufactory.Actuator.GripperTest do
   # ── init/1 ───────────────────────────────────────────────────────────────────
 
   describe "init/1" do
-    test "sends cmd_gripper_enable(true) then cmd_gripper_speed via controller call on init" do
+    test "stores controller and speed in state without sending hardware commands" do
+      BB
+      |> stub(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
+      BB.Process
+      |> reject(:call, 3)
+
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
+      assert {:ok, state} = Gripper.init(opts)
+      assert state.controller == :xarm
+      assert state.speed == 1500
+    end
+
+    test "stores custom speed from options" do
+      BB
+      |> stub(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm, speed: 800]
+      assert {:ok, state} = Gripper.init(opts)
+      assert state.speed == 800
+    end
+
+    test "subscribes to state machine transitions" do
+      BB
+      |> expect(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
+      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
+      assert {:ok, _state} = Gripper.init(opts)
+    end
+  end
+
+  # ── handle_info(state machine :armed) ──────────────────────────────────────
+
+  describe "handle_info(state machine transition to :armed)" do
+    test "sends cmd_gripper_enable(true) then cmd_gripper_speed on armed transition" do
+      state = make_state()
       expected_enable = Protocol.cmd_gripper_enable(0, true)
       expected_speed = Protocol.cmd_gripper_speed(0, 1500)
       test_pid = self()
@@ -44,39 +80,25 @@ defmodule BB.Ufactory.Actuator.GripperTest do
         :ok
       end)
 
-      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
-      assert {:ok, state} = Gripper.init(opts)
-      assert state.controller == :xarm
-      assert state.speed == 1500
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      assert {:noreply, ^state} = Gripper.handle_info(bb_msg, state)
 
       assert_receive {:frame, :first, ^expected_enable}
       assert_receive {:frame, :second, ^expected_speed}
     end
 
-    test "stores custom speed from options and sends it to hardware" do
-      expected_speed = Protocol.cmd_gripper_speed(0, 800)
-      test_pid = self()
+    test "completes even when enable command fails" do
+      state = make_state()
 
-      BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _} -> :ok end)
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        send(test_pid, {:speed_frame, frame})
-        :ok
-      end)
-
-      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm, speed: 800]
-      assert {:ok, state} = Gripper.init(opts)
-      assert state.speed == 800
-
-      assert_receive {:speed_frame, ^expected_speed}
-    end
-
-    test "completes init even when enable command fails" do
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:send_command, _} -> {:error, :closed} end)
 
-      opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
-      assert {:ok, _state} = Gripper.init(opts)
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      assert {:noreply, ^state} = Gripper.handle_info(bb_msg, state)
     end
   end
 

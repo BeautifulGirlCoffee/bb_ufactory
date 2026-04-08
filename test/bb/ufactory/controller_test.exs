@@ -133,7 +133,11 @@ defmodule BB.Ufactory.ControllerTest do
       reduced_joint_speed: nil,
       reduced_joint_ranges: nil,
       tcp_boundary: nil,
-      fence_on: false
+      fence_on: false,
+      auto_clear_errors: true,
+      error_report_grace_ms: 3_000,
+      error_report_grace_until: nil,
+      ignore_error_codes: []
     }
 
     Map.merge(base, extra)
@@ -788,6 +792,246 @@ defmodule BB.Ufactory.ControllerTest do
     end
   end
 
+  describe "error reporting grace period" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "suppresses report_error during grace period but updates last_error_code",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) + 60_000}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> reject(:report_error, 3)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+
+    test "reports error after grace period expires",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) - 5_000}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+
+    test "arm_init_sequence sets error_report_grace_until when auto_clear_errors is true",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | error_report_grace_until: nil, error_report_grace_ms: 5_000}
+
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      before = System.monotonic_time(:millisecond)
+      assert {:noreply, new_state} = Controller.handle_info(bb_msg, state)
+
+      assert new_state.error_report_grace_until >= before + 5_000
+      assert new_state.error_report_grace_until <= before + 5_100
+
+      {:ok, _data} = recv_at_least(cmd_server, 1)
+    end
+
+    test "arm_init_sequence does not set grace period when auto_clear_errors is false",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | auto_clear_errors: false, error_report_grace_until: nil}
+
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      assert {:noreply, new_state} = Controller.handle_info(bb_msg, state)
+      assert new_state.error_report_grace_until == nil
+
+      {:ok, _data} = recv_at_least(cmd_server, 1)
+    end
+  end
+
+  describe "ignore_error_codes" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "does not call report_error for ignored error codes",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | ignore_error_codes: [11, 22]}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 11, 0x00>>
+
+      BB.Safety
+      |> reject(:report_error, 3)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 11
+    end
+
+    test "reports error codes not in the ignore list",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | ignore_error_codes: [11], error_report_grace_until: nil}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+  end
+
+  # ── Response buffer draining ──────────────────────────────────────────────────
+  #
+  # Fire-and-forget operations (100Hz cmd_move_joints, RS485 actuator writes)
+  # generate responses the controller never reads. These accumulate in the TCP
+  # receive buffer and desynchronize subsequent recv calls. The drain_recv_buffer
+  # function clears stale data before every send-and-recv operation.
+
+  describe "response buffer draining" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "drains stale RS485 responses so poll_error_code reads the correct response",
+         %{state: state, cmd_server: cmd_server} do
+      # Pre-load the buffer with a stale RS485 response. Register 0x7C, params
+      # starting with host_id 0x0B (= decimal 11). Without draining + register
+      # validation, this would be misinterpreted as error code 11.
+      stale_rs485_response = Protocol.build_frame(0, 0x7C, <<0x00, 0x0B, 0x01, 0x10>>)
+      :gen_tcp.send(cmd_server, stale_rs485_response)
+      Process.sleep(10)
+
+      ok_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
+
+      BB.Safety
+      |> reject(:report_error, 3)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, ok_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 0
+    end
+
+    test "drains multiple stale responses accumulated from 100Hz loop",
+         %{state: state, cmd_server: cmd_server} do
+      # Simulate several cmd_move_joints responses sitting in the buffer
+      for _ <- 1..10 do
+        stale_move_response = Protocol.build_frame(0, 0x17, <<0x00>>)
+        :gen_tcp.send(cmd_server, stale_move_response)
+      end
+
+      Process.sleep(10)
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+
+    test "drains stale data before send_and_recv for actuator commands",
+         %{state: state, cmd_server: cmd_server} do
+      # Pre-load buffer with stale data
+      stale_response = Protocol.build_frame(0, 0x17, <<0x00>>)
+      :gen_tcp.send(cmd_server, stale_response)
+      Process.sleep(10)
+
+      frame = Protocol.cmd_get_error(0)
+      expected_response = Protocol.build_frame(0, 0x0F, <<0x00, 0x00>>)
+
+      task =
+        Task.async(fn ->
+          {:ok, _data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          :gen_tcp.send(cmd_server, expected_response)
+        end)
+
+      assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, _rest}, _new_state} =
+               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+
+      Task.await(task, 2_000)
+    end
+  end
+
   # ── handle_info(:loop) — control loop ────────────────────────────────────────
 
   describe "handle_info(:loop)" do
@@ -907,22 +1151,46 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state, cmd_server: cmd_server}
     end
 
-    test "sends cmd_enable(true) + cmd_set_state(3) on transition to :armed",
+    test "sends clean_error + enable + set_mode(0) + set_state(0) on transition to :armed",
          %{state: state, cmd_server: cmd_server} do
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
       bb_msg = {:bb, [:state_machine], msg}
 
       assert {:noreply, new_state} = Controller.handle_info(bb_msg, state)
 
+      clean_frame = Protocol.cmd_clean_error(0)
+      enable_frame = Protocol.cmd_enable(1, true)
+      mode_frame = Protocol.cmd_set_mode(2, 0)
+      state_frame = Protocol.cmd_set_state(3, 0)
+
+      expected =
+        clean_frame <> enable_frame <> mode_frame <> state_frame
+
+      assert {:ok, data} = recv_at_least(cmd_server, byte_size(expected))
+      assert data == expected
+
+      # txn_id advances by 4 (one per frame sent)
+      assert new_state.txn_id == 4
+    end
+
+    test "skips clean_error when auto_clear_errors is false",
+         %{state: state, cmd_server: cmd_server} do
+      state = %{state | auto_clear_errors: false}
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      assert {:noreply, new_state} = Controller.handle_info(bb_msg, state)
+
       enable_frame = Protocol.cmd_enable(0, true)
-      play_frame = Protocol.cmd_set_state(1, 3)
-      expected_bytes = byte_size(enable_frame) + byte_size(play_frame)
+      mode_frame = Protocol.cmd_set_mode(1, 0)
+      state_frame = Protocol.cmd_set_state(2, 0)
 
-      assert {:ok, data} = recv_at_least(cmd_server, expected_bytes)
-      assert data == enable_frame <> play_frame
+      expected = enable_frame <> mode_frame <> state_frame
 
-      # txn_id advances by 2 (one per frame sent)
-      assert new_state.txn_id == 2
+      assert {:ok, data} = recv_at_least(cmd_server, byte_size(expected))
+      assert data == expected
+
+      assert new_state.txn_id == 3
     end
 
     test "sends cmd_stop on transition away from :armed when disarm_action is :stop",
@@ -988,6 +1256,62 @@ defmodule BB.Ufactory.ControllerTest do
         Controller.handle_call({:send_command, frame}, {self(), make_ref()}, state1)
 
       assert state2.txn_id == 2
+    end
+  end
+
+  # ── handle_call({:send_and_recv, frame}) ────────────────────────────────────
+
+  describe "handle_call({:send_and_recv, frame})" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "sends frame, receives response, and returns parsed result",
+         %{state: state, cmd_server: cmd_server} do
+      frame = Protocol.cmd_get_error(0)
+
+      task =
+        Task.async(fn ->
+          {:ok, data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          response = Protocol.build_frame(0, 0x0F, <<0x00, 0x00>>)
+          :gen_tcp.send(cmd_server, response)
+          data
+        end)
+
+      assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, _rest}, new_state} =
+               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+
+      Task.await(task, 2_000)
+      assert new_state.txn_id == 1
+    end
+
+    test "supports custom timeout via 3-element tuple",
+         %{state: state, cmd_server: cmd_server} do
+      frame = Protocol.cmd_get_error(0)
+
+      task =
+        Task.async(fn ->
+          {:ok, _data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          response = Protocol.build_frame(0, 0x0F, <<0x00, 0x00>>)
+          :gen_tcp.send(cmd_server, response)
+        end)
+
+      assert {:reply, {:ok, {0x0F, 0x00, _params}, _rest}, _new_state} =
+               Controller.handle_call(
+                 {:send_and_recv, frame, 10_000},
+                 {self(), make_ref()},
+                 state
+               )
+
+      Task.await(task, 2_000)
     end
   end
 

@@ -11,6 +11,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.StateMachine.Transition
   alias BB.Ufactory.Actuator.LinearTrack
   alias BB.Ufactory.Protocol
 
@@ -72,6 +73,9 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
 
   describe "init/1" do
     test "stores bb, controller, and speed in state" do
+      BB
+      |> stub(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
       opts = [
         bb: %{robot: TestRobot, path: [:linear_track]},
         controller: :xarm,
@@ -85,9 +89,49 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     end
 
     test "defaults speed to 200 mm/s" do
+      BB
+      |> stub(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
       opts = [bb: %{robot: TestRobot, path: [:linear_track]}, controller: :xarm]
       assert {:ok, state} = LinearTrack.init(opts)
       assert state.speed == 200
+    end
+
+    test "subscribes to state machine transitions instead of eagerly enabling" do
+      BB
+      |> expect(:subscribe, fn TestRobot, [:state_machine] -> :ok end)
+
+      BB.Process
+      |> reject(:call, 3)
+
+      opts = [
+        bb: %{robot: TestRobot, path: [:linear_track]},
+        controller: :xarm
+      ]
+
+      assert {:ok, _state} = LinearTrack.init(opts)
+    end
+  end
+
+  # ── handle_info(state machine :armed) ──────────────────────────────────────
+
+  describe "handle_info(state machine transition to :armed)" do
+    test "sends track enable command on armed transition" do
+      state = make_state()
+      expected_frame = Protocol.cmd_linear_track_enable(0, true)
+      test_pid = self()
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        send(test_pid, {:enable_sent, frame})
+        :ok
+      end)
+
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+      bb_msg = {:bb, [:state_machine], msg}
+
+      assert {:noreply, ^state} = LinearTrack.handle_info(bb_msg, state)
+      assert_receive {:enable_sent, ^expected_frame}, 500
     end
   end
 
@@ -100,15 +144,25 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       {expected_pos_frame, expected_spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, 200)
 
       test_pid = self()
+      send_calls = :counters.new(1, [:atomics])
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        send(test_pid, {:frame_sent, :first, frame})
-        :ok
-      end)
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        send(test_pid, {:frame_sent, :second, frame})
-        :ok
+      |> stub(:call, fn TestRobot, :xarm, msg ->
+        case msg do
+          {:send_and_recv, _frame} ->
+            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+
+          {:send_command, frame} ->
+            idx = :counters.get(send_calls, 1)
+            :counters.add(send_calls, 1, 1)
+
+            case idx do
+              0 -> send(test_pid, {:frame_sent, :first, frame})
+              1 -> send(test_pid, {:frame_sent, :second, frame})
+            end
+
+            :ok
+        end
       end)
 
       BB
@@ -123,12 +177,22 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       assert second_frame == expected_pos_frame
     end
 
-    test "publishes BeginMotion with target_position in mm" do
+    test "publishes BeginMotion with initial_position from track read and target_position in mm" do
       state = make_state()
       test_pid = self()
 
+      initial_pos_raw = round(100.0 * 2000)
+
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, msg ->
+        case msg do
+          {:send_and_recv, _frame} ->
+            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, initial_pos_raw::signed-32>>}, <<>>}
+
+          {:send_command, _frame} ->
+            :ok
+        end
+      end)
 
       BB
       |> expect(:publish, fn TestRobot,
@@ -145,13 +209,22 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.target_position, 500.0, 0.001
+      assert_in_delta bm.initial_position, 100.0, 0.001
     end
 
     test "does not publish BeginMotion when speed frame send fails" do
       state = make_state()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> {:error, :closed} end)
+      |> stub(:call, fn TestRobot, :xarm, msg ->
+        case msg do
+          {:send_and_recv, _frame} ->
+            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+
+          {:send_command, _frame} ->
+            {:error, :closed}
+        end
+      end)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg ->
@@ -175,8 +248,15 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, msg ->
+        case msg do
+          {:send_and_recv, _frame} ->
+            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+
+          {:send_command, _frame} ->
+            :ok
+        end
+      end)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
@@ -196,8 +276,34 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
   # ── disarm/1 ────────────────────────────────────────────────────────────────
 
   describe "disarm/1" do
-    test "returns :ok without side effects" do
-      assert :ok = LinearTrack.disarm([])
+    test "sends track disable command via controller" do
+      expected_frame = Protocol.cmd_linear_track_enable(0, false)
+      test_pid = self()
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        send(test_pid, {:disable_sent, frame})
+        :ok
+      end)
+
+      assert :ok =
+               LinearTrack.disarm(
+                 bb: %{robot: TestRobot, path: [:linear_track]},
+                 controller: :xarm
+               )
+
+      assert_receive {:disable_sent, ^expected_frame}, 500
+    end
+
+    test "returns :ok when controller call fails" do
+      BB.Process
+      |> stub(:call, fn _robot, _ctrl, _msg -> {:error, :closed} end)
+
+      assert :ok =
+               LinearTrack.disarm(
+                 bb: %{robot: TestRobot, path: [:linear_track]},
+                 controller: :xarm
+               )
     end
   end
 end
