@@ -731,6 +731,83 @@ defmodule BB.Ufactory.ProtocolTest do
     end
   end
 
+  # ── Kinematics / workspace queries ──────────────────────────────────────────
+
+  describe "cmd_get_fk/2 and parse_fk_response/1" do
+    test "targets register 0x2C with 7 fp32 params, zero-padding short models" do
+      frame = Protocol.cmd_get_fk(0, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+      assert <<0::16, 0x0002::16, 29::16, 0x2C, params::binary>> = frame
+      assert byte_size(params) == 28
+      angles = Protocol.decode_fp32s(params, 7)
+      assert_in_delta Enum.at(angles, 0), 0.1, 1.0e-5
+      assert Enum.at(angles, 6) == 0.0
+    end
+
+    test "accepts a full 7-joint configuration" do
+      frame = Protocol.cmd_get_fk(0, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+      assert byte_size(frame) == 35
+    end
+
+    test "parse_fk_response decodes a 6-float pose and tolerates trailing bytes" do
+      params = Protocol.encode_fp32s([300.0, -50.0, 200.0, 3.14, 0.0, 1.57]) <> <<0xFF>>
+      assert {:ok, {x, y, z, roll, _pitch, yaw}} = Protocol.parse_fk_response(params)
+      assert_in_delta x, 300.0, 0.001
+      assert_in_delta y, -50.0, 0.001
+      assert_in_delta z, 200.0, 0.001
+      assert_in_delta roll, 3.14, 0.001
+      assert_in_delta yaw, 1.57, 0.001
+    end
+
+    test "parse_fk_response rejects short params" do
+      assert {:error, :invalid_response} = Protocol.parse_fk_response(<<1, 2, 3>>)
+    end
+  end
+
+  describe "cmd_get_ik/2 and parse_ik_response/1" do
+    test "targets register 0x2B with 6 fp32 pose params" do
+      frame = Protocol.cmd_get_ik(0, {300.0, 0.0, 200.0, 3.14, 0.0, 0.0})
+      assert <<0::16, 0x0002::16, 25::16, 0x2B, params::binary>> = frame
+      assert byte_size(params) == 24
+      [x | _] = Protocol.decode_fp32s(params, 6)
+      assert_in_delta x, 300.0, 0.001
+    end
+
+    test "parse_ik_response decodes 7 joint angles" do
+      params = Protocol.encode_fp32s([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0])
+      assert {:ok, angles} = Protocol.parse_ik_response(params)
+      assert length(angles) == 7
+      assert_in_delta Enum.at(angles, 1), 0.2, 1.0e-5
+    end
+
+    test "parse_ik_response rejects short params" do
+      assert {:error, :invalid_response} = Protocol.parse_ik_response(<<0, 0, 0, 0>>)
+    end
+  end
+
+  describe "cmd_tcp_limit_check/2, cmd_joint_limit_check/2, parse_limit_check/1" do
+    test "tcp check targets register 0x2E with 6 fp32 pose params" do
+      frame = Protocol.cmd_tcp_limit_check(0, {300.0, 0.0, 200.0, 3.14, 0.0, 0.0})
+      assert <<0::16, 0x0002::16, 25::16, 0x2E, params::binary>> = frame
+      assert byte_size(params) == 24
+    end
+
+    test "joint check targets register 0x2D with 7 zero-padded fp32 params" do
+      frame = Protocol.cmd_joint_limit_check(0, [0.5])
+      assert <<0::16, 0x0002::16, 29::16, 0x2D, params::binary>> = frame
+      angles = Protocol.decode_fp32s(params, 7)
+      assert_in_delta Enum.at(angles, 0), 0.5, 1.0e-5
+      assert Enum.slice(angles, 1..6) == List.duplicate(0.0, 6)
+    end
+
+    test "parse_limit_check maps the response byte per SDK semantics" do
+      assert {:ok, :within_limits} = Protocol.parse_limit_check(<<0>>)
+      assert {:ok, :beyond_limits} = Protocol.parse_limit_check(<<1>>)
+      # Any non-zero flag counts as beyond limits.
+      assert {:ok, :beyond_limits} = Protocol.parse_limit_check(<<7, 0xFF>>)
+      assert {:error, :invalid_response} = Protocol.parse_limit_check(<<>>)
+    end
+  end
+
   # ── Simple command builders ─────────────────────────────────────────────────
 
   describe "cmd_get_error/1, cmd_clean_error/1, cmd_set_mode/2" do

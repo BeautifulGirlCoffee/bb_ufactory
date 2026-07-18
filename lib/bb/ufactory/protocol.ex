@@ -58,6 +58,10 @@ defmodule BB.Ufactory.Protocol do
   @reg_move_joints 0x17
   @reg_get_tcp_pose 0x29
   @reg_get_joints 0x2A
+  @reg_get_ik 0x2B
+  @reg_get_fk 0x2C
+  @reg_joint_limit_check 0x2D
+  @reg_tcp_limit_check 0x2E
   @reg_rs485_rtu 0x7C
   @reg_get_error 0x0F
   @reg_clean_err 0x10
@@ -285,6 +289,167 @@ defmodule BB.Ufactory.Protocol do
   def cmd_get_cartesian_pose(txn_id) do
     build_frame(txn_id, @reg_get_tcp_pose, <<>>)
   end
+
+  # ── Kinematics / workspace queries ──────────────────────────────────────────
+  #
+  # The firmware exposes its own forward/inverse kinematics and limit checks,
+  # which bake in the controller's actual constraints (self-collision model,
+  # motion-planner limits). Sweeping cmd_tcp_limit_check/2 over a Cartesian
+  # grid is the ground-truth way to map the arm's reachable workspace.
+
+  @doc """
+  Asks the firmware's forward kinematics for the Cartesian pose of a joint
+  configuration (register 0x2C, GET_FK).
+
+  `angles` is a list of up to 7 joint angles in **radians** (J1..Jn); models
+  with fewer than 7 joints are zero-padded, matching the Python SDK's
+  `get_forward_kinematics`. Decode the response params with
+  `parse_fk_response/1`. A non-zero response status byte indicates the
+  firmware rejected the query.
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_get_fk(0, [0.0, 0.5, -0.5, 0.0, 1.0, 0.0])
+      iex> byte_size(frame)
+      35
+  """
+  @spec cmd_get_fk(non_neg_integer(), [number()]) :: binary()
+  def cmd_get_fk(txn_id, angles) when is_list(angles) and length(angles) <= 7 do
+    build_frame(txn_id, @reg_get_fk, encode_fp32s(pad_angles(angles, 7)))
+  end
+
+  @doc """
+  Decodes a GET_FK response into a `{x, y, z, roll, pitch, yaw}` pose
+  (mm / radians).
+
+  ## Examples
+
+      iex> params = BB.Ufactory.Protocol.encode_fp32s([300.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+      iex> {:ok, {x, _y, z, _r, _p, _yw}} = BB.Ufactory.Protocol.parse_fk_response(params)
+      iex> {Float.round(x, 3), Float.round(z, 3)}
+      {300.0, 200.0}
+  """
+  @spec parse_fk_response(binary()) ::
+          {:ok, {float(), float(), float(), float(), float(), float()}}
+          | {:error, :invalid_response}
+  def parse_fk_response(<<pose_bin::binary-24, _rest::binary>>) do
+    [x, y, z, roll, pitch, yaw] = decode_fp32s(pose_bin, 6)
+    {:ok, {x, y, z, roll, pitch, yaw}}
+  end
+
+  def parse_fk_response(_), do: {:error, :invalid_response}
+
+  @doc """
+  Asks the firmware's inverse kinematics for a joint configuration reaching
+  a Cartesian pose (register 0x2B, GET_IK).
+
+  Pose is `{x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}`. Decode the
+  response params with `parse_ik_response/1`. A non-zero response status
+  byte means no solution was found — which also makes this usable as a
+  reachability probe (see `cmd_tcp_limit_check/2` for the cheaper check).
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_get_ik(0, {300.0, 0.0, 200.0, 3.14, 0.0, 0.0})
+      iex> byte_size(frame)
+      31
+  """
+  @spec cmd_get_ik(
+          non_neg_integer(),
+          {number(), number(), number(), number(), number(), number()}
+        ) :: binary()
+  def cmd_get_ik(txn_id, {x, y, z, roll, pitch, yaw}) do
+    build_frame(txn_id, @reg_get_ik, encode_fp32s([x, y, z, roll, pitch, yaw]))
+  end
+
+  @doc """
+  Decodes a GET_IK response into a list of 7 joint angles in radians
+  (J1..J7; trailing entries are zero for models with fewer joints).
+
+  ## Examples
+
+      iex> params = BB.Ufactory.Protocol.encode_fp32s([0.0, 0.5, -0.5, 0.0, 1.0, 0.0, 0.0])
+      iex> {:ok, angles} = BB.Ufactory.Protocol.parse_ik_response(params)
+      iex> length(angles)
+      7
+  """
+  @spec parse_ik_response(binary()) :: {:ok, [float()]} | {:error, :invalid_response}
+  def parse_ik_response(<<angles_bin::binary-28, _rest::binary>>) do
+    {:ok, decode_fp32s(angles_bin, 7)}
+  end
+
+  def parse_ik_response(_), do: {:error, :invalid_response}
+
+  @doc """
+  Asks the firmware whether a Cartesian pose is within the arm's limits
+  (register 0x2E, IS_TCP_LIMIT — the SDK's `is_tcp_limit`).
+
+  Pose is `{x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}`. Decode the
+  response params with `parse_limit_check/1`.
+
+  Sweeping this probe over a grid maps the arm's actual reachable
+  workspace as the firmware sees it:
+
+      frame = Protocol.cmd_tcp_limit_check(0, {x, y, z, 3.14, 0.0, 0.0})
+
+      case BB.Process.call(robot, :xarm, {:send_and_recv, frame}) do
+        {:ok, {0x2E, 0, params}, _rest} -> Protocol.parse_limit_check(params)
+        other -> other
+      end
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_tcp_limit_check(0, {300.0, 0.0, 200.0, 3.14, 0.0, 0.0})
+      iex> byte_size(frame)
+      31
+  """
+  @spec cmd_tcp_limit_check(
+          non_neg_integer(),
+          {number(), number(), number(), number(), number(), number()}
+        ) :: binary()
+  def cmd_tcp_limit_check(txn_id, {x, y, z, roll, pitch, yaw}) do
+    build_frame(txn_id, @reg_tcp_limit_check, encode_fp32s([x, y, z, roll, pitch, yaw]))
+  end
+
+  @doc """
+  Asks the firmware whether a joint configuration is within limits
+  (register 0x2D, IS_JOINT_LIMIT — the SDK's `is_joint_limit`).
+
+  `angles` is a list of up to 7 joint angles in **radians**, zero-padded
+  like `cmd_get_fk/2`. Decode the response params with `parse_limit_check/1`.
+
+  ## Examples
+
+      iex> frame = BB.Ufactory.Protocol.cmd_joint_limit_check(0, [0.0, 0.5, -0.5, 0.0, 1.0, 0.0])
+      iex> byte_size(frame)
+      35
+  """
+  @spec cmd_joint_limit_check(non_neg_integer(), [number()]) :: binary()
+  def cmd_joint_limit_check(txn_id, angles) when is_list(angles) and length(angles) <= 7 do
+    build_frame(txn_id, @reg_joint_limit_check, encode_fp32s(pad_angles(angles, 7)))
+  end
+
+  @doc """
+  Decodes an IS_TCP_LIMIT / IS_JOINT_LIMIT response byte.
+
+  Returns `{:ok, :within_limits}` when the probed pose/configuration is
+  reachable, `{:ok, :beyond_limits}` when the firmware reports it outside
+  the arm's limits (the SDK's `is_tcp_limit`/`is_joint_limit` returning
+  `True`).
+
+  ## Examples
+
+      iex> BB.Ufactory.Protocol.parse_limit_check(<<0>>)
+      {:ok, :within_limits}
+
+      iex> BB.Ufactory.Protocol.parse_limit_check(<<1>>)
+      {:ok, :beyond_limits}
+  """
+  @spec parse_limit_check(binary()) ::
+          {:ok, :within_limits | :beyond_limits} | {:error, :invalid_response}
+  def parse_limit_check(<<0::8, _rest::binary>>), do: {:ok, :within_limits}
+  def parse_limit_check(<<_flag::8, _rest::binary>>), do: {:ok, :beyond_limits}
+  def parse_limit_check(_), do: {:error, :invalid_response}
 
   @doc """
   Requests the current error and warning codes from the arm (register 0x0F).
