@@ -12,19 +12,23 @@ defmodule BB.Ufactory.Message.ArmStatus do
 
   ## Fields
 
-  - `state` — arm motion state integer:
-    - `0` — idle
-    - `1` — sleeping
-    - `2` — suspended
-    - `3` — stopping
-    - `4` — transitioning
-    - `5` — moving
+  - `state` — arm motion state integer (per the xArm Python SDK `get_state`):
+    - `1` — in motion
+    - `2` — sleeping (ready, no motion)
+    - `3` — suspended (paused)
+    - `4` — stopping
+    - Other values are firmware-internal transitional states and are passed
+      through unchanged.
 
-  - `mode` — control mode integer:
-    - `0` — position (normal operation)
-    - `1` — servo (real-time servo mode)
+  - `mode` — control mode integer (per the SDK `set_mode`):
+    - `0` — position control (normal operation)
+    - `1` — servo motion (real-time servo mode)
     - `2` — joint teaching (manual drag)
     - `3` — Cartesian teaching (manual drag in Cartesian space)
+    - `4` — joint velocity control
+    - `5` — Cartesian velocity control
+    - `6` — joint online trajectory planning
+    - `7` — Cartesian online trajectory planning
 
   - `error_code` — hardware/controller error code (`0` = no error). See
     `BB.Error.Protocol.Ufactory.HardwareFault` for the full code table.
@@ -39,8 +43,8 @@ defmodule BB.Ufactory.Message.ArmStatus do
 
   use BB.Message,
     schema: [
-      state: [type: :non_neg_integer, required: true, doc: "Arm motion state (0–5)"],
-      mode: [type: :non_neg_integer, required: true, doc: "Control mode (0–3)"],
+      state: [type: :non_neg_integer, required: true, doc: "Arm motion state (see moduledoc)"],
+      mode: [type: :non_neg_integer, required: true, doc: "Control mode (see moduledoc)"],
       error_code: [type: :non_neg_integer, required: true, doc: "Hardware error code (0 = none)"],
       warn_code: [
         type: :non_neg_integer,

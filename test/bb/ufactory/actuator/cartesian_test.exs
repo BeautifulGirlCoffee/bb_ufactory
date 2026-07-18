@@ -132,6 +132,53 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       assert {:noreply, ^state} = Cartesian.handle_cast(:unexpected, state)
     end
 
+    test "BeginMotion target_position is the travel distance in metres" do
+      state = make_state()
+      # No ETS → current position falls back to {0,0,0}; distance = 300 mm.
+      pose = {300.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+
+      BB
+      |> expect(:publish, fn TestRobot, [:actuator | _], %Message{payload: %BeginMotion{} = bm} ->
+        send(test_pid, {:begin_motion, bm})
+        :ok
+      end)
+
+      Cartesian.handle_cast({:move_cartesian, pose}, state)
+
+      assert_receive {:begin_motion, bm}, 500
+      assert_in_delta bm.target_position, 0.3, 1.0e-6
+      assert bm.initial_position == 0.0
+    end
+
+    test "BeginMotion expected_arrival uses the per-command speed override" do
+      state = make_state()
+      # 300 mm at the 10 mm/s override → 30 s travel, not 3 s at the
+      # configured default of 100 mm/s.
+      pose = {300.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+
+      BB
+      |> expect(:publish, fn TestRobot, [:actuator | _], %Message{payload: %BeginMotion{} = bm} ->
+        send(test_pid, {:begin_motion, bm})
+        :ok
+      end)
+
+      before = System.monotonic_time(:millisecond)
+      Cartesian.handle_cast({:move_cartesian, pose, 10.0, 1000.0}, state)
+
+      assert_receive {:begin_motion, bm}, 500
+      travel_ms = bm.expected_arrival - before
+      assert travel_ms >= 29_000
+      assert travel_ms <= 31_000
+    end
+
     test "does not publish BeginMotion when controller call fails" do
       state = make_state()
       pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}

@@ -69,6 +69,9 @@ defmodule BB.Ufactory.Actuator.JointTest do
       |> expect(:call, fn TestRobot, :xarm, :get_ets -> ets end)
       |> expect(:call, fn TestRobot, :xarm, :get_model_config -> @model_config end)
 
+      BB
+      |> stub(:subscribe, fn TestRobot, [:actuator, :j2, :motor] -> :ok end)
+
       opts = [bb: %{robot: TestRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
       assert {:ok, state} = Joint.init(opts)
 
@@ -88,10 +91,44 @@ defmodule BB.Ufactory.Actuator.JointTest do
         TestRobot, :xarm, :get_model_config -> @model_config
       end)
 
+      BB
+      |> stub(:subscribe, fn TestRobot, _path -> :ok end)
+
       # Joint 1 should have ±2π limits
       opts = [bb: %{robot: TestRobot, path: [:j1, :motor]}, joint: 1, controller: :xarm]
       assert {:ok, state} = Joint.init(opts)
       assert state.limits == {-@two_pi, @two_pi}
+    end
+
+    test "subscribes to its own command topic for pubsub delivery" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      BB
+      |> expect(:subscribe, fn TestRobot, [:actuator, :j2, :motor] -> :ok end)
+
+      opts = [bb: %{robot: TestRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
+      assert {:ok, _state} = Joint.init(opts)
+    end
+
+    test "stops at init when the joint index exceeds the model's joint count" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      # joint 7 on a 6-joint model: previously init succeeded with nil limits
+      # and every position command crash-looped with a MatchError.
+      opts = [bb: %{robot: TestRobot, path: [:j7, :motor]}, joint: 7, controller: :xarm]
+      assert {:stop, {:invalid_joint, 7, 6}} = Joint.init(opts)
     end
   end
 

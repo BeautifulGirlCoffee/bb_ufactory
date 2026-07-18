@@ -10,12 +10,19 @@ defmodule BB.Ufactory.ProtocolTest do
   # ── heartbeat ───────────────────────────────────────────────────────────────
 
   describe "heartbeat/0" do
-    test "is exactly the 8-byte SDK heartbeat sequence" do
-      assert Protocol.heartbeat() == <<0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00>>
+    test "is a well-formed GET_STATE request with protocol id 0x0002" do
+      # txn 0, protocol 0x0002, length 1, register 0x0D (GET_STATE). The old
+      # constant encoded protocol id 0x0001, which the arm's replies would
+      # mirror and parse_response/1 would reject as {:bad_protocol_id, 1}.
+      assert Protocol.heartbeat() == <<0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x0D>>
     end
 
-    test "is 8 bytes" do
-      assert byte_size(Protocol.heartbeat()) == 8
+    test "parses as a valid frame" do
+      <<txn::16, protocol_id::16, length::16, register::8>> = Protocol.heartbeat()
+      assert txn == 0
+      assert protocol_id == 0x0002
+      assert length == 1
+      assert register == 0x0D
     end
   end
 
@@ -180,6 +187,15 @@ defmodule BB.Ufactory.ProtocolTest do
 
     test "returns {:more} for exactly 6 bytes (header only, no body)" do
       assert Protocol.parse_response(<<0x00, 0x01, 0x00, 0x02, 0x00, 0x02>>) == {:more}
+    end
+
+    test "returns {:error, {:bad_length, n}} for impossible length fields" do
+      # A response body is at least 2 bytes (register + status); a garbled
+      # length of 0 or 1 previously crashed the parser with a MatchError.
+      for bad_length <- [0, 1] do
+        bad = <<0x00, 0x01, 0x00, 0x02, bad_length::16, 0xAB, 0xCD, 0xEF>>
+        assert {:error, {:bad_length, ^bad_length}} = Protocol.parse_response(bad)
+      end
     end
   end
 
@@ -714,4 +730,69 @@ defmodule BB.Ufactory.ProtocolTest do
       assert binary_part(frame, 7, 1) == <<0x00>>
     end
   end
+
+  # ── Simple command builders ─────────────────────────────────────────────────
+
+  describe "cmd_get_error/1, cmd_clean_error/1, cmd_set_mode/2" do
+    test "cmd_get_error targets register 0x0F with no params" do
+      frame = Protocol.cmd_get_error(3)
+      assert <<3::16, 0x0002::16, 1::16, 0x0F>> = frame
+    end
+
+    test "cmd_clean_error targets register 0x10" do
+      frame = Protocol.cmd_clean_error(0)
+      assert binary_part(frame, 6, 1) == <<0x10>>
+    end
+
+    test "cmd_set_mode targets register 0x13 with the mode byte" do
+      frame = Protocol.cmd_set_mode(0, 2)
+      assert <<0::16, 0x0002::16, 2::16, 0x13, 0x02>> = frame
+    end
+  end
+
+  describe "cmd_gripper_speed/2" do
+    test "builds an RS485 write frame on register 0x7C" do
+      frame = Protocol.cmd_gripper_speed(0, 1500)
+      assert binary_part(frame, 6, 1) == <<0x7C>>
+    end
+  end
+
+  # ── Linear track ────────────────────────────────────────────────────────────
+
+  describe "cmd_linear_track_move/3" do
+    test "returns position and speed RS485 frames" do
+      {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, 500.0, 200)
+      assert binary_part(pos_frame, 6, 1) == <<0x7C>>
+      assert binary_part(spd_frame, 6, 1) == <<0x7C>>
+    end
+
+    test "encodes position as big-endian int32 at scale mm × 2000" do
+      {pos_frame, _spd} = Protocol.cmd_linear_track_move(0, 500.0, 200)
+      # RS485 write payload: host, dev, 0x10, reg_hi, reg_lo, count_hi,
+      # count_lo, byte_count, then the 4 data bytes at the end of the frame.
+      data = binary_part(pos_frame, byte_size(pos_frame) - 4, 4)
+      assert <<1_000_000::signed-32>> == data
+    end
+  end
+
+  describe "cmd_linear_track_read_position/1 and parse_linear_track_position/1" do
+    test "read frame targets register 0x7C" do
+      frame = Protocol.cmd_linear_track_read_position(0)
+      assert binary_part(frame, 6, 1) == <<0x7C>>
+    end
+
+    test "round-trips a position through the response parser" do
+      # Response params: host, dev, func, byte_count, then int32 BE raw.
+      raw = round(123.5 * 2000)
+      params = <<0x0B, 0x01, 0x03, 0x04, raw::signed-32>>
+      assert {:ok, pos} = Protocol.parse_linear_track_position(params)
+      assert_in_delta pos, 123.5, 1.0e-6
+    end
+
+    test "rejects short/invalid response params" do
+      assert {:error, :invalid_response} = Protocol.parse_linear_track_position(<<1, 2, 3>>)
+    end
+  end
+
+  doctest BB.Ufactory.Protocol
 end

@@ -8,7 +8,7 @@ defmodule BB.Error.Protocol.Ufactory.HardwareFault do
 
   Raised when the real-time report frame contains a non-zero `error_code`. The
   controller calls `BB.Safety.report_error/3` with this exception, which triggers
-  automatic disarm (unless `auto_disarm_on_error: false` is set on the robot).
+  automatic disarm via the robot's topology supervisor.
 
   ## Error Code Table
 

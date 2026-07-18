@@ -65,19 +65,31 @@ defmodule BB.Ufactory.Actuator.Joint do
     ets = BB.Process.call(bb.robot, controller, :get_ets)
     model_config = BB.Process.call(bb.robot, controller, :get_model_config)
 
-    limits = Enum.at(model_config.limits, joint - 1)
-    max_speed = model_config.max_speed_rads
+    if joint > model_config.joints do
+      # Fail at init instead of crash-looping with a MatchError on the first
+      # position command (Enum.at below would return nil limits).
+      {:stop, {:invalid_joint, joint, model_config.joints}}
+    else
+      model_limits = Enum.at(model_config.limits, joint - 1)
+      limits = intersect_topology_limits(bb, model_limits)
+      max_speed = model_config.max_speed_rads
 
-    state = %{
-      bb: bb,
-      joint: joint,
-      controller: controller,
-      ets: ets,
-      limits: limits,
-      max_speed: max_speed
-    }
+      # Commands may be delivered over pubsub (BB.Actuator.set_position/4,
+      # BB.Motion with delivery: :pubsub) — nothing else subscribes this
+      # process to its own command topic.
+      BB.subscribe(bb.robot, [:actuator | bb.path])
 
-    {:ok, state}
+      state = %{
+        bb: bb,
+        joint: joint,
+        controller: controller,
+        ets: ets,
+        limits: limits,
+        max_speed: max_speed
+      }
+
+      {:ok, state}
+    end
   end
 
   # ── disarm/1 — controller handles hardware stop ──────────────────────────────
@@ -109,6 +121,28 @@ defmodule BB.Ufactory.Actuator.Joint do
   def handle_cast(_request, state), do: {:noreply, state}
 
   # ── Private helpers ──────────────────────────────────────────────────────────
+
+  # Narrows the factory model limits by the joint limits declared in the
+  # robot's topology DSL (`limit do ... end`), so a user who tightens a
+  # joint's range in their robot module gets that range enforced by the
+  # clamp. Topology limits can only narrow, never widen, the factory range.
+  # Falls back to the model limits when the topology gives no usable limit
+  # (e.g. hand-built robots in tests without a full DSL).
+  defp intersect_topology_limits(bb, {model_lower, model_upper} = model_limits) do
+    actuator_name = List.last(bb.path)
+    robot = bb.robot.robot()
+
+    with %{joint: joint_name} <- Map.get(robot.actuators, actuator_name),
+         %BB.Robot.Joint{limits: %{lower: lower, upper: upper}} <-
+           BB.Robot.get_joint(robot, joint_name),
+         true <- is_number(lower) and is_number(upper) do
+      {max(model_lower, lower * 1.0), min(model_upper, upper * 1.0)}
+    else
+      _ -> model_limits
+    end
+  rescue
+    _ -> model_limits
+  end
 
   defp apply_position_command(%Command.Position{position: position} = cmd, state) do
     {lower, upper} = state.limits

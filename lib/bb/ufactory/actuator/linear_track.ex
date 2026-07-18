@@ -17,10 +17,12 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   ## Lifecycle
 
   The track motor is **not** enabled during `init/1`. Instead, the actuator
-  subscribes to state machine transitions and enables the track when the
-  robot transitions to `:armed`. This avoids sending RS485 commands before
-  the arm controller is fully initialized (mode 0, state 0), which can
-  trigger spurious servo motor faults on the controller bus.
+  registers its enable frame with the controller, which sends it at the end
+  of its own arm sequence on every `:armed` transition. This guarantees no
+  RS485 command reaches the bus before the arm controller is fully
+  initialized (mode 0, state 0) — ordering a separate state-machine
+  subscription could not provide, since pubsub dispatch order across
+  subscribers is unspecified.
 
   ## Protocol Note
 
@@ -47,6 +49,14 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
         type: :pos_integer,
         default: 200,
         doc: "Linear track speed in mm/s (default: 200)"
+      ],
+      stroke_mm: [
+        type: :pos_integer,
+        default: 700,
+        doc:
+          "Track stroke length in millimetres; position commands are clamped to " <>
+            "[0, stroke_mm]. UFactory tracks ship in 700 mm and 1000 mm variants " <>
+            "(default: 700)"
       ]
     ]
 
@@ -55,7 +65,6 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
-  alias BB.StateMachine.Transition
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -65,10 +74,15 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     bb = Keyword.fetch!(opts, :bb)
     controller = Keyword.fetch!(opts, :controller)
     speed = Keyword.get(opts, :speed, 200)
+    stroke_mm = Keyword.get(opts, :stroke_mm, 700)
 
-    BB.subscribe(bb.robot, [:state_machine])
+    # Commands may be delivered over pubsub (BB.Actuator.set_position/4) —
+    # nothing else subscribes this process to its own command topic.
+    BB.subscribe(bb.robot, [:actuator | bb.path])
 
-    {:ok, %{bb: bb, controller: controller, speed: speed}}
+    register_arm_frames(bb.robot, controller)
+
+    {:ok, %{bb: bb, controller: controller, speed: speed, stroke_mm: stroke_mm}}
   end
 
   # ── disarm/1 — disable track motor when arm disarms ──────────────────────────
@@ -98,17 +112,6 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   def handle_cast(_request, state), do: {:noreply, state}
 
-  # ── handle_info — state machine transitions ─────────────────────────────────
-
-  @impl BB.Actuator
-  def handle_info(
-        {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
-        state
-      ) do
-    enable_track(state.bb.robot, state.controller)
-    {:noreply, state}
-  end
-
   # ── handle_info — pubsub delivery ──────────────────────────────────────────
 
   @impl BB.Actuator
@@ -125,6 +128,16 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   # ── Private helpers ──────────────────────────────────────────────────────────
 
   defp apply_track_position(pos_mm, state) do
+    clamped = pos_mm |> max(0.0) |> min(state.stroke_mm * 1.0)
+
+    if clamped != pos_mm do
+      Logger.debug(
+        "[BB.Ufactory.Actuator.LinearTrack] position #{pos_mm} clamped to #{clamped} " <>
+          "(stroke #{state.stroke_mm} mm)"
+      )
+    end
+
+    pos_mm = clamped
     initial_position = read_track_position(state.bb.robot, state.controller)
     {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, state.speed)
 
@@ -142,16 +155,18 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     state
   end
 
-  defp enable_track(robot, controller) do
-    frame = Protocol.cmd_linear_track_enable(0, true)
+  # Registers the enable frame with the controller, which sends it at the end
+  # of its arm sequence (or immediately if already armed).
+  defp register_arm_frames(robot, controller) do
+    frames = [Protocol.cmd_linear_track_enable(0, true)]
 
-    case BB.Process.call(robot, controller, {:send_command, frame}) do
+    case BB.Process.call(robot, controller, {:register_arm_frames, :linear_track, frames}) do
       :ok ->
         :ok
 
       {:error, reason} ->
         Logger.warning(
-          "[BB.Ufactory.Actuator.LinearTrack] track enable failed: #{inspect(reason)}"
+          "[BB.Ufactory.Actuator.LinearTrack] arm-frame registration failed: #{inspect(reason)}"
         )
     end
   end

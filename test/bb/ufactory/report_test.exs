@@ -260,13 +260,13 @@ defmodule BB.Ufactory.ReportTest do
 
     test "includes :error_code" do
       frame = build_133_byte_frame(error_code: 7)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
       assert report.error_code == 7
     end
 
     test "includes :warn_code" do
       frame = build_133_byte_frame(warn_code: 2)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
       assert report.warn_code == 2
     end
 
@@ -274,7 +274,7 @@ defmodule BB.Ufactory.ReportTest do
       # Set bits 0 and 2 (joints 1 and 3 have brakes engaged)
       mtbrake_byte = 0b00000101
       frame = build_133_byte_frame(mtbrake: mtbrake_byte)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
 
       assert length(report.mtbrake) == 8
       assert Enum.at(report.mtbrake, 0) == 1
@@ -285,7 +285,7 @@ defmodule BB.Ufactory.ReportTest do
     test "includes :tcp_offset with 6 values" do
       tcp_offset = [1.0, 2.0, 3.0, 0.1, 0.2, 0.3]
       frame = build_133_byte_frame(tcp_offset: tcp_offset)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
 
       for {expected, actual} <- Enum.zip(tcp_offset, report.tcp_offset) do
         assert_in_delta actual, expected, 0.001
@@ -295,7 +295,7 @@ defmodule BB.Ufactory.ReportTest do
     test "includes :tcp_load with 4 values" do
       tcp_load = [1.5, 10.0, 0.0, 5.0]
       frame = build_133_byte_frame(tcp_load: tcp_load)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
 
       for {expected, actual} <- Enum.zip(tcp_load, report.tcp_load) do
         assert_in_delta actual, expected, 0.001
@@ -304,14 +304,14 @@ defmodule BB.Ufactory.ReportTest do
 
     test "includes :collis_sens and :teach_sens" do
       frame = build_133_byte_frame(collis_sens: 3, teach_sens: 5)
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
       assert report.collis_sens == 3
       assert report.teach_sens == 5
     end
 
     test "does NOT include :ft_filtered (normal report is not a real-time ft frame)" do
       frame = build_133_byte_frame()
-      {:ok, report, _} = Report.parse_report(frame)
+      {:ok, report, _} = Report.parse_report(frame, :normal)
       refute Map.has_key?(report, :ft_filtered)
     end
   end
@@ -373,4 +373,89 @@ defmodule BB.Ufactory.ReportTest do
       assert report.mode == 3
     end
   end
+
+  # ── Malformed length prefixes ────────────────────────────────────────────────
+  #
+  # A corrupted or desynced length prefix must produce a recoverable error,
+  # never a crash (frame_length < 87 previously raised MatchError) and never
+  # unbounded buffering (a 0xFFFFFFFF prefix previously returned {:more}
+  # forever).
+
+  describe "parse_report/2 with an impossible frame_length" do
+    test "rejects frame_length below the 87-byte minimum" do
+      for bad_length <- [0, 1, 2, 4, 10, 50, 86] do
+        buffer = <<bad_length::32>> <> :binary.copy(<<0>>, 200)
+        assert {:error, {:bad_frame_length, ^bad_length}} = Report.parse_report(buffer)
+      end
+    end
+
+    test "rejects frame_length above the sanity cap instead of buffering forever" do
+      assert {:error, {:bad_frame_length, 0xFFFFFFFF}} =
+               Report.parse_report(<<0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0>>)
+
+      assert {:error, {:bad_frame_length, 1024}} =
+               Report.parse_report(<<1024::32, 0, 0>>)
+    end
+
+    test "rejects bad lengths for :normal reports too" do
+      assert {:error, {:bad_frame_length, 10}} =
+               Report.parse_report(<<10::32, 1, 2, 3>>, :normal)
+    end
+  end
+
+  # ── Report-type selection ────────────────────────────────────────────────────
+
+  describe "report_type disambiguation" do
+    test "a large :realtime frame parses ft fields, never normal-report fields" do
+      # 135-byte real-time frame: bytes 87+ are force-torque floats.
+      base =
+        base_payload(
+          0,
+          0,
+          0,
+          List.duplicate(0.0, 7),
+          List.duplicate(0.0, 6),
+          List.duplicate(0.0, 7)
+        )
+
+      payload = base <> fp32s(List.duplicate(1.5, 6)) <> fp32s(List.duplicate(2.5, 6))
+      frame = wrap(payload)
+
+      {:ok, report, _} = Report.parse_report(frame, :realtime)
+      assert Map.has_key?(report, :ft_filtered)
+      refute Map.has_key?(report, :error_code)
+      refute Map.has_key?(report, :mtbrake)
+    end
+
+    test "a large :normal frame parses status fields, never ft fields" do
+      # Normal-report frames on current firmware exceed 135 bytes; the parser
+      # must still decode error_code from byte 89 rather than treating the
+      # region as force-torque floats.
+      base =
+        base_payload(
+          0,
+          0,
+          0,
+          List.duplicate(0.0, 7),
+          List.duplicate(0.0, 6),
+          List.duplicate(0.0, 7)
+        )
+
+      normal_fields =
+        <<0::8, 0::8, 23::8, 0::8>> <>
+          fp32s(List.duplicate(0.0, 6)) <> fp32s(List.duplicate(0.0, 4)) <> <<3::8, 3::8>>
+
+      # Pad beyond 135 total bytes to mimic current-firmware frame sizes.
+      payload = base <> normal_fields <> :binary.copy(<<0>>, 60)
+      frame = wrap(payload)
+      assert byte_size(frame) > 135
+
+      {:ok, report, _} = Report.parse_report(frame, :normal)
+      assert report.error_code == 23
+      refute Map.has_key?(report, :ft_filtered)
+      refute Map.has_key?(report, :ft_raw)
+    end
+  end
+
+  doctest BB.Ufactory.Report
 end

@@ -40,11 +40,16 @@ defmodule BB.Ufactory.Sensor.ForceTorqueTest do
   describe "init/1" do
     test "sends cmd_ft_sensor_enable(true) via controller call" do
       expected_frame = Protocol.cmd_ft_sensor_enable(0, true)
+      test_pid = self()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        assert frame == expected_frame
-        :ok
+      |> stub(:call, fn
+        TestRobot, :xarm, {:send_command, frame} ->
+          send(test_pid, {:enable_sent, frame})
+          :ok
+
+        TestRobot, :xarm, {:register_arm_frames, :force_torque, _frames} ->
+          :ok
       end)
 
       BB
@@ -54,11 +59,33 @@ defmodule BB.Ufactory.Sensor.ForceTorqueTest do
       assert {:ok, state} = ForceTorque.init(opts)
       assert state.controller == :xarm
       assert state.bb.robot == TestRobot
+      assert_receive {:enable_sent, ^expected_frame}, 500
+    end
+
+    test "registers the enable frame for re-arm (sensor is disabled on disarm)" do
+      expected_frame = Protocol.cmd_ft_sensor_enable(0, true)
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, {:send_command, _frame} ->
+          :ok
+
+        TestRobot, :xarm, {:register_arm_frames, :force_torque, frames} ->
+          send(test_pid, {:registered, frames})
+          :ok
+      end)
+
+      BB
+      |> stub(:subscribe, fn _robot, _path -> :ok end)
+
+      assert {:ok, _state} = ForceTorque.init(make_opts())
+      assert_receive {:registered, [^expected_frame]}, 500
     end
 
     test "subscribes to controller wrench pubsub path" do
       BB.Process
-      |> stub(:call, fn _robot, _controller, {:send_command, _} -> :ok end)
+      |> stub(:call, fn _robot, _controller, _msg -> :ok end)
 
       BB
       |> expect(:subscribe, fn TestRobot, [:sensor, :xarm, :wrench] -> :ok end)
@@ -69,7 +96,7 @@ defmodule BB.Ufactory.Sensor.ForceTorqueTest do
 
     test "completes init even when enable command fails" do
       BB.Process
-      |> stub(:call, fn _robot, _controller, {:send_command, _} -> {:error, :closed} end)
+      |> stub(:call, fn _robot, _controller, _msg -> {:error, :closed} end)
 
       BB
       |> stub(:subscribe, fn _robot, _path -> :ok end)
@@ -95,7 +122,13 @@ defmodule BB.Ufactory.Sensor.ForceTorqueTest do
 
     test "ignores messages that are not Wrench payloads" do
       state = make_state()
-      other_msg = %BB.Message{timestamp: 0, frame_id: :base, payload: %{something: :else}}
+
+      other_msg = %BB.Message{
+        monotonic_time: 0,
+        wall_time: 0,
+        frame_id: :base,
+        payload: %{something: :else}
+      }
 
       assert {:noreply, ^state} =
                ForceTorque.handle_info({:bb, [:sensor, :xarm, :wrench], other_msg}, state)

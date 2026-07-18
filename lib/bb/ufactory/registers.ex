@@ -51,9 +51,13 @@ defmodule BB.Ufactory.Registers do
   @spec move_joints() :: non_neg_integer()
   def move_joints, do: 0x17
 
-  @doc "MOVE_LINE_AA / arc blending — do not confuse with `move_cart/0`"
-  @spec move_cart_arc() :: non_neg_integer()
-  def move_cart_arc, do: 0x5C
+  @doc """
+  MOVE_LINE_AA — Cartesian linear motion with axis-angle orientation
+  (register 0x5C, decimal 92). NOT arc blending — for blended moves use
+  `move_lineb/0` (0x16) or `move_jointb/0` (0x18).
+  """
+  @spec move_line_aa() :: non_neg_integer()
+  def move_line_aa, do: 0x5C
 
   @doc "GET_TCP_POSE — read current Cartesian end-effector pose"
   @spec get_tcp_pose() :: non_neg_integer()

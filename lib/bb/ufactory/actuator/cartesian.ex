@@ -106,26 +106,31 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
     case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
       :ok ->
-        publish_begin_motion(pose, state)
+        publish_begin_motion(pose, speed, state)
 
       {:error, reason} ->
         Logger.warning("[BB.Ufactory.Actuator.Cartesian] send_command failed: #{inspect(reason)}")
     end
   end
 
-  defp publish_begin_motion({x, y, z, _roll, _pitch, _yaw}, state) do
+  # BeginMotion for a Cartesian move is expressed as scalar travel distance:
+  # initial_position 0.0 → target_position <distance in METRES> (BB's contract
+  # for prismatic-style positions is metres, not millimetres). The arrival
+  # estimate uses the speed this command was actually sent with, which may be
+  # a per-command override rather than the configured default.
+  defp publish_begin_motion({x, y, z, _roll, _pitch, _yaw}, speed, state) do
     actuator_name = List.last(state.bb.path)
     {cx, cy, cz} = current_position(state)
     dx = x - cx
     dy = y - cy
     dz = z - cz
     distance_mm = :math.sqrt(dx * dx + dy * dy + dz * dz)
-    travel_ms = round(distance_mm / max(state.speed, 0.001) * 1000)
+    travel_ms = round(distance_mm / max(speed, 0.001) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
     case Message.new(BeginMotion, actuator_name,
            initial_position: 0.0,
-           target_position: distance_mm * 1.0,
+           target_position: distance_mm / 1000.0,
            expected_arrival: expected_arrival,
            command_type: :position
          ) do

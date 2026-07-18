@@ -63,6 +63,69 @@ defmodule BB.Ufactory.ModelTest do
         end)
       end
     end
+
+    # Values from the official xarm_ros2 URDF descriptions
+    # (xarm_description/urdf/<model>/<model>.urdf.xacro), which match the
+    # Python SDK per-model configuration. Asserting exact values guards
+    # against the copy-paste drift that previously shipped xArm6 limits for
+    # every model (inverting xArm7's J4 range, among others).
+    @two_pi 2 * :math.pi()
+    @pi :math.pi()
+
+    @expected_limits %{
+      xarm5: [
+        {-@two_pi, @two_pi},
+        {-2.059488, 2.094395},
+        {-3.926990, 0.191986},
+        {-1.692969, @pi},
+        {-@two_pi, @two_pi}
+      ],
+      xarm6: [
+        {-@two_pi, @two_pi},
+        {-2.059488, 2.094395},
+        {-3.926990, 0.191986},
+        {-@two_pi, @two_pi},
+        {-1.692969, @pi},
+        {-@two_pi, @two_pi}
+      ],
+      xarm7: [
+        {-@two_pi, @two_pi},
+        {-2.059488, 2.094395},
+        {-@two_pi, @two_pi},
+        {-0.191986, 3.926990},
+        {-@two_pi, @two_pi},
+        {-1.692969, @pi},
+        {-@two_pi, @two_pi}
+      ],
+      lite6: [
+        {-@two_pi, @two_pi},
+        {-2.617990, 2.617990},
+        {-0.061087, 5.235988},
+        {-@two_pi, @two_pi},
+        {-2.164200, 2.164200},
+        {-@two_pi, @two_pi}
+      ],
+      xarm850: [
+        {-@two_pi, @two_pi},
+        {-2.303835, 2.303835},
+        {-4.223697, 0.061087},
+        {-@two_pi, @two_pi},
+        {-2.164200, 2.164200},
+        {-@two_pi, @two_pi}
+      ]
+    }
+
+    for model <- Map.keys(@expected_limits) do
+      test "#{model} limits match the official URDF values" do
+        expected = @expected_limits[unquote(model)]
+        actual = Model.joint_limits(unquote(model))
+
+        for {{{el, eu}, {al, au}}, idx} <- Enum.with_index(Enum.zip(expected, actual), 1) do
+          assert_in_delta al, el, 1.0e-6, "J#{idx} lower limit mismatch"
+          assert_in_delta au, eu, 1.0e-6, "J#{idx} upper limit mismatch"
+        end
+      end
+    end
   end
 
   describe "supported_models/0" do
@@ -76,4 +139,6 @@ defmodule BB.Ufactory.ModelTest do
       assert length(models) == 5
     end
   end
+
+  doctest BB.Ufactory.Model
 end

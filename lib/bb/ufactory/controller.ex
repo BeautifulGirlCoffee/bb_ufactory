@@ -24,7 +24,7 @@ defmodule BB.Ufactory.Controller do
 
   The arm-level row is keyed by `:arm`:
 
-      {:arm, state :: 0..5, mode :: 0..3, tcp_pose :: {x, y, z, roll, pitch, yaw} | nil}
+      {:arm, state :: non_neg_integer, mode :: non_neg_integer, tcp_pose :: {x, y, z, roll, pitch, yaw} | nil}
 
   Actuators write `set_position` into the ETS table. The 100 Hz control loop
   reads all pending positions and batches them into a single `cmd_move_joints`
@@ -182,6 +182,9 @@ defmodule BB.Ufactory.Controller do
   # All xArm models have at most 7 joints.
   @all_joint_names [:j1, :j2, :j3, :j4, :j5, :j6, :j7]
 
+  # TCP connect timeout for both init/1 and report-socket reconnects.
+  @connect_timeout_ms 2_000
+
   # ── Safety callback ─────────────────────────────────────────────────────────
 
   @doc """
@@ -239,9 +242,17 @@ defmodule BB.Ufactory.Controller do
     charlist_host = String.to_charlist(host)
     tcp_opts = [:binary, active: false, packet: :raw]
 
-    with {:ok, cmd_socket} <- :gen_tcp.connect(charlist_host, port, tcp_opts),
+    # Bounded connect timeouts: the default (:infinity) would let a
+    # black-holed host stall the whole robot supervision tree for the OS
+    # connect timeout (~75 s+).
+    with {:ok, cmd_socket} <- :gen_tcp.connect(charlist_host, port, tcp_opts, @connect_timeout_ms),
          {:ok, report_socket} <-
-           :gen_tcp.connect(charlist_host, report_port, [:binary, active: true, packet: :raw]) do
+           :gen_tcp.connect(
+             charlist_host,
+             report_port,
+             [:binary, active: true, packet: :raw],
+             @connect_timeout_ms
+           ) do
       ets = create_ets(bb.robot, controller_name, model_config.joints)
 
       BB.Safety.register(__MODULE__,
@@ -273,6 +284,9 @@ defmodule BB.Ufactory.Controller do
         last_error_code: 0,
         last_arm_status: nil,
         reconnect_attempts: 0,
+        report_reconnect_pending: false,
+        move_skip_logged: false,
+        arm_frames: [],
         auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
         error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
         error_report_grace_until: nil,
@@ -303,48 +317,72 @@ defmodule BB.Ufactory.Controller do
 
   @impl BB.Controller
   def handle_info(:loop, state) do
-    state = maybe_send_joint_move(state)
-    Process.send_after(self(), :loop, state.loop_interval_ms)
-    {:noreply, state}
+    case maybe_send_joint_move(state) do
+      {:ok, state} ->
+        Process.send_after(self(), :loop, state.loop_interval_ms)
+        {:noreply, state}
+
+      {:fatal, reason, state} ->
+        cmd_socket_fatal(reason, state)
+    end
   end
 
   # ── Report socket ─────────────────────────────────────────────────────────────
 
-  def handle_info({:tcp, _socket, data}, state) do
+  def handle_info({:tcp, socket, data}, %{report_socket: socket} = state) do
     buffer = state.buffer <> data
     state = drain_buffer(buffer, state)
     {:noreply, state}
   end
 
-  def handle_info({:tcp_closed, _socket}, state) do
+  # Data from a stale (already replaced or closed) report socket.
+  def handle_info({:tcp, _stale_socket, _data}, state), do: {:noreply, state}
+
+  def handle_info({:tcp_closed, socket}, %{report_socket: socket} = state) do
     Logger.warning("[BB.Ufactory.Controller] Report socket closed for #{state.controller_name}")
-    Process.send_after(self(), :reconnect_report, 1_000)
-    {:noreply, %{state | report_socket: nil, reconnect_attempts: 0}}
+    {:noreply, schedule_report_reconnect(%{state | report_socket: nil})}
   end
 
-  def handle_info({:tcp_error, _socket, reason}, state) do
+  def handle_info({:tcp_closed, _stale_socket}, state), do: {:noreply, state}
+
+  def handle_info({:tcp_error, socket, reason}, %{report_socket: socket} = state) do
     Logger.error(
       "[BB.Ufactory.Controller] Report socket error for #{state.controller_name}: #{inspect(reason)}"
     )
 
-    Process.send_after(self(), :reconnect_report, 1_000)
-    {:noreply, %{state | report_socket: nil, reconnect_attempts: 0}}
+    {:noreply, schedule_report_reconnect(%{state | report_socket: nil})}
   end
+
+  def handle_info({:tcp_error, _stale_socket, _reason}, state), do: {:noreply, state}
 
   def handle_info(:reconnect_report, %{report_socket: nil} = state) do
     host = String.to_charlist(state.host)
 
-    case :gen_tcp.connect(host, state.report_port, [:binary, active: true, packet: :raw], 2_000) do
+    case :gen_tcp.connect(
+           host,
+           state.report_port,
+           [:binary, active: true, packet: :raw],
+           @connect_timeout_ms
+         ) do
       {:ok, socket} ->
         Logger.info(
           "[BB.Ufactory.Controller] Report socket reconnected for #{state.controller_name}"
         )
 
-        {:noreply, %{state | report_socket: socket, buffer: <<>>, reconnect_attempts: 0}}
+        {:noreply,
+         %{
+           state
+           | report_socket: socket,
+             buffer: <<>>,
+             reconnect_attempts: 0,
+             report_reconnect_pending: false
+         }}
 
       {:error, reason} ->
         attempts = state.reconnect_attempts + 1
-        delay = min(30_000, 1_000 * trunc(:math.pow(2, attempts)))
+        # Cap the exponent as well as the product: :math.pow(2, n) raises
+        # ArithmeticError for very large n (~1024 attempts).
+        delay = min(30_000, 1_000 * trunc(:math.pow(2, min(attempts, 15))))
 
         Logger.warning(
           "[BB.Ufactory.Controller] Report reconnect failed for #{state.controller_name}: #{inspect(reason)}, retrying in #{delay}ms"
@@ -355,25 +393,20 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  def handle_info(:reconnect_report, state), do: {:noreply, state}
+  def handle_info(:reconnect_report, state) do
+    {:noreply, %{state | report_reconnect_pending: false}}
+  end
 
   # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
   def handle_info(:heartbeat, state) do
-    case :gen_tcp.send(state.cmd_socket, Protocol.heartbeat()) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Controller] Heartbeat send failed for #{state.controller_name}: #{inspect(reason)}"
-        )
+    with {:ok, state} <- send_raw(Protocol.heartbeat(), state),
+         {:ok, state} <- poll_error_code(state) do
+      Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+      {:noreply, state}
+    else
+      {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
     end
-
-    state = poll_error_code(state)
-
-    Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
-    {:noreply, state}
   end
 
   # ── State machine subscription ─────────────────────────────────────────────────
@@ -382,8 +415,10 @@ defmodule BB.Ufactory.Controller do
         {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
         state
       ) do
-    state = arm_init_sequence(state)
-    {:noreply, state}
+    case arm_init_sequence(state) do
+      {:ok, state} -> {:noreply, state}
+      {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
+    end
   end
 
   def handle_info({:bb, [:state_machine], %Message{payload: %Transition{}}}, state) do
@@ -393,40 +428,91 @@ defmodule BB.Ufactory.Controller do
         :hold -> Protocol.cmd_enable(state.txn_id, false)
       end
 
-    state = send_command(frame, state)
+    case send_command(frame, state) do
+      {:ok, state} -> {:noreply, state}
+      {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
+    end
+  end
+
+  # Catch-all: `use BB.Controller` only injects a default handle_info when the
+  # module defines none, so without this clause any unexpected message shape
+  # would crash an armed controller with a FunctionClauseError.
+  def handle_info(msg, state) do
+    Logger.debug(
+      "[BB.Ufactory.Controller] Ignoring unexpected message for #{state.controller_name}: #{inspect(msg)}"
+    )
+
     {:noreply, state}
   end
 
   # ── handle_call: send_command for actuators/sensors ─────────────────────────
+  #
+  # A failed send on the command socket is fatal: the socket is passive, so a
+  # dead peer never surfaces as :tcp_closed — send/recv errors are the only
+  # signal. The caller still gets its {:error, reason} reply, then the
+  # controller stops so bb's supervision and safety escalation take over
+  # (a silently dead command socket would otherwise disable fault detection
+  # and motion while the robot stays armed).
 
   @impl BB.Controller
   def handle_call({:send_command, frame}, _from, state) do
-    result = :gen_tcp.send(state.cmd_socket, frame)
-    {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
+    state = %{state | txn_id: next_txn(state.txn_id)}
+
+    case :gen_tcp.send(state.cmd_socket, frame) do
+      :ok ->
+        {:reply, :ok, state}
+
+      {:error, reason} = error ->
+        {:stop, fatal_stop_reason(reason, state), error, state}
+    end
   end
 
-  def handle_call({:send_and_recv, frame}, _from, state) do
-    drain_recv_buffer(state.cmd_socket)
-
-    result =
-      with :ok <- :gen_tcp.send(state.cmd_socket, frame),
-           {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, 5_000) do
-        Protocol.parse_response(data)
-      end
-
-    {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
+  def handle_call({:send_and_recv, frame}, from, state) do
+    handle_call({:send_and_recv, frame, 5_000}, from, state)
   end
 
   def handle_call({:send_and_recv, frame, timeout}, _from, state) do
     drain_recv_buffer(state.cmd_socket)
+    state = %{state | txn_id: next_txn(state.txn_id)}
 
-    result =
-      with :ok <- :gen_tcp.send(state.cmd_socket, frame),
-           {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, timeout) do
-        Protocol.parse_response(data)
+    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
+         {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, timeout) do
+      {:reply, Protocol.parse_response(data), state}
+    else
+      # A recv timeout is a normal slow-response condition, not socket death.
+      {:error, :timeout} = error ->
+        {:reply, error, state}
+
+      {:error, reason} = error ->
+        {:stop, fatal_stop_reason(reason, state), error, state}
+    end
+  end
+
+  # ── handle_call: arm-frame registration ──────────────────────────────────────
+  #
+  # Accessories (gripper, linear track, F/T sensor) register the frames that
+  # must be sent every time the robot arms. The controller sends them at the
+  # END of its own arm sequence, guaranteeing the arm is in mode 0 / state 0
+  # before any RS485 accessory command — ordering that a separate
+  # [:state_machine] subscription in each accessory cannot provide, because
+  # pubsub dispatch order across subscribers is unspecified.
+  #
+  # If the robot is already armed at registration time (e.g. an accessory
+  # restarted on its own), the frames are sent immediately.
+
+  def handle_call({:register_arm_frames, label, frames}, _from, state)
+      when is_atom(label) and is_list(frames) do
+    arm_frames = List.keystore(state.arm_frames, label, 0, {label, frames})
+    state = %{state | arm_frames: arm_frames}
+
+    if BB.Safety.armed?(state.bb.robot) do
+      case send_frames(frames, state) do
+        {:ok, state} -> {:reply, :ok, state}
+        {:fatal, reason, state} -> {:stop, fatal_stop_reason(reason, state), :ok, state}
       end
-
-    {:reply, result, %{state | txn_id: next_txn(state.txn_id)}}
+    else
+      {:reply, :ok, state}
+    end
   end
 
   # ── handle_call: ETS table reference for actuators ──────────────────────────
@@ -580,31 +666,37 @@ defmodule BB.Ufactory.Controller do
 
     if pending? and BB.Safety.armed?(state.bb.robot) do
       positions =
-        Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} ->
-          set_pos || cur_pos || 0.0
-        end)
+        Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} -> set_pos || cur_pos end)
 
-      max_speed = state.model_config.max_speed_rads
-      # Use a conservative default for acceleration (rad/s²); the arm's own
-      # motion planner will further clamp this per its firmware configuration.
-      max_accel = max_speed * 10.0
+      # Never substitute a default for an unknown joint position: commanding
+      # 0.0 for joints whose current angle has not yet been reported would
+      # sweep the whole arm toward the zero pose. Skip the tick until a report
+      # frame has populated every joint.
+      if Enum.any?(positions, &is_nil/1) do
+        {:ok, log_move_skip_once(state)}
+      else
+        max_speed = state.model_config.max_speed_rads
+        # Use a conservative default for acceleration (rad/s²); the arm's own
+        # motion planner will further clamp this per its firmware configuration.
+        max_accel = max_speed * 10.0
 
-      frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
-
-      case :gen_tcp.send(state.cmd_socket, frame) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning(
-            "[BB.Ufactory.Controller] Joint move send failed for #{state.controller_name}: #{inspect(reason)}"
-          )
+        frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
+        send_command(frame, %{state | move_skip_logged: false})
       end
-
-      %{state | txn_id: next_txn(state.txn_id)}
     else
-      state
+      {:ok, state}
     end
+  end
+
+  defp log_move_skip_once(%{move_skip_logged: true} = state), do: state
+
+  defp log_move_skip_once(state) do
+    Logger.warning(
+      "[BB.Ufactory.Controller] Skipping joint move for #{state.controller_name}: " <>
+        "current position unknown for one or more joints (no report frame yet)"
+    )
+
+    %{state | move_skip_logged: true}
   end
 
   defp drain_buffer(buffer, state) do
@@ -615,6 +707,31 @@ defmodule BB.Ufactory.Controller do
 
       {:more} ->
         %{state | buffer: buffer}
+
+      {:error, reason} ->
+        # The stream is desynchronized (corrupt length prefix); frame
+        # boundaries cannot be recovered mid-stream. Drop the connection and
+        # resync via reconnect.
+        Logger.error(
+          "[BB.Ufactory.Controller] Malformed report frame for #{state.controller_name}: " <>
+            "#{inspect(reason)} — resetting report socket"
+        )
+
+        if state.report_socket, do: :gen_tcp.close(state.report_socket)
+        schedule_report_reconnect(%{state | report_socket: nil, buffer: <<>>})
+    end
+  end
+
+  # Schedules exactly one reconnect chain. :tcp_error followed by :tcp_closed
+  # (a legal inet delivery sequence) or a parse error racing a close must not
+  # start parallel timer chains, so scheduling is guarded by a pending flag
+  # that only the :reconnect_report handler clears.
+  defp schedule_report_reconnect(state) do
+    if state.report_reconnect_pending do
+      state
+    else
+      Process.send_after(self(), :reconnect_report, 1_000)
+      %{state | report_reconnect_pending: true, reconnect_attempts: 0}
     end
   end
 
@@ -745,23 +862,82 @@ defmodule BB.Ufactory.Controller do
   #
   # Drains stale responses before sending to prevent desynchronization: fire-and-
   # forget operations (100Hz cmd_move_joints, RS485 actuator writes) generate
-  # responses nobody reads, and those accumulate in the TCP receive buffer. Without
-  # draining, recv would read a stale response — e.g. an RS485 response whose
-  # host_id byte (0x0B = 11) would be misinterpreted as error code 11 ("Servo motor
-  # 1 error"). The register is also validated to guard against any remaining
-  # desynchronization.
+  # responses nobody reads, and those accumulate in the TCP receive buffer.
+  # Responses that were still in flight when the drain ran (e.g. the reply to
+  # the heartbeat sent just before, or to a recent move frame) can still arrive
+  # ahead of the GET_ERROR reply, so the scanner walks all complete frames in
+  # the stream until it finds register 0x0F instead of requiring it first —
+  # otherwise every in-flight response would silently skip a fault-detection
+  # cycle while moving at 100 Hz.
+  #
+  # Returns {:ok, state} (poll answered or skipped) or {:fatal, reason, state}
+  # when the command socket is dead.
+  @poll_timeout_ms 500
+
   defp poll_error_code(state) do
     drain_recv_buffer(state.cmd_socket)
     frame = Protocol.cmd_get_error(state.txn_id)
+    state = %{state | txn_id: next_txn(state.txn_id)}
 
-    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
-         {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, 500),
-         {:ok, {0x0F, _status, <<error_code::8, _rest::binary>>}, _tail} <-
-           Protocol.parse_response(data) do
-      state = %{state | txn_id: next_txn(state.txn_id)}
-      maybe_report_error(%{error_code: error_code}, state)
+    case :gen_tcp.send(state.cmd_socket, frame) do
+      :ok ->
+        deadline = System.monotonic_time(:millisecond) + @poll_timeout_ms
+        await_error_response(state, <<>>, deadline)
+
+      {:error, reason} ->
+        {:fatal, reason, state}
+    end
+  end
+
+  defp await_error_response(state, buffer, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:ok, state}
     else
-      _ -> %{state | txn_id: next_txn(state.txn_id)}
+      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
+        {:ok, data} ->
+          handle_poll_data(state, buffer <> data, deadline)
+
+        # No response within the budget — skip this cycle.
+        {:error, :timeout} ->
+          {:ok, state}
+
+        {:error, reason} ->
+          {:fatal, reason, state}
+      end
+    end
+  end
+
+  defp handle_poll_data(state, buffer, deadline) do
+    case scan_for_error_response(buffer) do
+      {:found, error_code} ->
+        {:ok, maybe_report_error(%{error_code: error_code}, state)}
+
+      {:more, rest} ->
+        await_error_response(state, rest, deadline)
+
+      # Desynchronized/unparseable stream: skip this cycle; the drain at the
+      # start of the next poll clears the buffer.
+      :desync ->
+        {:ok, state}
+    end
+  end
+
+  # Walks complete response frames, skipping non-GET_ERROR responses.
+  defp scan_for_error_response(buffer) do
+    case Protocol.parse_response(buffer) do
+      {:ok, {0x0F, _status, <<error_code::8, _rest::binary>>}, _tail} ->
+        {:found, error_code}
+
+      {:ok, {_other_register, _status, _params}, tail} ->
+        scan_for_error_response(tail)
+
+      {:more} ->
+        {:more, buffer}
+
+      {:error, _reason} ->
+        :desync
     end
   end
 
@@ -782,7 +958,12 @@ defmodule BB.Ufactory.Controller do
           "[BB.Ufactory.Controller] Suppressing error code #{error_code} during post-arm grace period for #{state.controller_name}"
         )
 
-        %{state | last_error_code: error_code}
+        # Deliberately do NOT record the code in last_error_code: the guard on
+        # this function skips codes equal to last_error_code, so recording a
+        # suppressed code would permanently silence a fault that persists past
+        # the grace window. Leaving it unrecorded means the first poll after
+        # grace expiry sees a "new" code and reports it.
+        state
 
       true ->
         error =
@@ -805,36 +986,76 @@ defmodule BB.Ufactory.Controller do
   # Full xArm init sequence: clear stale errors, enable motors, set position
   # control mode, set state to ready. Without this sequence (especially
   # set_mode(0) and set_state(0)), the arm may remain in a stopped state
-  # after recovering from faults.
+  # after recovering from faults. Registered accessory arm frames (gripper /
+  # linear track enable, F/T sensor enable) are sent last, once the arm is in
+  # mode 0 / state 0.
   defp arm_init_sequence(state) do
-    state =
-      if state.auto_clear_errors do
-        grace_until =
-          System.monotonic_time(:millisecond) + state.error_report_grace_ms
-
-        state = send_command(Protocol.cmd_clean_error(state.txn_id), state)
-        %{state | error_report_grace_until: grace_until}
-      else
-        state
-      end
-
-    state = send_command(Protocol.cmd_enable(state.txn_id, true), state)
-    state = send_command(Protocol.cmd_set_mode(state.txn_id, 0), state)
-    send_command(Protocol.cmd_set_state(state.txn_id, 0), state)
+    with {:ok, state} <- maybe_clean_error(state),
+         {:ok, state} <- send_command(Protocol.cmd_enable(state.txn_id, true), state),
+         {:ok, state} <- send_command(Protocol.cmd_set_mode(state.txn_id, 0), state),
+         {:ok, state} <- send_command(Protocol.cmd_set_state(state.txn_id, 0), state) do
+      state.arm_frames
+      |> Enum.flat_map(fn {_label, frames} -> frames end)
+      |> send_frames(state)
+    end
   end
 
+  defp maybe_clean_error(%{auto_clear_errors: false} = state), do: {:ok, state}
+
+  defp maybe_clean_error(state) do
+    grace_until = System.monotonic_time(:millisecond) + state.error_report_grace_ms
+
+    case send_command(Protocol.cmd_clean_error(state.txn_id), state) do
+      {:ok, state} -> {:ok, %{state | error_report_grace_until: grace_until}}
+      fatal -> fatal
+    end
+  end
+
+  # Sends a frame built with the CURRENT txn_id, bumping the counter after.
+  # Returns {:ok, state} or {:fatal, reason, state} — a send failure on the
+  # command socket means the socket is dead (passive sockets have no
+  # :tcp_closed delivery) and must stop the controller.
   defp send_command(frame, state) do
     case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Controller] Command send failed for #{state.controller_name}: #{inspect(reason)}"
-        )
+      :ok -> {:ok, %{state | txn_id: next_txn(state.txn_id)}}
+      {:error, reason} -> {:fatal, reason, %{state | txn_id: next_txn(state.txn_id)}}
     end
+  end
 
-    %{state | txn_id: next_txn(state.txn_id)}
+  # Like send_command/2 but for pre-built frames that do not consume a txn_id
+  # (the heartbeat constant).
+  defp send_raw(frame, state) do
+    case :gen_tcp.send(state.cmd_socket, frame) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:fatal, reason, state}
+    end
+  end
+
+  defp send_frames(frames, state) do
+    Enum.reduce_while(frames, {:ok, state}, fn frame, {:ok, state} ->
+      case send_command(frame, state) do
+        {:ok, state} -> {:cont, {:ok, state}}
+        fatal -> {:halt, fatal}
+      end
+    end)
+  end
+
+  # Logs, reports the failure to BB.Safety (triggering disarm escalation), and
+  # returns the exception to use as the GenServer stop reason.
+  defp fatal_stop_reason(reason, state) do
+    error = ConnectionError.exception(host: state.host, port: state.port, reason: reason)
+
+    Logger.error(
+      "[BB.Ufactory.Controller] Command socket failed for #{state.controller_name}: " <>
+        "#{inspect(reason)} — stopping controller"
+    )
+
+    BB.Safety.report_error(state.bb.robot, state.bb.path, error)
+    error
+  end
+
+  defp cmd_socket_fatal(reason, state) do
+    {:stop, fatal_stop_reason(reason, state), state}
   end
 
   # Drains any stale unread responses from a TCP socket's receive buffer.

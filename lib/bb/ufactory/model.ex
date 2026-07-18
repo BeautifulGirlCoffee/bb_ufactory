@@ -7,8 +7,9 @@ defmodule BB.Ufactory.Model do
   Per-model configuration for UFactory xArm variants.
 
   Provides joint counts, maximum joint speed, and per-joint radian limits for
-  each supported model. Limits are taken from the xArm Developer Manual V1.10.0
-  and the Python SDK (`xarm/core/config/x_config.py` `XCONF.Robot.JOINT_LIMITS`).
+  each supported model. Limits are taken from the official `xarm_ros2` URDF
+  descriptions (`xarm_description/urdf/<model>/<model>.urdf.xacro`), which
+  match the Python SDK's per-model configuration.
 
   The map keys are the model atoms accepted by `BB.Ufactory.Controller`:
   `:xarm5`, `:xarm6`, `:xarm7`, `:lite6`, `:xarm850`.
@@ -19,12 +20,8 @@ defmodule BB.Ufactory.Model do
 
   - All values are in **radians**.
   - `max_speed_rads` is the maximum joint angular speed (rad/s).
-  - For models with sub-variants (e.g., xArm6-X4 vs X8), the standard X4
-    variant limits are used. If your arm uses a different sub-variant, override
-    the limits in your robot configuration.
-  - The xArm850 shares the xArm6 joint count and X4 limits (it is a
-    high-payload 6-axis arm using the same kinematic structure).
-  - The Lite6 has symmetric ±360° limits on most joints and ±180° on J5.
+  - These are the factory hard limits enforced by the firmware. They cannot be
+    widened; commands are clamped to them before being sent to the arm.
   """
 
   @pi :math.pi()
@@ -61,7 +58,7 @@ defmodule BB.Ufactory.Model do
         {-@two_pi, @two_pi},
         {-2.059488, 2.094395},
         {-@two_pi, @two_pi},
-        {-3.926990, 0.191986},
+        {-0.191986, 3.926990},
         {-@two_pi, @two_pi},
         {-1.692969, @pi},
         {-@two_pi, @two_pi}
@@ -72,10 +69,10 @@ defmodule BB.Ufactory.Model do
       max_speed_rads: @pi,
       limits: [
         {-@two_pi, @two_pi},
-        {-2.059488, 2.094395},
-        {-3.926990, 0.191986},
+        {-2.617990, 2.617990},
+        {-0.061087, 5.235988},
         {-@two_pi, @two_pi},
-        {-@pi, @pi},
+        {-2.164200, 2.164200},
         {-@two_pi, @two_pi}
       ]
     },
@@ -84,10 +81,10 @@ defmodule BB.Ufactory.Model do
       max_speed_rads: @pi,
       limits: [
         {-@two_pi, @two_pi},
-        {-2.059488, 2.094395},
-        {-3.926990, 0.191986},
+        {-2.303835, 2.303835},
+        {-4.223697, 0.061087},
         {-@two_pi, @two_pi},
-        {-1.692969, @pi},
+        {-2.164200, 2.164200},
         {-@two_pi, @two_pi}
       ]
     }

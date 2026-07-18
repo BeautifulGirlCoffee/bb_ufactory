@@ -23,11 +23,16 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
   in `init/1` via `cmd_ft_sensor_enable(true)`. Until the first frame with
   F/T data arrives, no `BB.Ufactory.Message.Wrench` messages are published.
 
-  ## Disarm
+  ## Disarm / Re-arm
 
   On disarm, the sensor attempts to send `cmd_ft_sensor_enable(false)` via
   the controller process. This is best-effort: if the controller is already
   down, the attempt is silently ignored and `:ok` is returned.
+
+  Because disarm disables the hardware sensor, `init/1` also registers the
+  enable frame with the controller's arm sequence, so the sensor is
+  re-enabled automatically on every `:armed` transition — without this, the
+  first disarm→re-arm cycle would leave the sensor silently disabled.
 
   ## Configuration
 
@@ -71,6 +76,23 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
       {:error, reason} ->
         Logger.warning(
           "[BB.Ufactory.Sensor.ForceTorque] ft_sensor_enable(true) failed: #{inspect(reason)}"
+        )
+    end
+
+    # disarm/1 disables the hardware sensor, so the enable frame must be
+    # re-sent on every :armed transition — registered with the controller's
+    # arm sequence so it happens after mode/state setup.
+    case BB.Process.call(
+           bb.robot,
+           controller,
+           {:register_arm_frames, :force_torque, [enable_frame]}
+         ) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[BB.Ufactory.Sensor.ForceTorque] arm-frame registration failed: #{inspect(reason)}"
         )
     end
 

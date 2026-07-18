@@ -67,21 +67,21 @@ defmodule BB.Ufactory.Sensor.Collision do
         doc: "Name of the xArm controller in the robot's registry"
       ],
       sensitivity: [
-        type: :any,
+        type: {:or, [{:in, 0..5}, {:literal, nil}]},
         default: nil,
         doc:
           "Collision detection sensitivity level (0–5). `nil` leaves the arm's current setting " <>
             "unchanged. 0 = disabled, 5 = most sensitive. Register 0x25, 1× u8."
       ],
       rebound: [
-        type: :any,
+        type: {:or, [:boolean, {:literal, nil}]},
         default: nil,
         doc:
           "Whether the arm briefly reverses direction after a collision. `nil` leaves the " <>
             "arm's current setting unchanged. Register 0x3C, 1× u8."
       ],
       self_collision_check: [
-        type: :any,
+        type: {:or, [:boolean, {:literal, nil}]},
         default: nil,
         doc:
           "Enable the firmware's geometric self-collision model. `nil` leaves the arm's current " <>
@@ -143,7 +143,7 @@ defmodule BB.Ufactory.Sensor.Collision do
   defp maybe_send_config(bb, controller, sensitivity, rebound, self_collision_check) do
     frames =
       [
-        sensitivity && Protocol.cmd_set_collision_sensitivity(0, sensitivity),
+        sensitivity != nil && Protocol.cmd_set_collision_sensitivity(0, sensitivity),
         rebound != nil && Protocol.cmd_set_collision_rebound(0, rebound),
         self_collision_check != nil &&
           Protocol.cmd_set_self_collision_check(0, self_collision_check)

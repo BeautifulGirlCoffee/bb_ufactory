@@ -36,9 +36,9 @@ defmodule BB.Ufactory.Protocol do
 
   ## Heartbeat
 
-  The arm drops the command connection if it does not receive a heartbeat
-  at least every ~10 seconds. Send `@heartbeat` on the command socket once
-  per second.
+  The arm drops the command connection if it does not receive traffic
+  at least every ~10 seconds. `heartbeat/0` returns an innocuous read-only
+  `GET_STATE` request frame; send it on the command socket once per second.
 
   ## Transaction IDs
 
@@ -49,13 +49,11 @@ defmodule BB.Ufactory.Protocol do
   # ── Private protocol identifier used in frame headers ─────────────────────
   @protocol_id 0x0002
 
-  # ── Heartbeat ──────────────────────────────────────────────────────────────
-  @heartbeat <<0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00>>
-
   # ── Register addresses (inlined to avoid a cross-module dependency in
   #    pattern matching; the canonical source is BB.Ufactory.Registers) ───────
   @reg_motion_en 0x0B
   @reg_set_state 0x0C
+  @reg_get_state 0x0D
   @reg_move_cart 0x15
   @reg_move_joints 0x17
   @reg_get_tcp_pose 0x29
@@ -105,9 +103,21 @@ defmodule BB.Ufactory.Protocol do
   # Note: 0x0A26 is the *read* address; writes go to 0x0303 via RS485 proxy.
   @linear_track_reg_speed 0x0303
 
-  @doc "Raw heartbeat frame. Send on the command socket once per second."
+  @doc """
+  Keep-alive frame for the command socket. Send once per second.
+
+  A well-formed read-only `GET_STATE` (register `0x0D`) request with
+  transaction ID 0. The response (register `0x0D`) is either drained or
+  skipped by the controller's response scanner; the request exists only to
+  generate periodic traffic so the arm does not drop the connection.
+
+  ## Examples
+
+      iex> BB.Ufactory.Protocol.heartbeat()
+      <<0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x0D>>
+  """
   @spec heartbeat() :: binary()
-  def heartbeat, do: @heartbeat
+  def heartbeat, do: build_frame(0, @reg_get_state, <<>>)
 
   # ── Core frame building ────────────────────────────────────────────────────
 
@@ -135,17 +145,26 @@ defmodule BB.Ufactory.Protocol do
   - `{:ok, {register, status, params_binary}, rest}` — a complete frame was
     parsed; `rest` is any trailing bytes not consumed.
   - `{:more}` — not enough bytes yet; accumulate more data and retry.
-  - `{:error, reason}` — malformed protocol identifier.
+  - `{:error, reason}` — malformed protocol identifier or impossible length
+    field (a response body is at least 2 bytes: register + status). The
+    error clause consumes no bytes, so callers cannot resync past a
+    malformed frame — treat it as a desynchronized stream and reset the
+    connection or drop the buffer.
   """
   @spec parse_response(binary()) ::
           {:ok, {byte(), byte(), binary()}, binary()} | {:more} | {:error, term()}
   def parse_response(binary) when byte_size(binary) < 6, do: {:more}
 
+  def parse_response(<<_txn_id::16, @protocol_id::16, length::16, _rest::binary>>)
+      when length < 2 do
+    {:error, {:bad_length, length}}
+  end
+
   def parse_response(<<_txn_id::16, @protocol_id::16, length::16, rest::binary>>) do
     if byte_size(rest) < length do
       {:more}
     else
-      <<body::binary-size(length), tail::binary>> = rest
+      <<body::binary-size(^length), tail::binary>> = rest
       <<register::8, status::8, params::binary>> = body
       {:ok, {register, status, params}, tail}
     end
@@ -533,8 +552,8 @@ defmodule BB.Ufactory.Protocol do
 
   ## Examples
 
-      iex> BB.Ufactory.Protocol.parse_linear_track_position(<<0x0B, 0x01, 0x03, 0x04, 0x00, 0x1E, 0x84, 0x80>>)
-      {:ok, 1.0}
+      iex> BB.Ufactory.Protocol.parse_linear_track_position(<<0x0B, 0x01, 0x03, 0x04, 0x00, 0x0F, 0x42, 0x40>>)
+      {:ok, 500.0}
   """
   @spec parse_linear_track_position(binary()) :: {:ok, float()} | {:error, :invalid_response}
   def parse_linear_track_position(

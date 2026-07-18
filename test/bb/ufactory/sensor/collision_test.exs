@@ -211,7 +211,13 @@ defmodule BB.Ufactory.Sensor.CollisionTest do
 
     test "ignores non-ArmStatus messages on the arm_status path" do
       state = make_state()
-      other_msg = %BB.Message{timestamp: 0, frame_id: :base, payload: %{something: :else}}
+
+      other_msg = %BB.Message{
+        monotonic_time: 0,
+        wall_time: 0,
+        frame_id: :base,
+        payload: %{something: :else}
+      }
 
       assert {:noreply, ^state} =
                Collision.handle_info({:bb, [:sensor, :xarm, :arm_status], other_msg}, state)

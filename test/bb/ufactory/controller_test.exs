@@ -126,6 +126,9 @@ defmodule BB.Ufactory.ControllerTest do
       last_error_code: 0,
       last_arm_status: nil,
       reconnect_attempts: 0,
+      report_reconnect_pending: false,
+      move_skip_logged: false,
+      arm_frames: [],
       tcp_offset: nil,
       tcp_load: nil,
       reduced_mode: false,
@@ -703,11 +706,26 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state}
     end
 
-    test "buffers data that cannot form a complete frame without corruption", %{state: state} do
+    test "resets the report connection on an impossible frame length", %{state: state} do
+      # A corrupted length prefix (4 GiB frame) means the stream is
+      # desynchronized: frame boundaries cannot be recovered, so the buffer
+      # is dropped and a reconnect is scheduled instead of buffering forever.
       garbage = <<0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x10>>
 
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, garbage}, state)
-      assert byte_size(new_state.buffer) > 0
+      assert new_state.buffer == <<>>
+      assert new_state.report_socket == nil
+      assert new_state.report_reconnect_pending
+      assert_receive :reconnect_report, 2_000
+    end
+
+    test "resets the report connection on a frame length below the 87-byte minimum",
+         %{state: state} do
+      garbage = <<0, 0, 0, 10, 1, 2, 3, 4, 5, 6>>
+
+      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, garbage}, state)
+      assert new_state.buffer == <<>>
+      assert new_state.report_reconnect_pending
     end
 
     test "valid frame after partial garbage is processed normally", %{state: state} do
@@ -750,7 +768,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -768,7 +786,7 @@ defmodule BB.Ufactory.ControllerTest do
       |> reject(:report_error, 3)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -783,7 +801,7 @@ defmodule BB.Ufactory.ControllerTest do
       ok_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0, 0x00>>
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, ok_response)
       end)
 
@@ -809,7 +827,7 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state, cmd_server: cmd_server}
     end
 
-    test "suppresses report_error during grace period but updates last_error_code",
+    test "suppresses report_error during grace period without recording the code",
          %{state: state, cmd_server: cmd_server} do
       state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) + 60_000}
 
@@ -819,7 +837,46 @@ defmodule BB.Ufactory.ControllerTest do
       |> reject(:report_error, 3)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      # The suppressed code must NOT be recorded as last_error_code: recording
+      # it would permanently silence a fault that persists past the grace
+      # window (the reporting guard skips codes equal to last_error_code).
+      assert new_state.last_error_code == 0
+    end
+
+    test "reports a fault first seen during grace once the grace period expires",
+         %{state: state, cmd_server: cmd_server} do
+      # Phase 1: fault appears during grace — suppressed.
+      state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) + 200}
+
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      # A single expectation for the whole test: if phase 1 wrongly reported
+      # the suppressed fault, phase 2's call would exceed it and fail.
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
+        :gen_tcp.send(cmd_server, error_response)
+      end)
+
+      assert {:noreply, state} = Controller.handle_info(:heartbeat, state)
+      assert state.last_error_code == 0
+
+      # Phase 2: grace expires while the same fault persists — it must be
+      # reported on the next poll, not silenced forever.
+      Process.sleep(250)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -840,7 +897,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -905,7 +962,7 @@ defmodule BB.Ufactory.ControllerTest do
       |> reject(:report_error, 3)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -926,7 +983,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -974,7 +1031,7 @@ defmodule BB.Ufactory.ControllerTest do
       |> reject(:report_error, 3)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, ok_response)
       end)
 
@@ -1001,7 +1058,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       spawn_link(fn ->
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
@@ -1102,6 +1159,26 @@ defmodule BB.Ufactory.ControllerTest do
       # Should still send a joint move since joint 1 has set_position
       assert {:ok, data} = recv_all(cmd_server, 200)
       assert byte_size(data) == 47
+
+      # Decode the commanded positions: joint 1 = its set_position, joints
+      # 2–6 = their current positions (never a substituted default).
+      <<_header::binary-6, _reg::8, params::binary>> = data
+      positions = Protocol.decode_fp32s(params, 7)
+      assert_in_delta Enum.at(positions, 0), 0.5, 1.0e-5
+      for i <- 1..5, do: assert_in_delta(Enum.at(positions, i), 0.2, 1.0e-5)
+    end
+
+    test "skips the tick when any joint's current position is unknown",
+         %{state: state, cmd_server: cmd_server} do
+      # Joint 1 has a pending command, but joints 2–6 have neither a report
+      # position nor a set_position (fresh ETS after a controller restart).
+      # Sending would command those joints to a substituted default — an
+      # uncommanded sweep on real hardware — so the tick must be skipped.
+      :ets.insert(state.ets, {1, nil, nil, 0.5})
+
+      assert {:noreply, new_state} = Controller.handle_info(:loop, state)
+      assert new_state.move_skip_logged
+      assert {:error, :timeout} = recv_all(cmd_server, 50)
     end
   end
 
@@ -1120,19 +1197,224 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state, cmd_server: cmd_server}
     end
 
-    test "sends the 8-byte heartbeat frame and polls error code over the command socket",
+    test "sends the heartbeat frame and polls error code over the command socket",
          %{state: state, cmd_server: cmd_server} do
       # Respond to the GET_ERROR poll with a zero error/warn code
       error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
 
       spawn_link(fn ->
         # Wait for heartbeat + error poll frames to arrive
-        {:ok, _data} = recv_at_least(cmd_server, 8 + 7, 1_000)
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, error_response)
       end)
 
       assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
       assert new_state.txn_id == 1
+    end
+
+    test "still finds the GET_ERROR reply behind an in-flight stale response",
+         %{state: state, cmd_server: cmd_server} do
+      # A response to the heartbeat (or a recent move frame) can land after
+      # the drain but before the GET_ERROR reply; the scanner must walk past
+      # it rather than dropping the fault-detection cycle.
+      stale = Protocol.build_frame(0, 0x0D, <<0x00, 0x02>>)
+      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.error_code == 22
+        :ok
+      end)
+
+      spawn_link(fn ->
+        {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
+        :gen_tcp.send(cmd_server, stale <> error_response)
+      end)
+
+      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert new_state.last_error_code == 22
+    end
+  end
+
+  # ── Command socket failure ───────────────────────────────────────────────────
+  #
+  # The command socket is passive, so a dead peer never surfaces as
+  # :tcp_closed. Send/recv errors are the only signal, and they must stop the
+  # controller (after reporting to BB.Safety) — a silently dead command
+  # socket would disable fault detection and motion while the robot stays
+  # armed.
+
+  describe "command socket failure" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+      state = make_state(cmd_client)
+
+      # Close both ends so every send on cmd_client fails.
+      :gen_tcp.close(cmd_server)
+      :gen_tcp.close(cmd_client)
+
+      %{state: state}
+    end
+
+    test "heartbeat send failure stops the controller and reports to safety", %{state: state} do
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.__struct__ == BB.Error.Protocol.Ufactory.ConnectionError
+        :ok
+      end)
+
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
+               Controller.handle_info(:heartbeat, state)
+    end
+
+    test "joint-move send failure stops the controller", %{state: state} do
+      BB.Safety
+      |> stub(:armed?, fn TestRobot -> true end)
+      |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
+
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
+
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
+               Controller.handle_info(:loop, state)
+    end
+
+    test "arm-sequence send failure stops the controller", %{state: state} do
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
+
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
+               Controller.handle_info({:bb, [:state_machine], msg}, state)
+    end
+
+    test "send_command call replies with the error and stops", %{state: state} do
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
+
+      frame = Protocol.cmd_gripper_position(0, 100)
+
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, {:error, _reason}, _state} =
+               Controller.handle_call({:send_command, frame}, {self(), make_ref()}, state)
+    end
+  end
+
+  describe "send_and_recv timeout is not fatal" do
+    test "replies {:error, :timeout} without stopping" do
+      {cmd_client, cmd_server} = tcp_pair()
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      frame = Protocol.cmd_get_error(0)
+
+      # Server never responds; a slow arm must not kill the controller.
+      assert {:reply, {:error, :timeout}, _state} =
+               Controller.handle_call({:send_and_recv, frame, 50}, {self(), make_ref()}, state)
+    end
+  end
+
+  # ── handle_call({:register_arm_frames, label, frames}) ──────────────────────
+
+  describe "handle_call({:register_arm_frames, label, frames})" do
+    setup do
+      {cmd_client, cmd_server} = tcp_pair()
+      state = make_state(cmd_client)
+
+      on_exit(fn ->
+        :gen_tcp.close(cmd_client)
+        :gen_tcp.close(cmd_server)
+      end)
+
+      %{state: state, cmd_server: cmd_server}
+    end
+
+    test "stores frames without sending when the robot is not armed",
+         %{state: state, cmd_server: cmd_server} do
+      BB.Safety
+      |> expect(:armed?, fn TestRobot -> false end)
+
+      frame = Protocol.cmd_gripper_enable(0, true)
+
+      assert {:reply, :ok, new_state} =
+               Controller.handle_call(
+                 {:register_arm_frames, :gripper, [frame]},
+                 {self(), make_ref()},
+                 state
+               )
+
+      assert new_state.arm_frames == [gripper: [frame]]
+      assert {:error, :timeout} = recv_all(cmd_server, 50)
+    end
+
+    test "sends frames immediately when the robot is already armed",
+         %{state: state, cmd_server: cmd_server} do
+      BB.Safety
+      |> expect(:armed?, fn TestRobot -> true end)
+
+      frame = Protocol.cmd_gripper_enable(0, true)
+
+      assert {:reply, :ok, _new_state} =
+               Controller.handle_call(
+                 {:register_arm_frames, :gripper, [frame]},
+                 {self(), make_ref()},
+                 state
+               )
+
+      assert {:ok, data} = recv_all(cmd_server, 200)
+      assert data == frame
+    end
+
+    test "re-registration under the same label replaces the previous frames",
+         %{state: state} do
+      BB.Safety
+      |> stub(:armed?, fn TestRobot -> false end)
+
+      frame_a = Protocol.cmd_gripper_enable(0, true)
+      frame_b = Protocol.cmd_gripper_enable(0, false)
+
+      {:reply, :ok, state} =
+        Controller.handle_call(
+          {:register_arm_frames, :gripper, [frame_a]},
+          {self(), make_ref()},
+          state
+        )
+
+      {:reply, :ok, state} =
+        Controller.handle_call(
+          {:register_arm_frames, :gripper, [frame_b]},
+          {self(), make_ref()},
+          state
+        )
+
+      assert state.arm_frames == [gripper: [frame_b]]
+    end
+
+    test "registered frames are sent at the end of the arm sequence",
+         %{state: state, cmd_server: cmd_server} do
+      accessory_frame = Protocol.cmd_gripper_enable(0, true)
+      state = %{state | arm_frames: [gripper: [accessory_frame]]}
+
+      {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
+
+      assert {:noreply, new_state} = Controller.handle_info({:bb, [:state_machine], msg}, state)
+
+      expected =
+        Protocol.cmd_clean_error(0) <>
+          Protocol.cmd_enable(1, true) <>
+          Protocol.cmd_set_mode(2, 0) <>
+          Protocol.cmd_set_state(3, 0) <>
+          accessory_frame
+
+      assert {:ok, data} = recv_at_least(cmd_server, byte_size(expected))
+      assert data == expected
+      assert new_state.txn_id == 5
     end
   end
 
