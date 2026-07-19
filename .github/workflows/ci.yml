@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: 2026 Holden Oullette
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELIXIR_VERSION: "1.20.2"
+  OTP_VERSION: "29"
+
+jobs:
+  check:
+    name: Static checks & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up BEAM
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # Runs the full ex_check suite: compiler (warnings-as-errors), formatter,
+      # credo --strict, dialyzer, doctor, ex_doc, unit tests with coverage,
+      # mix_audit, sobelow, unused_deps, and reuse (via the fsfe/reuse Docker
+      # image, per .check.exs). Dialyzer PLTs live in _build and are cached.
+      - name: Run mix check
+        run: mix check
+
+  simulator:
+    name: Simulator (${{ matrix.model }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [xarm5, xarm6, xarm7, lite6, xarm850]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up BEAM
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile tests
+        run: MIX_ENV=test mix compile
+
+      # Pulls UFACTORY's firmware simulator (~1.2 GB, amd64-native on these
+      # runners), starts this model's firmware inside it, and waits for the
+      # command (502) and report (30003) ports to answer.
+      - name: Start firmware simulator (${{ matrix.model }})
+        run: scripts/sim.sh start ${{ matrix.model }}
+
+      - name: Run simulator integration tests
+        run: SIM_MODEL=${{ matrix.model }} mix test --only simulator
+
+      - name: Simulator logs
+        if: failure()
+        run: docker logs --tail 200 bb_ufactory_sim || true
+
+      - name: Stop simulator
+        if: always()
+        run: scripts/sim.sh stop

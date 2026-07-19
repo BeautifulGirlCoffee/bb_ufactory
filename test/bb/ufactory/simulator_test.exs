@@ -19,6 +19,19 @@ defmodule BB.Ufactory.SimulatorTest do
 
   Configure the simulator address via `SIM_HOST` (default `127.0.0.1`).
 
+  ## Model coverage
+
+  The suite is parameterized over every supported arm model via `SIM_MODEL`
+  (default `xarm6`) — start the matching firmware and pass the same value:
+
+      scripts/sim.sh start lite6
+      SIM_MODEL=lite6 mix test --include simulator
+
+  Model-specific expectations (joint counts, the full-stack robot's model
+  option) derive from `BB.Ufactory.Model`; kinematics assertions use the
+  firmware's own report stream as ground truth so they hold for any model.
+  CI runs the suite against all five models in a matrix.
+
   ## Simulator quirks (observed against danielwang123321/uf-ubuntu-docker)
 
   - `MOTION_EN` (0x0B) never gets a response — enable must be sent
@@ -28,6 +41,10 @@ defmodule BB.Ufactory.SimulatorTest do
   - `IS_TCP_LIMIT`/`IS_JOINT_LIMIT` check the *configured* boundary, not
     reachability, so they answer `:within_limits` for everything by default.
     True reachability is probed via the FK(IK(pose)) round-trip instead.
+  - Joint limits ARE enforced at motion time (error 23), but the firmware's
+    self-collision model fires first on many folded poses and masks them —
+    the limit-boundary test temporarily disables self-collision checking to
+    observe pure limit enforcement.
   """
 
   use ExUnit.Case, async: false
@@ -36,12 +53,124 @@ defmodule BB.Ufactory.SimulatorTest do
   # Everything runs over real TCP against emulated firmware; be generous.
   @moduletag timeout: 120_000
 
+  alias BB.Ufactory.Model
   alias BB.Ufactory.Protocol
   alias BB.Ufactory.Report
 
   @host System.get_env("SIM_HOST", "127.0.0.1")
   @cmd_port 502
   @report_port 30_003
+
+  @model String.to_atom(System.get_env("SIM_MODEL", "xarm6"))
+  @joints Model.joint_count(@model)
+
+  # Per-model joint-limit boundary probe: {joint_index, inside_rad, beyond_rad}.
+  # Each targets a joint whose limit in BB.Ufactory.Model was corrected in the
+  # 2026-07-18 review, so this test firmware-validates the corrected table:
+  # the inside value must complete without error, the beyond value must trip
+  # firmware error 23 (Joints Angle Exceed Limit) at the model's true limit.
+  # (Self-collision checking is disabled during the probe — the firmware's
+  # collision model otherwise fires first on folded poses and masks the
+  # limit behavior.)
+  @limit_probe %{
+    # J3 upper limit 0.191986
+    xarm5: {3, 0.15, 0.6},
+    xarm6: {3, 0.15, 0.6},
+    # J4 lower limit -0.191986 — the axis whose range was shipped inverted
+    xarm7: {4, -0.15, -0.6},
+    # J5 ±2.1642 — was wrongly ±π
+    lite6: {5, 2.1, 2.5},
+    # J5 ±2.1642 — was wrongly {-1.693, +π}
+    xarm850: {5, 2.1, 2.5}
+  }
+
+  # The firmware accepts TCP connections a few seconds before its services
+  # actually respond (fresh `scripts/sim.sh start`, i.e. every CI run), so
+  # gate the whole suite on a real protocol-level readiness probe: the
+  # command socket must answer GET_STATE and the report stream must produce
+  # a parseable frame.
+  setup_all do
+    wait_for_firmware!(60_000)
+    :ok
+  end
+
+  defp wait_for_firmware!(budget_ms) do
+    deadline = System.monotonic_time(:millisecond) + budget_ms
+    do_wait_for_firmware(deadline)
+  end
+
+  defp do_wait_for_firmware(deadline) do
+    case firmware_ready?() do
+      true ->
+        :ok
+
+      false ->
+        if System.monotonic_time(:millisecond) > deadline do
+          raise "UFACTORY simulator firmware did not become ready — is it running? (scripts/sim.sh status)"
+        end
+
+        Process.sleep(1_000)
+        do_wait_for_firmware(deadline)
+    end
+  end
+
+  defp firmware_ready? do
+    cmd_responding?() and report_streaming?()
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
+  end
+
+  defp cmd_responding? do
+    with {:ok, socket} <-
+           :gen_tcp.connect(
+             String.to_charlist(@host),
+             @cmd_port,
+             [:binary, active: false, packet: :raw],
+             2_000
+           ),
+         :ok <- :gen_tcp.send(socket, Protocol.heartbeat()),
+         {:ok, data} <- :gen_tcp.recv(socket, 0, 2_000) do
+      :gen_tcp.close(socket)
+      match?({:ok, {0x0D, _, _}, _}, Protocol.parse_response(data))
+    else
+      _ -> false
+    end
+  end
+
+  defp report_streaming? do
+    case :gen_tcp.connect(
+           String.to_charlist(@host),
+           @report_port,
+           [:binary, active: false, packet: :raw],
+           2_000
+         ) do
+      {:ok, socket} ->
+        result = collect_frame(socket, <<>>, 3_000)
+        :gen_tcp.close(socket)
+        result
+
+      _ ->
+        false
+    end
+  end
+
+  defp collect_frame(socket, buffer, timeout) do
+    case Report.parse_report(buffer) do
+      {:ok, _report, _rest} ->
+        true
+
+      {:more} ->
+        case :gen_tcp.recv(socket, 0, timeout) do
+          {:ok, data} -> collect_frame(socket, buffer <> data, timeout)
+          {:error, _} -> false
+        end
+
+      {:error, _} ->
+        false
+    end
+  end
 
   # ── Raw socket helpers ──────────────────────────────────────────────────────
 
@@ -108,6 +237,15 @@ defmodule BB.Ufactory.SimulatorTest do
         {:ok, more} = :gen_tcp.recv(socket, 0, 2_000)
         recv_report(socket, buffer <> more)
     end
+  end
+
+  # Reads one report frame and returns the current joint angles (trimmed to
+  # the model's joint count) and TCP pose — the firmware's own ground truth.
+  defp current_state do
+    socket = connect_report()
+    {report, _rest} = recv_report(socket)
+    :gen_tcp.close(socket)
+    {Enum.take(report.angles, @joints), report.pose}
   end
 
   # Polls the report stream until `fun` returns true or `deadline_ms` passes.
@@ -196,21 +334,42 @@ defmodule BB.Ufactory.SimulatorTest do
       %{socket: socket}
     end
 
-    test "FK of the zero pose matches the xArm6 kinematic model", %{socket: socket} do
+    if @model == :xarm6 do
+      test "FK of the zero pose matches the xArm6 kinematic model", %{socket: socket} do
+        assert {:ok, {0x2C, _status, params}, _rest} =
+                 send_and_recv(socket, Protocol.cmd_get_fk(0, List.duplicate(0.0, 6)))
+
+        assert {:ok, {x, y, z, roll, _pitch, _yaw}} = Protocol.parse_fk_response(params)
+
+        # xArm6 all-zeros TCP pose: x = 207 mm, z = 112 mm, tool pointing down.
+        assert_in_delta x, 207.0, 1.0
+        assert_in_delta y, 0.0, 1.0
+        assert_in_delta z, 112.0, 1.0
+        assert_in_delta abs(roll), :math.pi(), 0.01
+      end
+    end
+
+    test "FK of the reported joint angles matches the reported TCP pose",
+         %{socket: socket} do
+      # Model-independent FK check: the firmware's own report stream is the
+      # ground truth — FK of the current joint angles must land on the
+      # current TCP pose for every model.
+      {angles, pose} = current_state()
+      [px, py, pz | _] = pose
+
       assert {:ok, {0x2C, _status, params}, _rest} =
-               send_and_recv(socket, Protocol.cmd_get_fk(0, List.duplicate(0.0, 6)))
+               send_and_recv(socket, Protocol.cmd_get_fk(0, angles))
 
-      assert {:ok, {x, y, z, roll, _pitch, _yaw}} = Protocol.parse_fk_response(params)
-
-      # xArm6 all-zeros TCP pose: x = 207 mm, z = 112 mm, tool pointing down.
-      assert_in_delta x, 207.0, 1.0
-      assert_in_delta y, 0.0, 1.0
-      assert_in_delta z, 112.0, 1.0
-      assert_in_delta abs(roll), :math.pi(), 0.01
+      assert {:ok, {x, y, z, _r, _p, _yw}} = Protocol.parse_fk_response(params)
+      assert_in_delta x, px, 2.0
+      assert_in_delta y, py, 2.0
+      assert_in_delta z, pz, 2.0
     end
 
     test "IK round-trips through FK for a reachable pose", %{socket: socket} do
-      pose = {300.0, 50.0, 300.0, :math.pi(), 0.0, 0.0}
+      # The arm's current pose is reachable by definition on every model.
+      {_angles, [px, py, pz, roll, pitch, yaw]} = current_state()
+      pose = {px, py, pz, roll, pitch, yaw}
 
       assert {:ok, {0x2B, _status, ik_params}, _rest} =
                send_and_recv(socket, Protocol.cmd_get_ik(0, pose))
@@ -222,10 +381,9 @@ defmodule BB.Ufactory.SimulatorTest do
 
       assert {:ok, {x, y, z, _r, _p, _yw}} = Protocol.parse_fk_response(fk_params)
 
-      {ex, ey, ez, _, _, _} = pose
-      assert_in_delta x, ex, 5.0
-      assert_in_delta y, ey, 5.0
-      assert_in_delta z, ez, 5.0
+      assert_in_delta x, px, 5.0
+      assert_in_delta y, py, 5.0
+      assert_in_delta z, pz, 5.0
     end
 
     test "FK(IK(pose)) round-trip distinguishes reachable from unreachable poses",
@@ -241,7 +399,10 @@ defmodule BB.Ufactory.SimulatorTest do
         :math.sqrt((fx - x) ** 2 + (fy - y) ** 2 + (fz - z) ** 2)
       end
 
-      reachable = {300.0, 0.0, 300.0, :math.pi(), 0.0, 0.0}
+      {_angles, [px, py, pz, roll, pitch, yaw]} = current_state()
+      reachable = {px, py, pz, roll, pitch, yaw}
+      # 2 m out is beyond every supported model's reach (Lite6 440 mm …
+      # UF850 850 mm).
       unreachable = {2000.0, 0.0, 300.0, :math.pi(), 0.0, 0.0}
 
       assert round_trip_error.(reachable) < 5.0
@@ -262,7 +423,10 @@ defmodule BB.Ufactory.SimulatorTest do
       assert verdict in [:within_limits, :beyond_limits]
 
       assert {:ok, {0x2D, _status, jparams}, _rest} =
-               send_and_recv(socket, Protocol.cmd_joint_limit_check(1, List.duplicate(0.0, 6)))
+               send_and_recv(
+                 socket,
+                 Protocol.cmd_joint_limit_check(1, List.duplicate(0.0, @joints))
+               )
 
       assert {:ok, jverdict} = Protocol.parse_limit_check(jparams)
       assert jverdict in [:within_limits, :beyond_limits]
@@ -278,7 +442,7 @@ defmodule BB.Ufactory.SimulatorTest do
       ensure_ready(cmd)
 
       {initial, rest} = recv_report(report)
-      initial_angles = Enum.take(initial.angles, 6)
+      initial_angles = Enum.take(initial.angles, @joints)
       target_j1 = hd(initial_angles) + 0.3
       target_angles = List.replace_at(initial_angles, 0, target_j1)
 
@@ -302,6 +466,112 @@ defmodule BB.Ufactory.SimulatorTest do
     end
   end
 
+  # ── Firmware joint-limit enforcement ────────────────────────────────────────
+
+  describe "firmware joint-limit enforcement" do
+    test "the corrected model limits match the firmware's enforcement boundary" do
+      {joint_idx, inside, beyond} = @limit_probe[@model]
+      {lower, upper} = Enum.at(Model.joint_limits(@model), joint_idx - 1)
+      bound = if beyond > 0, do: upper, else: lower
+
+      cmd = connect_cmd()
+      report = connect_report()
+
+      # Best-effort restore no matter how the test exits: clear any latched
+      # fault and re-enable the firmware's self-collision model.
+      on_exit(fn ->
+        try do
+          sock = connect_cmd()
+          send_fire_and_forget(sock, Protocol.cmd_clean_error(0))
+          send_fire_and_forget(sock, Protocol.cmd_set_self_collision_check(1, true))
+          :gen_tcp.close(sock)
+        catch
+          _, _ -> :ok
+        end
+      end)
+
+      ensure_ready(cmd)
+      send_fire_and_forget(cmd, Protocol.cmd_set_self_collision_check(5, false))
+
+      zero = List.duplicate(0.0, @joints)
+      {_first, rest} = recv_report(report)
+
+      # Phase 1: just inside our table's limit — the firmware must accept it
+      # and complete the move with no error (proves our table is not wider
+      # than the firmware's).
+      inside_target = List.replace_at(zero, joint_idx - 1, inside)
+      :ok = :gen_tcp.send(cmd, Protocol.cmd_move_joints(10, inside_target, 1.5, 15.0))
+
+      assert {:ok, _r, _rest} =
+               await_report(report, rest, 30_000, fn r ->
+                 abs(Enum.at(r.angles, joint_idx - 1) - inside) < 0.02
+               end)
+
+      assert get_error(cmd) == 0
+
+      # Phase 2: beyond our table's limit — the firmware must refuse and
+      # raise error 23, Joints Angle Exceed Limit (proves our table is not
+      # narrower than the firmware's by any useful margin).
+      beyond_target = List.replace_at(zero, joint_idx - 1, beyond)
+      :ok = :gen_tcp.send(cmd, Protocol.cmd_move_joints(11, beyond_target, 1.5, 15.0))
+
+      assert await_error(cmd, 23, 20_000),
+             "firmware did not raise error 23 for J#{joint_idx} = #{beyond} " <>
+               "(model #{@model}, table limit #{bound})"
+
+      # The fault has latched, so motion has stopped — read the halt angle
+      # from a fresh report connection (the old socket's buffer holds stale
+      # mid-motion frames). The firmware halts AT its own limit, which must
+      # agree with our table: close to our bound, never meaningfully past it.
+      {angles, _pose} = current_state()
+      halted = Enum.at(angles, joint_idx - 1)
+      assert_in_delta halted, bound, 0.15
+      assert abs(halted) <= abs(bound) + 0.02
+
+      # Cleanup: clear the fault and return to zero so later tests start sane.
+      ensure_ready(cmd)
+      :ok = :gen_tcp.send(cmd, Protocol.cmd_move_joints(12, zero, 1.5, 15.0))
+      Process.sleep(3_000)
+
+      :gen_tcp.close(cmd)
+      :gen_tcp.close(report)
+    end
+  end
+
+  # Drains stale responses, then polls GET_ERROR once. Retries on a non-0x0F
+  # response (an in-flight reply to an earlier fire-and-forget frame).
+  defp get_error(cmd, attempts \\ 5) do
+    drain(cmd)
+
+    case send_and_recv(cmd, Protocol.cmd_get_error(0)) do
+      {:ok, {0x0F, _status, <<err::8, _warn::8>>}, _rest} ->
+        err
+
+      _other when attempts > 0 ->
+        Process.sleep(200)
+        get_error(cmd, attempts - 1)
+    end
+  end
+
+  defp await_error(cmd, code, budget_ms) do
+    deadline = System.monotonic_time(:millisecond) + budget_ms
+    do_await_error(cmd, code, deadline)
+  end
+
+  defp do_await_error(cmd, code, deadline) do
+    cond do
+      get_error(cmd) == code ->
+        true
+
+      System.monotonic_time(:millisecond) > deadline ->
+        false
+
+      true ->
+        Process.sleep(500)
+        do_await_error(cmd, code, deadline)
+    end
+  end
+
   # ── Full stack: real BB.Ufactory.Controller against the simulator ──────────
 
   defmodule Robot do
@@ -313,7 +583,9 @@ defmodule BB.Ufactory.SimulatorTest do
       controller(
         :xarm,
         {BB.Ufactory.Controller,
-         host: System.get_env("SIM_HOST", "127.0.0.1"), model: :xarm6, loop_hz: 50}
+         host: System.get_env("SIM_HOST", "127.0.0.1"),
+         model: String.to_atom(System.get_env("SIM_MODEL", "xarm6")),
+         loop_hz: 50}
       )
     end
 
@@ -368,7 +640,7 @@ defmodule BB.Ufactory.SimulatorTest do
                       %BB.Message{payload: %BB.Message.Sensor.JointState{} = js}},
                      5_000
 
-      assert length(js.positions) == 6
+      assert length(js.positions) == @joints
     end
 
     test "arms, moves J1 through the actuator, and observes convergence" do

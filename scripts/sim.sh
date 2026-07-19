@@ -10,24 +10,48 @@
 # verification.
 #
 # Usage:
-#   scripts/sim.sh start [axes]   # start container + firmware (default: 6)
+#   scripts/sim.sh start [model]  # start container + firmware (default: xarm6)
 #   scripts/sim.sh stop           # stop and remove the container
 #   scripts/sim.sh status         # is it running / is port 502 answering?
 #   scripts/sim.sh logs           # tail firmware logs
 #
-# Then run the simulator test suite:
-#   mix test --include simulator
+# Supported models (matching BB.Ufactory.Model): xarm5, xarm6, xarm7, lite6,
+# xarm850. The container ships one firmware binary per model
+# (xarm<axes>-type<type>-controller); Lite6 is device type 9 and UF850 is
+# device type 12, both 6-axis.
+#
+# Then run the simulator test suite against the started model:
+#   SIM_MODEL=<model> mix test --include simulator
 
 set -euo pipefail
 
 IMAGE="danielwang123321/uf-ubuntu-docker"
 NAME="bb_ufactory_sim"
-AXES="${2:-6}"
+MODEL="${2:-xarm6}"
+
+model_args() {
+  case "$1" in
+    xarm5) echo "5 5" ;;
+    xarm6) echo "6 6" ;;
+    xarm7) echo "7 7" ;;
+    lite6) echo "6 9" ;;
+    xarm850) echo "6 12" ;;
+    *)
+      echo "Unknown model '$1' (expected xarm5|xarm6|xarm7|lite6|xarm850)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+port_open() {
+  # Bash-builtin TCP probe — no dependency on nc, which CI runners may lack.
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- 3<&-
+}
 
 wait_for_port() {
   local port="$1" tries="${2:-30}"
   for _ in $(seq 1 "$tries"); do
-    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+    if port_open "$port"; then
       return 0
     fi
     sleep 1
@@ -37,28 +61,30 @@ wait_for_port() {
 
 case "${1:-}" in
   start)
-    if [ "$(docker ps -q -f name="^${NAME}$")" ]; then
-      echo "Container ${NAME} already running."
-    else
-      docker rm -f "$NAME" >/dev/null 2>&1 || true
-      # -it: the image's entrypoint is a bare bash shell, which exits
-      # immediately without a TTY. --platform: the image is amd64-only;
-      # Apple Silicon hosts run it under emulation.
-      docker run -dit --platform linux/amd64 --name "$NAME" \
-        -p 18333:18333 \
-        -p 502:502 \
-        -p 503:503 \
-        -p 504:504 \
-        -p 30000:30000 \
-        -p 30001:30001 \
-        -p 30002:30002 \
-        -p 30003:30003 \
-        "$IMAGE" >/dev/null
-      echo "Container ${NAME} started."
-    fi
+    ARGS="$(model_args "$MODEL")"
 
-    echo "Starting xArm firmware simulation (${AXES} axes)..."
-    docker exec -d "$NAME" /xarm_scripts/xarm_start.sh "$AXES" "$AXES"
+    # Always recreate: a previously started firmware (possibly a different
+    # model) must be fully torn down before starting the new one.
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+    # -it: the image's entrypoint is a bare bash shell, which exits
+    # immediately without a TTY. --platform: the image is amd64-only;
+    # Apple Silicon hosts run it under emulation.
+    docker run -dit --platform linux/amd64 --name "$NAME" \
+      -p 18333:18333 \
+      -p 502:502 \
+      -p 503:503 \
+      -p 504:504 \
+      -p 30000:30000 \
+      -p 30001:30001 \
+      -p 30002:30002 \
+      -p 30003:30003 \
+      "$IMAGE" >/dev/null
+    echo "Container ${NAME} started."
+
+    echo "Starting ${MODEL} firmware simulation (xarm_start.sh ${ARGS})..."
+    # shellcheck disable=SC2086
+    docker exec -d "$NAME" /xarm_scripts/xarm_start.sh $ARGS
 
     echo -n "Waiting for command port 502..."
     if wait_for_port 502 60; then
@@ -76,8 +102,8 @@ case "${1:-}" in
       exit 1
     fi
 
-    echo "Simulator ready. Studio UI: http://127.0.0.1:18333"
-    echo "Run tests with: mix test --include simulator"
+    echo "Simulator ready (${MODEL}). Studio UI: http://127.0.0.1:18333"
+    echo "Run tests with: SIM_MODEL=${MODEL} mix test --include simulator"
     ;;
 
   stop)
@@ -88,7 +114,7 @@ case "${1:-}" in
   status)
     if [ "$(docker ps -q -f name="^${NAME}$")" ]; then
       echo "Container: running"
-      if nc -z 127.0.0.1 502 2>/dev/null; then
+      if port_open 502; then
         echo "Command port 502: answering"
       else
         echo "Command port 502: NOT answering (firmware not started?)"

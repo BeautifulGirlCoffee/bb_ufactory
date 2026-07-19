@@ -231,9 +231,14 @@ mix test
 #    Runs the real controller and wire protocol against the real firmware —
 #    the closest thing to hardware without an arm. Studio UI for visual
 #    verification at http://127.0.0.1:18333.
-scripts/sim.sh start
+scripts/sim.sh start            # defaults to xarm6
 mix test --include simulator
 scripts/sim.sh stop
+
+#    The simulator ships firmware for every supported model; CI runs the
+#    suite against all five. Locally, pick one:
+scripts/sim.sh start lite6      # or xarm5 | xarm7 | xarm850
+SIM_MODEL=lite6 mix test --include simulator
 
 # 3. Hardware tests against a physical arm (clear the workspace first!)
 XARM_HOST=192.168.1.224 mix test --include hardware
