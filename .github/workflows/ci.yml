@@ -87,10 +87,10 @@ jobs:
         run: MIX_ENV=test mix compile
 
       # Pulls UFACTORY's firmware simulator (~1.2 GB, amd64-native on these
-      # runners), starts this model's firmware inside it, and waits for the
-      # command (502) and report (30003) ports to answer.
+      # runners), starts this model's firmware inside it, and blocks until
+      # the firmware passes a protocol-level readiness probe.
       - name: Start firmware simulator (${{ matrix.model }})
-        run: scripts/sim.sh start ${{ matrix.model }}
+        run: MIX_ENV=test mix bb_ufactory.sim start ${{ matrix.model }}
 
       - name: Run simulator integration tests
         run: SIM_MODEL=${{ matrix.model }} mix test --only simulator
@@ -101,4 +101,4 @@ jobs:
 
       - name: Stop simulator
         if: always()
-        run: scripts/sim.sh stop
+        run: MIX_ENV=test mix bb_ufactory.sim stop

@@ -231,13 +231,13 @@ mix test
 #    Runs the real controller and wire protocol against the real firmware —
 #    the closest thing to hardware without an arm. Studio UI for visual
 #    verification at http://127.0.0.1:18333.
-scripts/sim.sh start            # defaults to xarm6
+mix bb_ufactory.sim start       # defaults to xarm6
 mix test --include simulator
-scripts/sim.sh stop
+mix bb_ufactory.sim stop
 
 #    The simulator ships firmware for every supported model; CI runs the
 #    suite against all five. Locally, pick one:
-scripts/sim.sh start lite6      # or xarm5 | xarm7 | xarm850
+mix bb_ufactory.sim start lite6 # or xarm5 | xarm7 | xarm850
 SIM_MODEL=lite6 mix test --include simulator
 
 # 3. Hardware tests against a physical arm (clear the workspace first!)
@@ -245,8 +245,14 @@ XARM_HOST=192.168.1.224 mix test --include hardware
 ```
 
 The simulator image (`danielwang123321/uf-ubuntu-docker`) is amd64-only and
-runs under emulation on Apple Silicon; `scripts/sim.sh` handles the platform
-flag and firmware startup automatically.
+runs under emulation on Apple Silicon; `mix bb_ufactory.sim` handles the
+platform flag, firmware startup, and protocol-level readiness automatically.
+
+Building simulator tests for your own robot application? This library ships
+`BB.Ufactory.SimulatorCase` (an ExUnit case template) and
+`BB.Ufactory.Simulator` (protocol-level helpers that also work against a
+physical arm) — see the *Testing against the UFACTORY simulator* tutorial
+on HexDocs.
 
 ## Documentation
 

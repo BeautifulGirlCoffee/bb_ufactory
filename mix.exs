@@ -35,7 +35,10 @@ defmodule BB.Ufactory.MixProject do
     ]
   end
 
-  defp dialyzer, do: []
+  # :mix and :ex_unit are needed in the PLT because the library ships a Mix
+  # task (Mix.Tasks.BbUfactory.Sim) and an ExUnit case template
+  # (BB.Ufactory.SimulatorCase).
+  defp dialyzer, do: [plt_add_apps: [:mix, :ex_unit]]
 
   defp package do
     [
