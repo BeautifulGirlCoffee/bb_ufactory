@@ -28,3 +28,4 @@ bb_ufactory-*.tar
 
 # macOS
 .DS_Store*
+.claude/settings.local.json

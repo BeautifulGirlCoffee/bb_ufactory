@@ -219,6 +219,30 @@ frames that are 135+ bytes, which requires the F/T sensor to be enabled via
 Error codes are not included in real-time report frames; they are polled from the command
 socket (register 0x0F) once per second alongside the heartbeat.
 
+## Testing
+
+Three tiers, from fastest to closest-to-production:
+
+```sh
+# 1. Unit + kinematic-sim tests (no hardware, no Docker) — the default
+mix test
+
+# 2. Integration tests against UFACTORY's firmware simulator in Docker.
+#    Runs the real controller and wire protocol against the real firmware —
+#    the closest thing to hardware without an arm. Studio UI for visual
+#    verification at http://127.0.0.1:18333.
+scripts/sim.sh start
+mix test --include simulator
+scripts/sim.sh stop
+
+# 3. Hardware tests against a physical arm (clear the workspace first!)
+XARM_HOST=192.168.1.224 mix test --include hardware
+```
+
+The simulator image (`danielwang123321/uf-ubuntu-docker`) is amd64-only and
+runs under emulation on Apple Silicon; `scripts/sim.sh` handles the platform
+flag and firmware startup automatically.
+
 ## Documentation
 
 Full documentation is available at [HexDocs](https://hexdocs.pm/bb_ufactory).
