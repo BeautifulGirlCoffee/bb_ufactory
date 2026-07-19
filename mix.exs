@@ -42,6 +42,9 @@ defmodule BB.Ufactory.MixProject do
 
   defp package do
     [
+      # Public package owned by the beautifulgirlcoffee organization on
+      # hex.pm (published via an org-owned key; the org is the package
+      # owner, not a private repository).
       maintainers: ["Holden Oullette"],
       licenses: ["Apache-2.0"],
       links: %{
@@ -66,7 +69,9 @@ defmodule BB.Ufactory.MixProject do
       groups_for_extras: [
         Tutorials: ~r/tutorials\//
       ],
-      source_ref: "main",
+      # Published docs link to the release tag (created by the publish CI
+      # job); "main" would drift as the branch moves past the release.
+      source_ref: "v#{@version}",
       source_url: "https://github.com/BeautifulGirlCoffee/bb_ufactory"
     ]
   end
@@ -75,7 +80,9 @@ defmodule BB.Ufactory.MixProject do
 
   defp deps do
     [
-      {:bb, "~> 0.15"},
+      # 0.22+ required: BB.Message monotonic_time/wall_time envelope,
+      # compile-time component behaviour enforcement, Localize-based units.
+      {:bb, "~> 0.22"},
 
       # dev/test
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

@@ -102,3 +102,73 @@ jobs:
       - name: Stop simulator
         if: always()
         run: MIX_ENV=test mix bb_ufactory.sim stop
+
+  publish:
+    name: Publish to Hex
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only after the FULL gate passes on a push to main: static checks, unit
+    # tests, and the five-model firmware-simulator matrix.
+    needs: [check, simulator]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up BEAM
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # Idempotent auto-publish: only publish when mix.exs carries a version
+      # hex.pm has not seen. Merges that don't bump the version skip
+      # cleanly; unexpected API responses fail the job loudly rather than
+      # silently skipping.
+      - name: Check whether this version is unpublished
+        id: version
+        run: |
+          VERSION=$(grep -m1 '@version "' mix.exs | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://hex.pm/api/packages/bb_ufactory/releases/$VERSION")
+          case "$STATUS" in
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              echo "Version $VERSION is unpublished — will publish." ;;
+            200)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "Version $VERSION already on hex.pm — skipping." ;;
+            *)
+              echo "Unexpected HTTP $STATUS from hex.pm"
+              exit 1 ;;
+          esac
+
+      - name: Publish package and docs
+        if: steps.version.outputs.publish == 'true'
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
+
+      - name: Tag the release
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"

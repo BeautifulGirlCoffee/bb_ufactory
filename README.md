@@ -57,7 +57,7 @@ end
 ## Requirements
 
 - UFactory xArm arm connected via Ethernet
-- BB framework (`~> 0.15`)
+- BB framework (`~> 0.22`)
 
 ## Usage
 
