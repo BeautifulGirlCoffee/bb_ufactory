@@ -134,7 +134,9 @@ BB.Error.Protocol.Ufactory.ConnectionError
 
 - **`BB.Ufactory.Robots.XArm6`** (`lib/bb/ufactory/robots/x_arm6.ex`) — Ready-to-use
   BB robot definition for the xArm6 with correct joint limits, effort values, and
-  actuator wiring. Use with `use BB.Ufactory.Robots.XArm6` as a starting point.
+  actuator wiring. Use with `use BB.Ufactory.Robots.XArm6, host: "..."` as a
+  starting point; `gripper:`, `linear_track:`, and `controller:` options add
+  accessories and controller configuration.
 
 - **`BB.Error.Protocol.Ufactory.HardwareFault`** — Structured exception for arm
   hardware error codes (full code table included). Raised via `BB.Safety.report_error`.

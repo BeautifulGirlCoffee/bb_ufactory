@@ -29,27 +29,14 @@ fully closed (0) to fully open (840).
 
 ### Adding the Gripper
 
-Declare the gripper actuator in your robot's topology:
+Enable the gripper with the `:gripper` option — it mounts a `:gripper`
+actuator on a fixed joint at `:link6` (the TCP):
 
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller, host: "192.168.1.111", model: :xarm6}
-  end
-
-  # Add at the base link level (outside the joint chain)
-  topology do
-    link :base do
-      # ... joints j1–j6 ...
-
-      actuator :gripper, {BB.Ufactory.Actuator.Gripper,
-        controller: :xarm,
-        speed: 1500         # pulse units per second; default: 1500
-      }
-    end
-  end
+  use BB.Ufactory.Robots.XArm6,
+    host: "192.168.1.111",
+    gripper: [speed: 1500]   # pulse units per second; `gripper: true` for defaults
 end
 ```
 
@@ -101,17 +88,10 @@ The sensor is polled at a configurable rate (default 50 Hz) by sending
 
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller, host: "192.168.1.111", model: :xarm6}
-  end
+  use BB.Ufactory.Robots.XArm6, host: "192.168.1.111"
 
   sensors do
-    sensor :wrench, {BB.Ufactory.Sensor.ForceTorque,
-      controller: :xarm,
-      poll_interval_ms: 20    # 50 Hz; default: 20 ms
-    }
+    sensor :wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm}
   end
 end
 ```
@@ -152,24 +132,14 @@ transparently by `BB.Ufactory.Protocol.cmd_linear_track_move/3`.
 
 ### Adding the Linear Track
 
+Enable it with the `:linear_track` option — it mounts a `:track` actuator on
+a fixed joint at the base link:
+
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller, host: "192.168.1.111", model: :xarm6}
-  end
-
-  topology do
-    link :base do
-      # ... joints j1–j6 ...
-
-      actuator :track, {BB.Ufactory.Actuator.LinearTrack,
-        controller: :xarm,
-        speed: 200          # mm/s; default: 200
-      }
-    end
-  end
+  use BB.Ufactory.Robots.XArm6,
+    host: "192.168.1.111",
+    linear_track: [speed: 200]   # mm/s; `linear_track: true` for defaults
 end
 ```
 
@@ -271,12 +241,12 @@ configuration is required for Cartesian motion and force/torque readings in
 tool coordinates.
 
 ```elixir
-controller :xarm, {BB.Ufactory.Controller,
+use BB.Ufactory.Robots.XArm6,
   host: "192.168.1.111",
-  model: :xarm6,
-  tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}
-  # {x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}
-}
+  controller: [
+    tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}
+    # {x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}
+  ]
 ```
 
 Omit `tcp_offset` (or pass `nil`) to leave the arm's current setting unchanged.
@@ -287,13 +257,13 @@ Accurate payload configuration improves the arm's motion planning, collision
 detection thresholds, and force/torque readings:
 
 ```elixir
-controller :xarm, {BB.Ufactory.Controller,
+use BB.Ufactory.Robots.XArm6,
   host: "192.168.1.111",
-  model: :xarm6,
-  tcp_load: {0.82, 0.0, 0.0, 48.0}
-  # {mass_kg, com_x_mm, com_y_mm, com_z_mm}
-  # com = center of mass relative to flange
-}
+  controller: [
+    tcp_load: {0.82, 0.0, 0.0, 48.0}
+    # {mass_kg, com_x_mm, com_y_mm, com_z_mm}
+    # com = center of mass relative to flange
+  ]
 ```
 
 ---
@@ -307,15 +277,15 @@ applications or when the arm operates near obstacles.
 ### Enabling Reduced Mode
 
 ```elixir
-controller :xarm, {BB.Ufactory.Controller,
+use BB.Ufactory.Robots.XArm6,
   host: "192.168.1.111",
-  model: :xarm6,
-  # Speed limits applied in reduced mode
-  reduced_tcp_speed: 250.0,      # max TCP linear speed in mm/s
-  reduced_joint_speed: 1.0,      # max joint speed in rad/s
-  # Enable reduced mode (applies the above limits)
-  reduced_mode: true
-}
+  controller: [
+    # Speed limits applied in reduced mode
+    reduced_tcp_speed: 250.0,      # max TCP linear speed in mm/s
+    reduced_joint_speed: 1.0,      # max joint speed in rad/s
+    # Enable reduced mode (applies the above limits)
+    reduced_mode: true
+  ]
 ```
 
 Limits are sent before reduced mode is enabled, ensuring the firmware applies
@@ -343,13 +313,13 @@ reduced_joint_ranges: [
 Reject any motion that would move the TCP outside a Cartesian box:
 
 ```elixir
-controller :xarm, {BB.Ufactory.Controller,
+use BB.Ufactory.Robots.XArm6,
   host: "192.168.1.111",
-  model: :xarm6,
-  tcp_boundary: {-400, 400, -400, 400, 0, 800},
-  # {x_min, x_max, y_min, y_max, z_min, z_max} in mm
-  fence_on: true
-}
+  controller: [
+    tcp_boundary: {-400, 400, -400, 400, 0, 800},
+    # {x_min, x_max, y_min, y_max, z_min, z_max} in mm
+    fence_on: true
+  ]
 ```
 
 The firmware rejects the motion before it executes, which triggers error code 35.
@@ -365,99 +335,25 @@ gripper, F/T sensor, and linear track:
 
 ```elixir
 defmodule BaristaBotRobot do
-  use BB
-  import BB.Unit
-
-  controller :xarm, {BB.Ufactory.Controller,
+  use BB.Ufactory.Robots.XArm6,
     host: "192.168.1.111",
-    model: :xarm6,
-    loop_hz: 100,
-    # Tool geometry — gripper G2 adds ~172mm to the flange along Z
-    tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0},
-    tcp_load: {0.82, 0.0, 0.0, 48.0},
-    # Workspace fence
-    tcp_boundary: {-600, 600, -600, 600, 0, 900},
-    fence_on: true,
-    # Reduced mode for safe co-existence with humans
-    reduced_tcp_speed: 250.0,
-    reduced_mode: true
-  }
-
-  topology do
-    link :base do
-      joint :j1 do
-        type :revolute
-        limit do
-          lower ~u(-360 degree); upper ~u(360 degree)
-          effort ~u(50 newton_meter); velocity ~u(180 degree_per_second)
-        end
-        actuator :j1_motor, {BB.Ufactory.Actuator.Joint, joint: 1, controller: :xarm}
-
-        link :link1 do
-          joint :j2 do
-            type :revolute
-            limit do
-              lower ~u(-118 degree); upper ~u(120 degree)
-              effort ~u(50 newton_meter); velocity ~u(180 degree_per_second)
-            end
-            actuator :j2_motor, {BB.Ufactory.Actuator.Joint, joint: 2, controller: :xarm}
-
-            link :link2 do
-              joint :j3 do
-                type :revolute
-                limit do
-                  lower ~u(-225 degree); upper ~u(11 degree)
-                  effort ~u(32 newton_meter); velocity ~u(180 degree_per_second)
-                end
-                actuator :j3_motor, {BB.Ufactory.Actuator.Joint, joint: 3, controller: :xarm}
-
-                link :link3 do
-                  joint :j4 do
-                    type :revolute
-                    limit do
-                      lower ~u(-360 degree); upper ~u(360 degree)
-                      effort ~u(32 newton_meter); velocity ~u(180 degree_per_second)
-                    end
-                    actuator :j4_motor, {BB.Ufactory.Actuator.Joint, joint: 4, controller: :xarm}
-
-                    link :link4 do
-                      joint :j5 do
-                        type :revolute
-                        limit do
-                          lower ~u(-97 degree); upper ~u(180 degree)
-                          effort ~u(32 newton_meter); velocity ~u(180 degree_per_second)
-                        end
-                        actuator :j5_motor, {BB.Ufactory.Actuator.Joint, joint: 5, controller: :xarm}
-
-                        link :link5 do
-                          joint :j6 do
-                            type :revolute
-                            limit do
-                              lower ~u(-360 degree); upper ~u(360 degree)
-                              effort ~u(20 newton_meter); velocity ~u(180 degree_per_second)
-                            end
-                            actuator :j6_motor, {BB.Ufactory.Actuator.Joint, joint: 6, controller: :xarm}
-                            link :link6 do
-                            end
-                          end
-                        end
-                      end
-                    end
-                  end
-                end
-              end
-            end
-          end
-        end
-      end
-
-      actuator :gripper, {BB.Ufactory.Actuator.Gripper, controller: :xarm, speed: 1500}
-      actuator :track,   {BB.Ufactory.Actuator.LinearTrack, controller: :xarm, speed: 200}
-    end
-  end
+    gripper: [speed: 1500],
+    linear_track: [speed: 200],
+    controller: [
+      # Tool geometry — gripper G2 adds ~172mm to the flange along Z
+      tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0},
+      tcp_load: {0.82, 0.0, 0.0, 48.0},
+      # Workspace fence
+      tcp_boundary: {-600, 600, -600, 600, 0, 900},
+      fence_on: true,
+      # Reduced mode for safe co-existence with humans
+      reduced_tcp_speed: 250.0,
+      reduced_mode: true
+    ]
 
   sensors do
-    sensor :wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm, poll_interval_ms: 20}
+    sensor :wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm}
+
     sensor :collision, {BB.Ufactory.Sensor.Collision,
       controller: :xarm,
       sensitivity: 3,

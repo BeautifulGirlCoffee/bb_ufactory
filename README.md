@@ -49,7 +49,7 @@ Add `bb_ufactory` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:bb_ufactory, "~> 0.1.0"}
+    {:bb_ufactory, "~> 0.2"}
   ]
 end
 ```
@@ -64,20 +64,14 @@ end
 ### Quick Start with the Pre-Built xArm6 Robot
 
 `BB.Ufactory.Robots.XArm6` provides a ready-made robot definition with correct joint
-limits, effort values, and actuator wiring. Use it as a base and override the controller
-host:
+limits, effort values, and actuator wiring. Use it as a base and pass your arm's
+address (and any accessories) as options:
 
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller,
-      host: "192.168.1.111",
-      model: :xarm6,
-      loop_hz: 100
-    }
-  end
+  use BB.Ufactory.Robots.XArm6,
+    host: "192.168.1.111",
+    gripper: true               # optional; also :linear_track
 end
 ```
 

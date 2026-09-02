@@ -151,7 +151,7 @@ defmodule BB.Ufactory.Sensor.Collision do
       |> Enum.filter(& &1)
 
     for frame <- frames do
-      case BB.Process.call(bb.robot, controller, {:send_command, frame}) do
+      case call_controller(bb.robot, controller, {:send_command, frame}) do
         :ok ->
           :ok
 
@@ -161,5 +161,14 @@ defmodule BB.Ufactory.Sensor.Collision do
           )
       end
     end
+  end
+
+  # A sensor must survive an unreachable controller at init: the controller
+  # may be mid-restart on hardware, or replaced by a no-op mock in simulation
+  # mode. An exit here would take down the whole robot supervision tree.
+  defp call_controller(robot, controller, msg) do
+    BB.Process.call(robot, controller, msg)
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 end

@@ -23,7 +23,7 @@ Add `bb_ufactory` to your `mix.exs` dependencies:
 def deps do
   [
     {:bb, "~> 0.31"},
-    {:bb_ufactory, "~> 0.1"}
+    {:bb_ufactory, "~> 0.2"}
   ]
 end
 ```
@@ -61,17 +61,13 @@ wired up. Supply the arm's IP address and you are done:
 
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller,
-      host: "192.168.1.111",
-      model: :xarm6,
-      loop_hz: 100
-    }
-  end
+  use BB.Ufactory.Robots.XArm6, host: "192.168.1.111"
 end
 ```
+
+Options: `:host`, `:loop_hz` (default 100), `:simulation` (default `:mock`),
+plus `:gripper` and `:linear_track` for accessories (see the
+[accessories tutorial](02-accessories.md)).
 
 ### From Scratch — `use BB`
 

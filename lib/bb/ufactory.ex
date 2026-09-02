@@ -39,16 +39,12 @@ defmodule BB.Ufactory do
   which provides the complete six-joint topology and only requires a host address:
 
       defmodule MyRobot do
-        use BB.Ufactory.Robots.XArm6
-
-        controllers do
-          controller :xarm, {BB.Ufactory.Controller,
-            host: "192.168.1.111",
-            model: :xarm6,
-            loop_hz: 100
-          }
-        end
+        use BB.Ufactory.Robots.XArm6, host: "192.168.1.111"
       end
+
+  Accessories and controller configuration are options of the same macro
+  (`gripper:`, `linear_track:`, `controller:`) — see
+  `BB.Ufactory.Robots.XArm6` for the full list.
 
   ## Full Robot Definition Example
 

@@ -69,7 +69,7 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
 
     enable_frame = Protocol.cmd_ft_sensor_enable(0, true)
 
-    case BB.Process.call(bb.robot, controller, {:send_command, enable_frame}) do
+    case call_controller(bb.robot, controller, {:send_command, enable_frame}) do
       :ok ->
         :ok
 
@@ -82,7 +82,7 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
     # disarm/1 disables the hardware sensor, so the enable frame must be
     # re-sent on every :armed transition — registered with the controller's
     # arm sequence so it happens after mode/state setup.
-    case BB.Process.call(
+    case call_controller(
            bb.robot,
            controller,
            {:register_arm_frames, :force_torque, [enable_frame]}
@@ -116,6 +116,15 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
     end
 
     :ok
+  end
+
+  # A sensor must survive an unreachable controller at init: the controller
+  # may be mid-restart on hardware, or replaced by a no-op mock in simulation
+  # mode. An exit here would take down the whole robot supervision tree.
+  defp call_controller(robot, controller, msg) do
+    BB.Process.call(robot, controller, msg)
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   # ── handle_info — forward Wrench from controller pubsub ─────────────────────

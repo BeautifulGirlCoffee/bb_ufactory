@@ -2,6 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# The documented quick-start snippet: compiling these modules IS the test —
+# they exercise `use BB.Ufactory.Robots.XArm6` exactly as README and the
+# tutorials show it.
+defmodule BB.Ufactory.Robots.XArm6Test.QuickStart do
+  use BB.Ufactory.Robots.XArm6, host: "10.0.0.42"
+end
+
+defmodule BB.Ufactory.Robots.XArm6Test.WithAccessories do
+  use BB.Ufactory.Robots.XArm6,
+    gripper: [speed: 1200],
+    linear_track: true,
+    controller: [tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}]
+
+  sensors do
+    sensor(:wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm})
+  end
+end
+
 defmodule BB.Ufactory.Robots.XArm6Test do
   # async: false because start_supervised starts a real process tree
   use ExUnit.Case, async: false
@@ -76,8 +94,64 @@ defmodule BB.Ufactory.Robots.XArm6Test do
     end
 
     test "kinematic chain links base to link6 via 6 joints", %{robot: robot} do
-      assert BB.Robot.get_joint(robot, :j1) != nil
-      assert BB.Robot.get_joint(robot, :j6) != nil
+      assert {:ok, %BB.Robot.Joint{}} = BB.Robot.get_joint(robot, :j1)
+      assert {:ok, %BB.Robot.Joint{}} = BB.Robot.get_joint(robot, :j6)
+    end
+  end
+
+  describe "use BB.Ufactory.Robots.XArm6" do
+    alias BB.Ufactory.Robots.XArm6Test.{QuickStart, WithAccessories}
+
+    test "quick-start module defines the full 6-joint robot" do
+      robot = QuickStart.robot()
+      joints = BB.Robot.joints_in_order(robot)
+
+      assert Enum.map(joints, & &1.name) == [:j1, :j2, :j3, :j4, :j5, :j6]
+      assert Map.has_key?(robot.actuators, :j1_motor)
+      refute Map.has_key?(robot.actuators, :gripper)
+    end
+
+    test "quick-start module matches the base definition's limits" do
+      base = Enum.map(BB.Robot.joints_in_order(XArm6.robot()), & &1.limits)
+      derived = Enum.map(BB.Robot.joints_in_order(QuickStart.robot()), & &1.limits)
+      assert base == derived
+    end
+
+    test "accessory options add gripper and track actuators on fixed mounts" do
+      robot = WithAccessories.robot()
+
+      assert %{joint: :gripper_mount} = robot.actuators[:gripper]
+      assert %{joint: :track_mount} = robot.actuators[:track]
+
+      assert {:ok, %BB.Robot.Joint{type: :fixed}} =
+               BB.Robot.get_joint(WithAccessories.robot(), :gripper_mount)
+    end
+
+    test "accessory robot supervisor starts in kinematic simulation" do
+      pid = start_supervised!({WithAccessories, simulation: :kinematic})
+      assert Process.alive?(pid)
+    end
+
+    test "controller option merges extra opts into the child spec" do
+      [controller] = Spark.Dsl.Extension.get_entities(WithAccessories, [:controllers])
+      {BB.Ufactory.Controller, opts} = controller.child_spec
+
+      assert opts[:host] == "192.168.1.111"
+      assert opts[:loop_hz] == 100
+      assert opts[:tcp_offset] == {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}
+    end
+
+    test "unknown options raise at compile time" do
+      assert_raise ArgumentError, ~r/unknown keys/, fn ->
+        defmodule BadOpts do
+          use BB.Ufactory.Robots.XArm6, hostname: "typo"
+        end
+      end
+    end
+
+    test "derived robot supervisor starts in kinematic simulation" do
+      pid = start_supervised!({QuickStart, simulation: :kinematic})
+      assert Process.alive?(pid)
     end
   end
 
