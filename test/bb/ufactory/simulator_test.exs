@@ -542,15 +542,23 @@ defmodule BB.Ufactory.SimulatorTest do
       # Stop latches the current reported position as the loop target.
       assert {:ok, _accepted} = BB.Actuator.stop_sync(Robot, :j1_motor)
 
-      # The joint must settle short of the original target...
-      halted = await_stable(1, 15_000)
-      assert is_number(halted), "J1 never settled after Stop"
-      assert abs(halted - target) > 0.3, "J1 reached its target despite Stop"
+      # Give the unbraked move more than enough time to have finished
+      # (1.0 rad at 0.25 rad/s ≈ 4 s), then sample ~1 s of the stream.
+      # A failed Stop parks J1 AT the target; a working brake leaves it far
+      # short. Exact stillness is deliberately not asserted: the loop keeps
+      # streaming the latched target and the firmware dithers around it, so
+      # distance-from-target over time is the discriminating property.
+      Process.sleep(6_000)
+      early = average_position(1, 1_000)
+      assert is_number(early), "no JointState frames after Stop"
+      assert abs(early - target) > 0.3, "J1 reached its target despite Stop"
 
-      # ...and STAY there (the latched brake target keeps it in place).
-      Process.sleep(1_500)
-      later = drain_latest_position(1) || halted
-      assert_in_delta later, halted, 0.1
+      # And it must STAY braked — the cleared move must not resume.
+      Process.sleep(2_000)
+      late = average_position(1, 1_000)
+      assert is_number(late), "JointState stream died after Stop"
+      assert abs(late - target) > 0.3, "J1 resumed motion toward its target after Stop"
+      assert_in_delta late, early, 0.15
 
       assert :ok = BB.Safety.disarm(Robot)
     end
@@ -580,23 +588,31 @@ defmodule BB.Ufactory.SimulatorTest do
       end
     end
 
-    # Position once two samples ~500 ms apart agree within 0.02 rad — the
-    # suite's convergence tolerance. Tighter thresholds fail here: unlike a
-    # raw cmd_stop, the brake latch keeps the loop STREAMING the latched
-    # target, and the firmware micro-dithers under continuous re-planning
-    # (an in-flight move at 0.25 rad/s changes ~0.125 rad per sample, so
-    # the separation from real motion stays an order of magnitude wide).
-    defp await_stable(_index, deadline_ms) when deadline_ms <= 0, do: nil
+    # Mean J1 position over roughly `window_ms` of FRESH JointState frames
+    # (the queued backlog is flushed first, so sleeps between calls don't
+    # bleed stale samples into the window).
+    defp average_position(index, window_ms) do
+      drain_latest_position(index)
+      deadline = System.monotonic_time(:millisecond) + window_ms
 
-    defp await_stable(index, deadline_ms) do
-      a = drain_latest_position(index)
-      Process.sleep(500)
-      b = drain_latest_position(index)
+      case collect_positions(index, deadline, []) do
+        [] -> nil
+        samples -> Enum.sum(samples) / length(samples)
+      end
+    end
 
-      if is_number(a) and is_number(b) and abs(a - b) < 0.02 do
-        b
+    defp collect_positions(index, deadline, acc) do
+      remaining = deadline - System.monotonic_time(:millisecond)
+
+      if remaining <= 0 do
+        acc
       else
-        await_stable(index, deadline_ms - 500)
+        receive do
+          {:bb, _, %BB.Message{payload: %BB.Message.Sensor.JointState{positions: positions}}} ->
+            collect_positions(index, deadline, [Enum.at(positions, index - 1) | acc])
+        after
+          remaining -> acc
+        end
       end
     end
 
