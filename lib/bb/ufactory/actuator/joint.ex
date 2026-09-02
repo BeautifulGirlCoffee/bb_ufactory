@@ -192,18 +192,22 @@ defmodule BB.Ufactory.Actuator.Joint do
       )
     end
 
-    cur_pos = write_set_position(state.ets, state.joint, clamped)
+    # The velocity hint travels with the target; cmd_move_joints takes one
+    # speed for the whole batch, so the loop uses the slowest pending hint.
+    cur_pos = write_set_position(state.ets, state.joint, clamped, cmd.velocity)
     publish_begin_motion(cmd, clamped, cur_pos, state)
     state
   end
 
   # Latches the joint's current reported position as its target, so the 100 Hz
-  # loop brakes the joint there. Returns :no_feedback when no report frame has
-  # populated current_position yet.
+  # loop brakes the joint there. The velocity hint is cleared — braking should
+  # happen at the model's full speed, not at a leisurely pace a previous move
+  # requested. Returns :no_feedback when no report frame has populated
+  # current_position yet.
   defp brake_at_current(state) do
     case :ets.lookup(state.ets, state.joint) do
-      [{_joint, cur_pos, _cur_torq, _sp}] when is_number(cur_pos) ->
-        write_set_position(state.ets, state.joint, cur_pos)
+      [{_joint, cur_pos, _cur_torq, _sp, _sv}] when is_number(cur_pos) ->
+        write_set_position(state.ets, state.joint, cur_pos, nil)
         :ok
 
       _ ->
@@ -213,27 +217,28 @@ defmodule BB.Ufactory.Actuator.Joint do
 
   # The controller's report handler writes the current_position and
   # current_torque columns of the same rows at ~100 Hz from its own process.
-  # Writes here must therefore touch ONLY the set_position column — a
-  # read-whole-row-then-insert could interleave with a report update and
-  # clobber a fresh angle (or let the controller resurrect a stale target).
-  # :ets.update_element/3 is atomic per row.
+  # Writes here must therefore touch ONLY the set_position/set_velocity
+  # columns — a read-whole-row-then-insert could interleave with a report
+  # update and clobber a fresh angle (or let the controller resurrect a stale
+  # target). :ets.update_element/3 is atomic per row.
   defp clear_set_position(ets, joint) do
-    :ets.update_element(ets, joint, {4, nil})
+    :ets.update_element(ets, joint, [{4, nil}, {5, nil}])
     :ok
   end
 
-  # Writes only the set_position column. Returns current_position (may be
-  # nil); the read is advisory (BeginMotion's initial-position estimate), so
-  # a report frame landing between the lookup and the update is harmless.
-  defp write_set_position(ets, joint, set_pos) do
+  # Writes only the set_position/set_velocity columns. Returns
+  # current_position (may be nil); the read is advisory (BeginMotion's
+  # initial-position estimate), so a report frame landing between the lookup
+  # and the update is harmless.
+  defp write_set_position(ets, joint, set_pos, set_vel) do
     cur_pos =
       case :ets.lookup(ets, joint) do
-        [{^joint, cp, _ct, _sp}] -> cp
+        [{^joint, cp, _ct, _sp, _sv}] -> cp
         [] -> nil
       end
 
-    :ets.update_element(ets, joint, {4, set_pos}) ||
-      :ets.insert(ets, {joint, nil, nil, set_pos})
+    :ets.update_element(ets, joint, [{4, set_pos}, {5, set_vel}]) ||
+      :ets.insert(ets, {joint, nil, nil, set_pos, set_vel})
 
     cur_pos
   end

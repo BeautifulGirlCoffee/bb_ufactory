@@ -20,7 +20,7 @@ defmodule BB.Ufactory.Controller do
   actuators. Per-joint rows are keyed by joint index (1-based integer):
 
       {joint_index, current_position :: float | nil, current_torque :: float | nil,
-       set_position :: float | nil}
+       set_position :: float | nil, set_velocity :: float | nil}
 
   The arm-level row is keyed by `:arm`:
 
@@ -765,7 +765,7 @@ defmodule BB.Ufactory.Controller do
 
     # Pre-populate per-joint rows
     for i <- 1..joint_count do
-      :ets.insert(ets, {i, nil, nil, nil})
+      :ets.insert(ets, {i, nil, nil, nil, nil})
     end
 
     # Arm-level row
@@ -779,7 +779,8 @@ defmodule BB.Ufactory.Controller do
     rows = for i <- 1..joint_count, do: :ets.lookup(state.ets, i)
     rows = List.flatten(rows)
 
-    pending? = Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos} -> set_pos != nil end)
+    pending? =
+      Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos != nil end)
 
     cond do
       not (pending? and BB.Safety.armed?(state.bb.robot)) ->
@@ -796,7 +797,7 @@ defmodule BB.Ufactory.Controller do
 
   defp dispatch_joint_move(rows, state) do
     positions =
-      Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} -> set_pos || cur_pos end)
+      Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos || cur_pos end)
 
     # Never substitute a default for an unknown joint position: commanding
     # 0.0 for joints whose current angle has not yet been reported would
@@ -805,13 +806,26 @@ defmodule BB.Ufactory.Controller do
     if Enum.any?(positions, &is_nil/1) do
       {:ok, log_move_skip_once(state)}
     else
-      max_speed = state.model_config.max_speed_rads
-      # Use a conservative default for acceleration (rad/s²); the arm's own
+      speed = batch_speed(rows, state.model_config.max_speed_rads)
+      # Acceleration scales with the commanded speed (rad/s²); the arm's own
       # motion planner will further clamp this per its firmware configuration.
-      max_accel = max_speed * 10.0
+      accel = speed * 10.0
 
-      frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
+      frame = Protocol.cmd_move_joints(state.txn_id, positions, speed, accel)
       send_command(frame, %{state | move_skip_logged: false})
+    end
+  end
+
+  # cmd_move_joints takes a single speed for the whole batch, so honor the
+  # SLOWEST pending velocity hint (a faster joint can only be as slow as
+  # asked, never faster than allowed). Hints are clamped into (0, max_speed].
+  defp batch_speed(rows, max_speed) do
+    rows
+    |> Enum.map(fn {_i, _cur_pos, _cur_torq, _set_pos, set_vel} -> set_vel end)
+    |> Enum.filter(&is_number/1)
+    |> case do
+      [] -> max_speed
+      hints -> hints |> Enum.min() |> max(0.01) |> min(max_speed)
     end
   end
 
@@ -932,7 +946,7 @@ defmodule BB.Ufactory.Controller do
     |> Enum.with_index(1)
     |> Enum.each(fn {{angle, torque}, idx} ->
       :ets.update_element(state.ets, idx, [{2, angle}, {3, torque}]) ||
-        :ets.insert(state.ets, {idx, angle, torque, nil})
+        :ets.insert(state.ets, {idx, angle, torque, nil, nil})
     end)
 
     # Update arm-level row

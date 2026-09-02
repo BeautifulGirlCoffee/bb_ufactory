@@ -105,7 +105,7 @@ defmodule BB.Ufactory.ControllerTest do
   defp make_state(cmd_socket, extra \\ %{}) do
     ets = :ets.new(:test_controller_ets, [:public, :set])
     # Pre-populate 6-joint rows (xarm6)
-    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil})
+    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
 
     base = %{
@@ -360,7 +360,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       # xArm6 has 6 joints
       for i <- 1..6 do
-        assert [{^i, nil, nil, nil}] = :ets.lookup(state.ets, i)
+        assert [{^i, nil, nil, nil, nil}] = :ets.lookup(state.ets, i)
       end
 
       assert [{:arm, 0, 0, nil}] = :ets.lookup(state.ets, :arm)
@@ -477,7 +477,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert new_state.buffer == <<>>
 
       for {angle, i} <- Enum.with_index(Enum.take(angles, 6), 1) do
-        [{^i, read_pos, _torq, _set}] = :ets.lookup(new_state.ets, i)
+        [{^i, read_pos, _torq, _set, _vel}] = :ets.lookup(new_state.ets, i)
         assert_in_delta read_pos, angle, 1.0e-5
       end
     end
@@ -489,7 +489,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
 
       for {torque, i} <- Enum.with_index(Enum.take(torques, 6), 1) do
-        [{^i, _pos, read_torq, _set}] = :ets.lookup(new_state.ets, i)
+        [{^i, _pos, read_torq, _set, _vel}] = :ets.lookup(new_state.ets, i)
         assert_in_delta read_torq, torque, 1.0e-5
       end
     end
@@ -518,13 +518,13 @@ defmodule BB.Ufactory.ControllerTest do
     end
 
     test "preserves set_position in ETS when report arrives", %{state: state} do
-      :ets.insert(state.ets, {1, nil, nil, 1.57})
+      :ets.insert(state.ets, {1, nil, nil, 1.57, nil})
 
       frame = build_87_byte_frame(angles: [0.1 | List.duplicate(0.0, 6)])
 
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
 
-      [{1, _cur, _torq, set_pos}] = :ets.lookup(new_state.ets, 1)
+      [{1, _cur, _torq, set_pos, _set_vel}] = :ets.lookup(new_state.ets, 1)
       assert set_pos == 1.57
     end
 
@@ -566,7 +566,7 @@ defmodule BB.Ufactory.ControllerTest do
         msg = Message.new!(BB.Message.Actuator.Command.Position, :motor, position: target)
 
         assert {:noreply, _} = BB.Ufactory.Actuator.Joint.handle_command(msg, joint_state)
-        assert [{1, _cur, _torq, ^target}] = :ets.lookup(state.ets, 1)
+        assert [{1, _cur, _torq, ^target, _vel}] = :ets.lookup(state.ets, 1)
       end
 
       Task.await(reporter, 30_000)
@@ -783,7 +783,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, valid_frame}, state)
       assert new_state.buffer == <<>>
 
-      [{1, pos, _torq, _set}] = :ets.lookup(new_state.ets, 1)
+      [{1, pos, _torq, _set, _vel}] = :ets.lookup(new_state.ets, 1)
       assert_in_delta pos, 0.1, 1.0e-5
     end
   end
@@ -1144,6 +1144,7 @@ defmodule BB.Ufactory.ControllerTest do
       # be the 0x7C frame, not the move-ack.
       rs485_frame = Protocol.build_frame(0, 0x7C, <<0x0B, 0x01, 0x03>>)
       move_ack = Protocol.build_frame(0, 0x1D, <<0x00>>)
+
       rs485_response =
         Protocol.build_frame(0, 0x7C, <<0x00, 0x0B, 0x01, 0x03, 0x04, 0, 0, 0x0F, 0x42>>)
 
@@ -1153,7 +1154,8 @@ defmodule BB.Ufactory.ControllerTest do
           :gen_tcp.send(cmd_server, move_ack <> rs485_response)
         end)
 
-      assert {:reply, {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, _::binary>>}, <<>>}, _new_state} =
+      assert {:reply, {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, _::binary>>}, <<>>},
+              _new_state} =
                Controller.handle_call({:send_and_recv, rs485_frame}, {self(), make_ref()}, state)
 
       Task.await(task, 2_000)
@@ -1226,7 +1228,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
       state = %{state | report_socket: nil}
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
@@ -1239,7 +1241,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
       state = %{state | last_report_at: System.monotonic_time(:millisecond) - 1_000}
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
@@ -1255,7 +1257,7 @@ defmodule BB.Ufactory.ControllerTest do
         :ok
       end)
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
 
       state = %{
         state
@@ -1271,7 +1273,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
 
       stale = %{state | report_socket: nil}
       assert {:noreply, stale_state} = Controller.handle_info(:tick, stale)
@@ -1292,7 +1294,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "sends cmd_move_joints when set_positions are pending and robot is armed",
          %{state: state, cmd_server: cmd_server} do
       # Write set_position for all 6 joints
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
 
@@ -1305,6 +1307,37 @@ defmodule BB.Ufactory.ControllerTest do
 
       # txn_id should have incremented
       assert new_state.txn_id == 1
+    end
+
+    test "honors the slowest pending velocity hint for the batch", %{
+      state: state,
+      cmd_server: cmd_server
+    } do
+      # Two hints (0.9 and 0.3 rad/s): the batch moves at the SLOWEST one —
+      # a joint can be as slow as asked, never faster than allowed.
+      :ets.insert(state.ets, {1, 0.0, 0.0, 0.5, 0.9})
+      :ets.insert(state.ets, {2, 0.0, 0.0, 0.5, 0.3})
+      for i <- 3..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
+
+      assert {:ok, data} = recv_all(cmd_server, 200)
+      positions = List.duplicate(0.5, 6)
+      assert data == Protocol.cmd_move_joints(0, positions, 0.3, 3.0)
+    end
+
+    test "velocity hints are clamped to the model's maximum speed", %{
+      state: state,
+      cmd_server: cmd_server
+    } do
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, 100.0})
+
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
+
+      assert {:ok, data} = recv_all(cmd_server, 200)
+      max_speed = state.model_config.max_speed_rads
+      positions = List.duplicate(0.5, 6)
+      assert data == Protocol.cmd_move_joints(0, positions, max_speed, max_speed * 10.0)
     end
 
     test "does not send when no set_positions are pending", %{
@@ -1321,7 +1354,7 @@ defmodule BB.Ufactory.ControllerTest do
       BB.Safety
       |> expect(:armed?, fn TestRobot -> false end)
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1331,9 +1364,9 @@ defmodule BB.Ufactory.ControllerTest do
     test "uses current_position for joints where set_position is nil",
          %{state: state, cmd_server: cmd_server} do
       # Only joint 1 has a pending set_position; others have current from report
-      :ets.insert(state.ets, {1, 0.1, 0.0, 0.5})
+      :ets.insert(state.ets, {1, 0.1, 0.0, 0.5, nil})
 
-      for i <- 2..6, do: :ets.insert(state.ets, {i, 0.2, 0.0, nil})
+      for i <- 2..6, do: :ets.insert(state.ets, {i, 0.2, 0.0, nil, nil})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1355,7 +1388,7 @@ defmodule BB.Ufactory.ControllerTest do
       # position nor a set_position (fresh ETS after a controller restart).
       # Sending would command those joints to a substituted default — an
       # uncommanded sweep on real hardware — so the tick must be skipped.
-      :ets.insert(state.ets, {1, nil, nil, 0.5})
+      :ets.insert(state.ets, {1, nil, nil, 0.5, nil})
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
       assert new_state.move_skip_logged
@@ -1462,7 +1495,7 @@ defmodule BB.Ufactory.ControllerTest do
           last_report_at: System.monotonic_time(:millisecond)
       }
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil})
 
       assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
                Controller.handle_info(:tick, state)

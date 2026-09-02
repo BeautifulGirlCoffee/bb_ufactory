@@ -36,7 +36,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
 
   defp make_ets do
     ets = :ets.new(:joint_test_ets, [:public, :set])
-    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil})
+    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
     ets
   end
@@ -55,6 +55,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
   defp position_msg(position, opts \\ []) do
     Message.new!(Command.Position, :motor,
       position: position * 1.0,
+      velocity: opts[:velocity],
       command_id: opts[:command_id]
     )
   end
@@ -149,7 +150,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
   describe "handle_command(%Command.Position{}, state)" do
     test "writes set_position to ETS for an in-range position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.5, 0.1, nil})
+      :ets.insert(ets, {2, 0.5, 0.1, nil, nil})
       state = make_state(ets)
 
       BB
@@ -158,12 +159,12 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(1.0)
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, 0.5, 0.1, 1.0}] = :ets.lookup(ets, 2)
+      assert [{2, 0.5, 0.1, 1.0, nil}] = :ets.lookup(ets, 2)
     end
 
     test "preserves current_position and current_torque when writing set_position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.3, 0.05, nil})
+      :ets.insert(ets, {2, 0.3, 0.05, nil, nil})
       state = make_state(ets)
 
       BB
@@ -172,7 +173,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(1.5)
       Joint.handle_command(msg, state)
 
-      [{2, cur_pos, cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, cur_pos, cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert cur_pos == 0.3
       assert cur_torq == 0.05
       assert set_pos == 1.5
@@ -188,7 +189,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(@j2_upper + 1.0)
       Joint.handle_command(msg, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_upper, 0.0001
     end
 
@@ -202,13 +203,13 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(@j2_lower - 1.0)
       Joint.handle_command(msg, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_lower, 0.0001
     end
 
     test "publishes BeginMotion with correct initial_position, target_position, expected_arrival" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, nil})
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
       state = make_state(ets)
 
       test_pid = self()
@@ -276,33 +277,76 @@ defmodule BB.Ufactory.Actuator.JointTest do
     end
   end
 
+  describe "velocity hints" do
+    setup do
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      :ok
+    end
+
+    test "stores the velocity hint alongside the target" do
+      ets = make_ets()
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
+      state = make_state(ets)
+
+      msg = position_msg(1.0, velocity: 0.25)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, 0.0, 0.0, 1.0, 0.25}] = :ets.lookup(ets, 2)
+    end
+
+    test "a hint-less command clears a previous velocity hint" do
+      ets = make_ets()
+      :ets.insert(ets, {2, 0.0, 0.0, 0.5, 0.25})
+      state = make_state(ets)
+
+      assert {:noreply, ^state} = Joint.handle_command(position_msg(1.0), state)
+
+      assert [{2, 0.0, 0.0, 1.0, nil}] = :ets.lookup(ets, 2)
+    end
+
+    test "Stop's brake latch clears the velocity hint" do
+      ets = make_ets()
+      # Slow move in progress: braking must happen at full model speed, not
+      # at the leisurely pace the interrupted move requested.
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, 0.1})
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Stop, :motor, mode: :immediate)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+    end
+  end
+
   # ── handle_command: Command.Stop ─────────────────────────────────────────────
 
   describe "handle_command(%Command.Stop{}, state)" do
     test "latches the current reported position as the target" do
       ets = make_ets()
       # Joint travelling: current 0.7, commanded target 1.5
-      :ets.insert(ets, {2, 0.7, 0.1, 1.5})
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, nil})
       state = make_state(ets)
 
       msg = Message.new!(Command.Stop, :motor, mode: :immediate)
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
       # Target becomes the current position, so the 100 Hz loop brakes there.
-      assert [{2, 0.7, 0.1, 0.7}] = :ets.lookup(ets, 2)
+      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
     end
 
     test "clears the pending target when no report frame has arrived yet" do
       ets = make_ets()
       # set_position written, but current_position never reported: the loop
       # has been skipping ticks, so nothing was dispatched.
-      :ets.insert(ets, {2, nil, nil, 1.5})
+      :ets.insert(ets, {2, nil, nil, 1.5, nil})
       state = make_state(ets)
 
       msg = Message.new!(Command.Stop, :motor, mode: :immediate)
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, nil, nil, nil}] = :ets.lookup(ets, 2)
+      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
     end
   end
 
@@ -311,13 +355,13 @@ defmodule BB.Ufactory.Actuator.JointTest do
   describe "handle_command(%Command.Hold{}, state)" do
     test "latches the current reported position as the target" do
       ets = make_ets()
-      :ets.insert(ets, {2, -0.4, 0.0, 1.0})
+      :ets.insert(ets, {2, -0.4, 0.0, 1.0, nil})
       state = make_state(ets)
 
       msg = Message.new!(Command.Hold, :motor, [])
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, -0.4, 0.0, -0.4}] = :ets.lookup(ets, 2)
+      assert [{2, -0.4, 0.0, -0.4, nil}] = :ets.lookup(ets, 2)
     end
 
     test "refuses when the current position is unknown" do
@@ -328,7 +372,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       assert {:reply, {:error, :position_unknown}, ^state} = Joint.handle_command(msg, state)
 
       # Nothing written
-      assert [{2, nil, nil, nil}] = :ets.lookup(ets, 2)
+      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
     end
   end
 
