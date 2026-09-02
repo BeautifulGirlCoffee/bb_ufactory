@@ -246,8 +246,15 @@ defmodule BB.Ufactory.ProtocolTest do
   end
 
   describe "cmd_stop/1" do
-    test "is equivalent to cmd_set_state with value 0" do
-      assert Protocol.cmd_stop(1) == Protocol.cmd_set_state(1, 0)
+    # State 4 is the firmware's stop state (terminate motion, clear queued
+    # commands). State 0 is the motion ("sport") state — sending it would put
+    # the arm INTO motion-ready state rather than stopping it.
+    test "is equivalent to cmd_set_state with value 4" do
+      assert Protocol.cmd_stop(1) == Protocol.cmd_set_state(1, 4)
+    end
+
+    test "encodes the stop state value 4 at byte 7" do
+      assert binary_part(Protocol.cmd_stop(0), 7, 1) == <<0x04>>
     end
   end
 

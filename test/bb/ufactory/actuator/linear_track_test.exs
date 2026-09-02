@@ -27,6 +27,12 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     Message.new!(Command.Position, :linear_track, position: pos_mm * 1.0)
   end
 
+  # Response params for a successful RS485 position read of `pos_mm`.
+  defp track_read_response(pos_mm) do
+    raw = round(pos_mm * 2000)
+    {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, raw::signed-32>>}, <<>>}
+  end
+
   # ── Protocol encoding ────────────────────────────────────────────────────────
 
   describe "Protocol.cmd_linear_track_move/3 encoding" do
@@ -73,9 +79,6 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
 
   describe "init/1" do
     test "stores bb, controller, speed, and stroke in state" do
-      BB
-      |> stub(:subscribe, fn TestRobot, [:actuator, :linear_track] -> :ok end)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :linear_track, _frames} ->
         :ok
@@ -96,9 +99,6 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     end
 
     test "defaults speed to 200 mm/s and stroke to 700 mm" do
-      BB
-      |> stub(:subscribe, fn TestRobot, [:actuator, :linear_track] -> :ok end)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :linear_track, _frames} ->
         :ok
@@ -110,14 +110,15 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       assert state.stroke_mm == 700
     end
 
-    test "subscribes to its own command topic for pubsub delivery" do
-      BB
-      |> expect(:subscribe, fn TestRobot, [:actuator, :linear_track] -> :ok end)
-
+    test "does not subscribe to its own command topic (BB.Actuator.Server owns it)" do
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :linear_track, _frames} ->
         :ok
       end)
+
+      BB
+      |> reject(:subscribe, 2)
+      |> reject(:subscribe, 3)
 
       opts = [bb: %{robot: TestRobot, path: [:linear_track]}, controller: :xarm]
       assert {:ok, _state} = LinearTrack.init(opts)
@@ -126,9 +127,6 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     test "registers the enable frame with the controller instead of eagerly enabling" do
       expected_frame = Protocol.cmd_linear_track_enable(0, true)
       test_pid = self()
-
-      BB
-      |> stub(:subscribe, fn TestRobot, _path -> :ok end)
 
       BB.Process
       |> expect(:call, fn TestRobot, :xarm, {:register_arm_frames, :linear_track, frames} ->
@@ -142,9 +140,17 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     end
   end
 
-  # ── handle_cast position commands ────────────────────────────────────────────
+  # ── command_payloads/1 ───────────────────────────────────────────────────────
 
-  describe "handle_cast({:command, %Command.Position{}}, state)" do
+  describe "command_payloads/1" do
+    test "declares Position and Stop" do
+      assert LinearTrack.command_payloads([]) == [Command.Position, Command.Stop]
+    end
+  end
+
+  # ── handle_command: Command.Position ─────────────────────────────────────────
+
+  describe "handle_command(%Command.Position{}, state)" do
     test "sends speed frame then position frame via sequential controller calls" do
       state = make_state()
       pos_mm = 500.0
@@ -157,7 +163,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+            track_read_response(0.0)
 
           {:send_command, frame} ->
             idx = :counters.get(send_calls, 1)
@@ -176,7 +182,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(pos_mm)
-      assert {:noreply, ^state} = LinearTrack.handle_cast({:command, msg}, state)
+      assert {:noreply, ^state} = LinearTrack.handle_command(msg, state)
 
       assert_receive {:frame_sent, :first, first_frame}, 500
       assert_receive {:frame_sent, :second, second_frame}, 500
@@ -188,16 +194,11 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       state = make_state()
       test_pid = self()
 
-      initial_pos_raw = round(100.0 * 2000)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
-          {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, initial_pos_raw::signed-32>>}, <<>>}
-
-          {:send_command, _frame} ->
-            :ok
+          {:send_and_recv, _frame} -> track_read_response(100.0)
+          {:send_command, _frame} -> :ok
         end
       end)
 
@@ -212,24 +213,21 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       end)
 
       msg = position_msg(500.0)
-      LinearTrack.handle_cast({:command, msg}, state)
+      LinearTrack.handle_command(msg, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.target_position, 500.0, 0.001
       assert_in_delta bm.initial_position, 100.0, 0.001
     end
 
-    test "does not publish BeginMotion when speed frame send fails" do
+    test "replies with the error and skips BeginMotion when the speed frame send fails" do
       state = make_state()
 
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
-          {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
-
-          {:send_command, _frame} ->
-            {:error, :closed}
+          {:send_and_recv, _frame} -> track_read_response(0.0)
+          {:send_command, _frame} -> {:error, :closed}
         end
       end)
 
@@ -239,12 +237,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       end)
 
       msg = position_msg(500.0)
-      assert {:noreply, ^state} = LinearTrack.handle_cast({:command, msg}, state)
-    end
-
-    test "ignores unknown casts" do
-      state = make_state()
-      assert {:noreply, ^state} = LinearTrack.handle_cast(:unexpected, state)
+      assert {:reply, {:error, :closed}, ^state} = LinearTrack.handle_command(msg, state)
     end
 
     test "clamps commands beyond the stroke to the stroke limit" do
@@ -256,7 +249,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+            track_read_response(0.0)
 
           {:send_command, frame} ->
             send(test_pid, {:frame_sent, frame})
@@ -268,7 +261,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(5_000.0)
-      assert {:noreply, ^state} = LinearTrack.handle_cast({:command, msg}, state)
+      assert {:noreply, ^state} = LinearTrack.handle_command(msg, state)
 
       # Speed frame first, then the position frame clamped to 700 mm.
       assert_receive {:frame_sent, _spd_frame}, 500
@@ -284,7 +277,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+            track_read_response(0.0)
 
           {:send_command, frame} ->
             send(test_pid, {:frame_sent, frame})
@@ -296,26 +289,30 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(-50.0)
-      assert {:noreply, ^state} = LinearTrack.handle_cast({:command, msg}, state)
+      assert {:noreply, ^state} = LinearTrack.handle_command(msg, state)
 
       assert_receive {:frame_sent, _spd_frame}, 500
       assert_receive {:frame_sent, ^expected_pos_frame}, 500
     end
   end
 
-  # ── handle_info pubsub delivery ──────────────────────────────────────────────
+  # ── handle_command: Command.Stop ─────────────────────────────────────────────
 
-  describe "handle_info({:bb, [:actuator | path], %Command.Position{}}, state)" do
-    test "applies the same track move logic as handle_cast" do
+  describe "handle_command(%Command.Stop{}, state)" do
+    test "re-targets the current position to brake the carriage" do
       state = make_state()
+      # Track is at 320 mm; stopping must command 320 mm, not the old target.
+      {expected_pos_frame, _} = Protocol.cmd_linear_track_move(0, 320.0, 200)
+      test_pid = self()
 
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} ->
-            {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00>>}, <<>>}
+            track_read_response(320.0)
 
-          {:send_command, _frame} ->
+          {:send_command, frame} ->
+            send(test_pid, {:frame_sent, frame})
             :ok
         end
       end)
@@ -323,15 +320,28 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
-      msg = position_msg(200.0)
+      msg = Message.new!(Command.Stop, :linear_track, mode: :immediate)
+      assert {:noreply, ^state} = LinearTrack.handle_command(msg, state)
 
-      assert {:noreply, ^state} =
-               LinearTrack.handle_info({:bb, [:actuator, :linear_track], msg}, state)
+      assert_receive {:frame_sent, _spd_frame}, 500
+      assert_receive {:frame_sent, ^expected_pos_frame}, 500
     end
 
-    test "ignores unrecognised messages" do
+    test "refuses when the position read fails (never assumes a position)" do
       state = make_state()
-      assert {:noreply, ^state} = LinearTrack.handle_info(:unexpected, state)
+
+      BB.Process
+      |> stub(:call, fn TestRobot, :xarm, msg ->
+        case msg do
+          {:send_and_recv, _frame} -> {:error, :timeout}
+          {:send_command, _frame} -> flunk("must not command a move when position is unknown")
+        end
+      end)
+
+      msg = Message.new!(Command.Stop, :linear_track, mode: :immediate)
+
+      assert {:reply, {:error, :position_unknown}, ^state} =
+               LinearTrack.handle_command(msg, state)
     end
   end
 

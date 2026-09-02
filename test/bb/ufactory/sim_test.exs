@@ -48,9 +48,11 @@ defmodule BB.Ufactory.SimTest do
   @robot BB.Ufactory.Robots.XArm6
   @pi :math.pi()
 
-  # Actuator atom names (used with set_position!/3 for direct GenServer.cast).
-  # set_position!/3 avoids publishing a Command.Position via pubsub, which would
-  # crash OpenLoopPositionEstimator (it only handles BeginMotion, not commands).
+  # Position commands use `delivery: :direct` (bb >= 0.30 replaced
+  # set_position!/3 with this option): the command is cast straight to the
+  # actuator without a pubsub publication, so the broad [:actuator]
+  # subscriptions below observe only the BeginMotion the Sim.Actuator
+  # publishes after accepting the command.
 
   # ── Setup / teardown ──────────────────────────────────────────────────────────
 
@@ -102,10 +104,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J1 position command publishes BeginMotion with correct target" do
-      # set_position! sends directly to the actuator via GenServer.cast (no pubsub
-      # Command.Position message), so the OpenLoopPositionEstimator only sees the
-      # BeginMotion that the Sim.Actuator publishes after accepting the command.
-      BB.Actuator.set_position!(@robot, :j1_motor, 0.5)
+      BB.Actuator.set_position(@robot, :j1_motor, 0.5, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j1_motor in path
@@ -116,7 +115,7 @@ defmodule BB.Ufactory.SimTest do
     test "BeginMotion reports initial position at limits midpoint (0.0 for symmetric J1)" do
       # BB.Sim.Actuator initialises at the limits midpoint.
       # J1: {-2π, +2π} → midpoint = 0.0
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.0, delivery: :direct)
 
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert_in_delta bm.initial_position, 0.0, 1.0e-4
@@ -124,7 +123,7 @@ defmodule BB.Ufactory.SimTest do
 
     test "BeginMotion expected_arrival is in the future for non-trivial travel distance" do
       # 1.0 rad at π rad/s (J1 velocity limit) ≈ 318 ms
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.0, delivery: :direct)
 
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert bm.expected_arrival > System.monotonic_time(:millisecond)
@@ -143,7 +142,7 @@ defmodule BB.Ufactory.SimTest do
 
     test "J2 upper limit (~2.094 rad / 120°) clamps an out-of-range position" do
       # J2 upper ≈ 2.094 rad. Request π (~3.14 rad) — must clamp.
-      BB.Actuator.set_position!(@robot, :j2_motor, @pi)
+      BB.Actuator.set_position(@robot, :j2_motor, @pi, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j2_motor in path
@@ -152,7 +151,7 @@ defmodule BB.Ufactory.SimTest do
 
     test "J2 lower limit (~-2.059 rad / -118°) clamps an out-of-range negative position" do
       # J2 lower ≈ -2.059 rad. Request -π (~-3.14 rad) — must clamp.
-      BB.Actuator.set_position!(@robot, :j2_motor, -@pi)
+      BB.Actuator.set_position(@robot, :j2_motor, -@pi, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j2_motor in path
@@ -161,14 +160,14 @@ defmodule BB.Ufactory.SimTest do
 
     test "J1 position within limits is not clamped" do
       # J1: {-2π, +2π}. 1.0 rad is well within range.
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.0, delivery: :direct)
 
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert_in_delta bm.target_position, 1.0, 1.0e-4
     end
 
     test "J3 upper limit (~0.192 rad / 11°) clamps an out-of-range position" do
-      BB.Actuator.set_position!(@robot, :j3_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j3_motor, 1.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j3_motor in path
@@ -176,7 +175,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J3 lower limit (~-3.927 rad / -225°) clamps an out-of-range position" do
-      BB.Actuator.set_position!(@robot, :j3_motor, -4.0)
+      BB.Actuator.set_position(@robot, :j3_motor, -4.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j3_motor in path
@@ -184,7 +183,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J4 symmetric ±2π limits do not clamp 5.0 rad" do
-      BB.Actuator.set_position!(@robot, :j4_motor, 5.0)
+      BB.Actuator.set_position(@robot, :j4_motor, 5.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j4_motor in path
@@ -192,7 +191,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J5 upper limit (π rad / 180°) clamps 4.0 rad" do
-      BB.Actuator.set_position!(@robot, :j5_motor, 4.0)
+      BB.Actuator.set_position(@robot, :j5_motor, 4.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j5_motor in path
@@ -200,7 +199,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J5 lower limit (~-1.693 rad / -97°) clamps -2.0 rad" do
-      BB.Actuator.set_position!(@robot, :j5_motor, -2.0)
+      BB.Actuator.set_position(@robot, :j5_motor, -2.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j5_motor in path
@@ -208,7 +207,7 @@ defmodule BB.Ufactory.SimTest do
     end
 
     test "J6 symmetric ±2π limits do not clamp 3.0 rad" do
-      BB.Actuator.set_position!(@robot, :j6_motor, 3.0)
+      BB.Actuator.set_position(@robot, :j6_motor, 3.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert :j6_motor in path
@@ -229,7 +228,7 @@ defmodule BB.Ufactory.SimTest do
 
     test "JointState is published for J1 after a position command" do
       # 1.0 rad at π rad/s ≈ 318 ms. Estimator ticks at 50 Hz during motion.
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.0, delivery: :direct)
 
       assert_receive {:bb, path, %Message{payload: %JointState{} = js}}, 2_000
       assert :j1 in path
@@ -240,7 +239,7 @@ defmodule BB.Ufactory.SimTest do
 
     test "multiple JointState messages are published during motion" do
       # 1.5 rad at π rad/s ≈ 477 ms. At 50 Hz that is ~24 ticks.
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.5)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.5, delivery: :direct)
 
       positions = collect_joint_state_positions(2_500)
       assert length(positions) >= 2
@@ -266,7 +265,7 @@ defmodule BB.Ufactory.SimTest do
             {:j5_motor, 0.1},
             {:j6_motor, 0.1}
           ] do
-        BB.Actuator.set_position!(@robot, motor, pos)
+        BB.Actuator.set_position(@robot, motor, pos, delivery: :direct)
       end
 
       motors_received = collect_begin_motion_motors(6, 2_000)
@@ -285,13 +284,13 @@ defmodule BB.Ufactory.SimTest do
       BB.Safety.arm(@robot)
       BB.subscribe(@robot, [:actuator])
 
-      BB.Actuator.set_position!(@robot, :j1_motor, 0.5)
+      BB.Actuator.set_position(@robot, :j1_motor, 0.5, delivery: :direct)
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{}}}, 1_000
 
       BB.Safety.disarm(@robot)
       BB.Safety.arm(@robot)
 
-      BB.Actuator.set_position!(@robot, :j1_motor, 1.0)
+      BB.Actuator.set_position(@robot, :j1_motor, 1.0, delivery: :direct)
       assert_receive {:bb, _path, %Message{payload: %BeginMotion{} = bm}}, 1_000
       assert_in_delta bm.target_position, 1.0, 1.0e-4
 

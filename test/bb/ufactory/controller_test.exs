@@ -115,7 +115,7 @@ defmodule BB.Ufactory.ControllerTest do
       report_port: 30_003,
       model_config: %{joints: 6, max_speed_rads: :math.pi(), limits: []},
       controller_name: :xarm,
-      loop_interval_ms: 10,
+      loop: BB.Loop.new(%{robot: TestRobot, path: [:xarm]}, clock: {:rate, 100}),
       heartbeat_interval_ms: 1_000,
       disarm_action: :stop,
       cmd_socket: cmd_socket,
@@ -1089,9 +1089,9 @@ defmodule BB.Ufactory.ControllerTest do
     end
   end
 
-  # ── handle_info(:loop) — control loop ────────────────────────────────────────
+  # ── handle_info(:tick) — control loop ────────────────────────────────────────
 
-  describe "handle_info(:loop)" do
+  describe "handle_info(:tick)" do
     setup do
       {cmd_client, cmd_server} = tcp_pair()
 
@@ -1113,7 +1113,7 @@ defmodule BB.Ufactory.ControllerTest do
       # Write set_position for all 6 joints
       for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
 
-      assert {:noreply, new_state} = Controller.handle_info(:loop, state)
+      assert {:noreply, new_state} = Controller.handle_info(:tick, state)
 
       # A joint move frame should have been sent
       assert {:ok, data} = recv_all(cmd_server, 200)
@@ -1131,7 +1131,7 @@ defmodule BB.Ufactory.ControllerTest do
       cmd_server: cmd_server
     } do
       # All set_position remain nil
-      assert {:noreply, _new_state} = Controller.handle_info(:loop, state)
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
       assert {:error, :timeout} = recv_all(cmd_server, 50)
     end
@@ -1142,7 +1142,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
 
-      assert {:noreply, _new_state} = Controller.handle_info(:loop, state)
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
       assert {:error, :timeout} = recv_all(cmd_server, 50)
     end
@@ -1154,7 +1154,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       for i <- 2..6, do: :ets.insert(state.ets, {i, 0.2, 0.0, nil})
 
-      assert {:noreply, _new_state} = Controller.handle_info(:loop, state)
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
       # Should still send a joint move since joint 1 has set_position
       assert {:ok, data} = recv_all(cmd_server, 200)
@@ -1176,7 +1176,7 @@ defmodule BB.Ufactory.ControllerTest do
       # uncommanded sweep on real hardware — so the tick must be skipped.
       :ets.insert(state.ets, {1, nil, nil, 0.5})
 
-      assert {:noreply, new_state} = Controller.handle_info(:loop, state)
+      assert {:noreply, new_state} = Controller.handle_info(:tick, state)
       assert new_state.move_skip_logged
       assert {:error, :timeout} = recv_all(cmd_server, 50)
     end
@@ -1278,7 +1278,7 @@ defmodule BB.Ufactory.ControllerTest do
       for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
 
       assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
-               Controller.handle_info(:loop, state)
+               Controller.handle_info(:tick, state)
     end
 
     test "arm-sequence send failure stops the controller", %{state: state} do

@@ -30,9 +30,6 @@ defmodule BB.Ufactory.Actuator.GripperTest do
 
   describe "init/1" do
     test "stores controller and speed in state without sending hardware commands" do
-      BB
-      |> stub(:subscribe, fn TestRobot, [:actuator, :gripper] -> :ok end)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :gripper, _frames} -> :ok end)
 
@@ -43,9 +40,6 @@ defmodule BB.Ufactory.Actuator.GripperTest do
     end
 
     test "stores custom speed from options" do
-      BB
-      |> stub(:subscribe, fn TestRobot, [:actuator, :gripper] -> :ok end)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :gripper, _frames} -> :ok end)
 
@@ -54,12 +48,13 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       assert state.speed == 800
     end
 
-    test "subscribes to its own command topic for pubsub delivery" do
-      BB
-      |> expect(:subscribe, fn TestRobot, [:actuator, :gripper] -> :ok end)
-
+    test "does not subscribe to its own command topic (BB.Actuator.Server owns it)" do
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :gripper, _frames} -> :ok end)
+
+      BB
+      |> reject(:subscribe, 2)
+      |> reject(:subscribe, 3)
 
       opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
       assert {:ok, _state} = Gripper.init(opts)
@@ -69,9 +64,6 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       expected_enable = Protocol.cmd_gripper_enable(0, true)
       expected_speed = Protocol.cmd_gripper_speed(0, 800)
       test_pid = self()
-
-      BB
-      |> stub(:subscribe, fn TestRobot, _path -> :ok end)
 
       BB.Process
       |> expect(:call, fn TestRobot, :xarm, {:register_arm_frames, :gripper, frames} ->
@@ -86,9 +78,6 @@ defmodule BB.Ufactory.Actuator.GripperTest do
     end
 
     test "completes init even when arm-frame registration fails" do
-      BB
-      |> stub(:subscribe, fn TestRobot, _path -> :ok end)
-
       BB.Process
       |> stub(:call, fn TestRobot, :xarm, {:register_arm_frames, :gripper, _} ->
         {:error, :closed}
@@ -99,9 +88,17 @@ defmodule BB.Ufactory.Actuator.GripperTest do
     end
   end
 
-  # ── handle_cast position commands ────────────────────────────────────────────
+  # ── command_payloads/1 ───────────────────────────────────────────────────────
 
-  describe "handle_cast({:command, %Command.Position{}}, state)" do
+  describe "command_payloads/1" do
+    test "declares only Position (no genuine gripper stop on the RS485 proxy)" do
+      assert Gripper.command_payloads([]) == [Command.Position]
+    end
+  end
+
+  # ── handle_command: Command.Position ─────────────────────────────────────────
+
+  describe "handle_command(%Command.Position{}, state)" do
     test "sends cmd_gripper_position frame with rounded integer position" do
       state = make_state()
       expected_frame = Protocol.cmd_gripper_position(0, 420)
@@ -116,7 +113,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(420.0)
-      assert {:noreply, ^state} = Gripper.handle_cast({:command, msg}, state)
+      assert {:noreply, ^state} = Gripper.handle_command(msg, state)
     end
 
     test "rounds float position to nearest integer" do
@@ -133,7 +130,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(420.7)
-      Gripper.handle_cast({:command, msg}, state)
+      Gripper.handle_command(msg, state)
     end
 
     test "clamps position above 840 to 840" do
@@ -150,7 +147,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(1000.0)
-      Gripper.handle_cast({:command, msg}, state)
+      Gripper.handle_command(msg, state)
     end
 
     test "clamps position below 0 to 0" do
@@ -167,7 +164,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(-50.0)
-      Gripper.handle_cast({:command, msg}, state)
+      Gripper.handle_command(msg, state)
     end
 
     test "publishes BeginMotion with correct target_position" do
@@ -188,41 +185,22 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       end)
 
       msg = position_msg(500.0)
-      Gripper.handle_cast({:command, msg}, state)
+      Gripper.handle_command(msg, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.target_position, 500.0, 0.001
     end
 
-    test "ignores unknown casts" do
-      state = make_state()
-      assert {:noreply, ^state} = Gripper.handle_cast(:unexpected, state)
-    end
-  end
-
-  # ── handle_info pubsub delivery ──────────────────────────────────────────────
-
-  describe "handle_info({:bb, [:actuator | path], %Command.Position{}}, state)" do
-    test "applies the same position logic as handle_cast" do
+    test "replies with the error when the controller cannot deliver the frame" do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        expected = Protocol.cmd_gripper_position(0, 300)
-        assert frame == expected
-        :ok
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+        {:error, :closed}
       end)
 
-      BB
-      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
-
       msg = position_msg(300.0)
-      assert {:noreply, ^state} = Gripper.handle_info({:bb, [:actuator, :gripper], msg}, state)
-    end
-
-    test "ignores unrecognised messages" do
-      state = make_state()
-      assert {:noreply, ^state} = Gripper.handle_info(:unexpected, state)
+      assert {:reply, {:error, :closed}, ^state} = Gripper.handle_command(msg, state)
     end
   end
 

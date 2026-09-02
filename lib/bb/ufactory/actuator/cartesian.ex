@@ -16,17 +16,35 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   ## Command Interface
 
-  Cartesian commands use a custom GenServer cast rather than the standard
-  scalar `%Command.Position{}` message (which only holds a single float).
-  Send commands via:
+  The actuator declares `BB.Ufactory.Message.Command.CartesianMove` via
+  `c:BB.Actuator.command_payloads/1`, so pose commands travel through BB's
+  gated command pipeline (armed check, refusals reaching the caller):
 
-      BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
+      alias BB.Ufactory.Message.Command.CartesianMove
+
+      msg = BB.Message.new!(CartesianMove, :tcp,
+        x: 300.0, y: 0.0, z: 400.0, roll: 3.14159, pitch: 0.0, yaw: 0.0)
+
+      # Synchronous — learn whether the arm accepted the command:
+      :ok = BB.call(MyRobot, :tcp, {:command, msg})
+
+      # Fire-and-forget:
+      BB.cast(MyRobot, :tcp, {:command, msg})
 
   - `x`, `y`, `z` — position in **millimetres**
   - `roll`, `pitch`, `yaw` — orientation in **radians**
 
-  Speed and acceleration default to the values configured in `options_schema`
-  and can be overridden per-command by passing `{:move_cartesian, pose, speed, accel}`.
+  `speed` and `acceleration` default to the values configured in
+  `options_schema` and can be overridden per-command in the payload.
+
+  ### Legacy cast interface
+
+  The pre-0.2 raw cast is still accepted for backwards compatibility, but it
+  bypasses the armed check the command pipeline provides — prefer
+  `CartesianMove`:
+
+      BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
+      BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, speed, accel})
   """
 
   use BB.Actuator,
@@ -52,6 +70,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
+  alias BB.Ufactory.Message.Command.CartesianMove
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -84,7 +103,36 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   @impl BB.Actuator
   def disarm(_opts), do: :ok
 
-  # ── Direct cast: {:move_cartesian, pose} ────────────────────────────────────
+  # ── Accepted command payloads ────────────────────────────────────────────────
+
+  # MOVE_LINE has no scoped stop: firmware state 4 halts the whole arm and
+  # clears every queued command, which would silently fight the 100 Hz joint
+  # streaming loop. Stopping the arm is the safety system's job (disarm), so
+  # only the pose command is declared here.
+  @impl BB.Actuator
+  def command_payloads(_opts), do: [CartesianMove]
+
+  # ── handle_command/2 — gated command pipeline ────────────────────────────────
+
+  @impl BB.Actuator
+  def handle_command(%Message{payload: %CartesianMove{} = cmd}, state) do
+    # Both operands are already floats: the payload schema types speed and
+    # acceleration as :float, and init/1 coerces the configured defaults.
+    pose = {cmd.x, cmd.y, cmd.z, cmd.roll, cmd.pitch, cmd.yaw}
+    speed = cmd.speed || state.speed
+    accel = cmd.acceleration || state.acceleration
+
+    case send_cartesian(pose, speed, accel, state) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_command(%Message{payload: payload}, state) do
+    {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
+  end
+
+  # ── Legacy direct cast: {:move_cartesian, pose} ─────────────────────────────
 
   @impl BB.Actuator
   def handle_cast({:move_cartesian, {_x, _y, _z, _roll, _pitch, _yaw} = pose}, state) do
@@ -107,9 +155,11 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
       :ok ->
         publish_begin_motion(pose, speed, state)
+        :ok
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning("[BB.Ufactory.Actuator.Cartesian] send_command failed: #{inspect(reason)}")
+        error
     end
   end
 

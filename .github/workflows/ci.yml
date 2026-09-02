@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ELIXIR_VERSION: "1.20.2"
+  ELIXIR_VERSION: "1.20.4"
   OTP_VERSION: "29"
 
 jobs:
@@ -47,7 +47,8 @@ jobs:
 
       # Runs the full ex_check suite: compiler (warnings-as-errors), formatter,
       # credo --strict, dialyzer, doctor, ex_doc, unit tests with coverage,
-      # mix_audit, sobelow, unused_deps, and reuse (via the fsfe/reuse Docker
+      # mix_audit, sobelow, reach (architecture policy + strict smell checks,
+      # per .reach.exs), unused_deps, and reuse (via the fsfe/reuse Docker
       # image, per .check.exs). Dialyzer PLTs live in _build and are cached.
       - name: Run mix check
         run: mix check

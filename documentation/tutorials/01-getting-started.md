@@ -22,7 +22,7 @@ Add `bb_ufactory` to your `mix.exs` dependencies:
 ```elixir
 def deps do
   [
-    {:bb, "~> 0.15"},
+    {:bb, "~> 0.31"},
     {:bb_ufactory, "~> 0.1"}
   ]
 end

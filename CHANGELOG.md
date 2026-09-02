@@ -13,6 +13,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## v0.2.0 (2026-09-01)
+
+### Breaking Changes
+
+- Requires `bb ~> 0.31` (was `~> 0.22`). Actuator command delivery now goes
+  through `c:BB.Actuator.handle_command/2` (bb 0.23+): the framework
+  subscribes each actuator to its command topic, enforces the armed check,
+  and gates payload types before the driver sees them. Code that called the
+  actuators' old `handle_cast({:command, ...})`/`handle_info` clauses
+  directly must use the command pipeline (`BB.Actuator.set_position/4`,
+  `BB.call(robot, name, {:command, msg})`).
+- `BB.Actuator.set_position/4` is synchronous under bb 0.30+: it returns
+  `:ok` or `{:error, reason}`, and the Gripper, LinearTrack, and Cartesian
+  actuators now reply with the error when the controller cannot deliver a
+  frame.
+- Cartesian moves have a first-class payload:
+  `BB.Ufactory.Message.Command.CartesianMove` (6-DOF pose + optional
+  speed/acceleration), delivered through the gated pipeline. The raw
+  `{:move_cartesian, pose}` cast is still accepted but bypasses the armed
+  check; prefer the payload.
+
+### Bug Fixes
+
+- **`Protocol.cmd_stop/1` now sends SET_STATE 4 (stop) instead of
+  SET_STATE 0 (motion state).** State 0 is the firmware's motion-ready
+  ("sport") state, so the `:stop` disarm action — including the
+  fresh-connection safety disarm — was commanding the arm *into* motion
+  state rather than terminating motion and clearing queued commands.
+
+### Features
+
+- `Actuator.Joint` accepts `Command.Stop` and `Command.Hold`, braking the
+  joint by latching its current reported position as the 100 Hz loop
+  target. It also declares `capabilities: [:position_feedback,
+  :effort_feedback]`, so joints it drives no longer warn about missing
+  position sensors (the controller publishes `JointState` from every
+  report frame).
+- `Actuator.LinearTrack` accepts `Command.Stop`: it reads the carriage's
+  current position over RS485 and re-targets it, and refuses the stop when
+  the read fails rather than commanding an assumed position.
+- The 100 Hz control loop runs on `BB.Loop` (bb 0.26+): ticks are
+  scheduled against absolute monotonic deadlines, so the loop no longer
+  drifts by per-tick processing time, and overruns are reported via
+  `[:bb, :loop, :tick]` telemetry instead of accumulating silently.
+
+### Improvements
+
+- `.formatter.exs` imports the Spark DSL locals from bb's exported
+  formatter config instead of a hand-maintained copy.
+- Added `reach` to the dev/test toolchain: `.reach.exs` machine-checks the
+  wire-layer purity invariant (Protocol/Report/Registers/Model must not
+  depend on runtime components, message structs, or sockets), and
+  `mix check` now runs `mix reach.check --arch --smells --strict`.
+- CI runs on Elixir 1.20.4 (was 1.20.2); the library now requires
+  Elixir ~> 1.20.
+
 ## v0.1.0 (2026-07-19)
 
 Initial release.

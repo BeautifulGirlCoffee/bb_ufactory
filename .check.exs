@@ -6,6 +6,8 @@
   tools: [
     {:credo, "mix credo --strict"},
     {:excoveralls, "mix coveralls"},
+    # Architecture policy (.reach.exs) + strict cross-function smell checks.
+    {:reach, "mix reach.check --arch --smells --strict"},
     {:reuse, command: ["docker", "run", "--rm", "-v", "#{File.cwd!()}:/data", "fsfe/reuse", "lint"]}
   ]
 ]

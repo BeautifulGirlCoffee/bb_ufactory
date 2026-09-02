@@ -86,7 +86,8 @@ defmodule Mix.Tasks.BbUfactory.Sim do
     firmware_args =
       Map.get(@models, model) ||
         Mix.raise(
-          "Unknown model #{inspect(model)} — expected one of: #{Enum.join(Map.keys(@models), ", ")}"
+          "Unknown model #{inspect(model)} — expected one of: " <>
+            Enum.map_join(@models, ", ", fn {name, _args} -> Atom.to_string(name) end)
         )
 
     # Always recreate so a previously started firmware (possibly a different

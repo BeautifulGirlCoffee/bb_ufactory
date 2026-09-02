@@ -122,10 +122,11 @@ defmodule BB.Ufactory.Simulator do
   @spec available?(opts()) :: boolean()
   def available?(opts \\ []) do
     command_responding?(opts) and report_streaming?(opts)
-  rescue
-    _ -> false
   catch
-    _, _ -> false
+    # A readiness probe answers false on ANY failure. The two-arity catch
+    # covers all three kinds — :error (raised exceptions), :exit, :throw —
+    # so no separate rescue clause is needed.
+    _kind, _value -> false
   end
 
   @doc """

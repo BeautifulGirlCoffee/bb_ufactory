@@ -168,6 +168,7 @@ defmodule BB.Ufactory.Controller do
 
   alias BB.Error.Protocol.Ufactory.ConnectionError
   alias BB.Error.Protocol.Ufactory.HardwareFault
+  alias BB.Loop
   alias BB.Message
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
@@ -236,7 +237,6 @@ defmodule BB.Ufactory.Controller do
     disarm_action = Keyword.get(opts, :disarm_action, :stop)
 
     model_config = Model.get(model)
-    loop_interval_ms = max(1, div(1_000, loop_hz))
     controller_name = List.last(bb.path)
 
     charlist_host = String.to_charlist(host)
@@ -263,7 +263,12 @@ defmodule BB.Ufactory.Controller do
 
       BB.subscribe(bb.robot, [:state_machine])
 
-      Process.send_after(self(), :loop, loop_interval_ms)
+      # BB.Loop schedules against absolute monotonic deadlines, so the
+      # control loop holds its configured rate rather than drifting by each
+      # tick's processing time, and overruns surface as [:bb, :loop, :tick]
+      # :skipped telemetry instead of a silent backlog of stale ticks.
+      loop = bb |> Loop.new(clock: {:rate, loop_hz}) |> Loop.arm()
+
       Process.send_after(self(), :heartbeat, heartbeat_interval_ms)
 
       state = %{
@@ -273,7 +278,7 @@ defmodule BB.Ufactory.Controller do
         report_port: report_port,
         model_config: model_config,
         controller_name: controller_name,
-        loop_interval_ms: loop_interval_ms,
+        loop: loop,
         heartbeat_interval_ms: heartbeat_interval_ms,
         disarm_action: disarm_action,
         cmd_socket: cmd_socket,
@@ -316,10 +321,15 @@ defmodule BB.Ufactory.Controller do
   # ── Control loop ─────────────────────────────────────────────────────────────
 
   @impl BB.Controller
-  def handle_info(:loop, state) do
+  def handle_info(:tick, state) do
+    # tick/1 re-arms the timer against the next absolute deadline before the
+    # work runs, so a slow tick delays nothing and whole missed periods are
+    # skipped rather than delivered back-to-back.
+    {_dt, _skipped, loop} = Loop.tick(state.loop)
+    state = %{state | loop: loop}
+
     case maybe_send_joint_move(state) do
       {:ok, state} ->
-        Process.send_after(self(), :loop, state.loop_interval_ms)
         {:noreply, state}
 
       {:fatal, reason, state} ->
@@ -531,6 +541,7 @@ defmodule BB.Ufactory.Controller do
 
   @impl BB.Controller
   def terminate(_reason, state) do
+    if state[:loop], do: Loop.cancel(state.loop)
     if state.cmd_socket, do: :gen_tcp.close(state.cmd_socket)
     if state.report_socket, do: :gen_tcp.close(state.report_socket)
     :ok

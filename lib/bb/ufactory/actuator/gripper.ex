@@ -24,7 +24,11 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
   Receives standard `%BB.Message.Actuator.Command.Position{}` commands, where
   `position` is the target position in pulse units (0.0–840.0). Non-integer
-  values are rounded to the nearest integer.
+  values are rounded to the nearest integer. All transports converge on
+  `c:BB.Actuator.handle_command/2`; only `Command.Position` is declared, so
+  the framework refuses other payload types before the driver sees them. A
+  synchronous caller (`BB.Actuator.set_position/4`) receives `{:error, reason}`
+  when the controller cannot deliver the frame.
 
   ## Disarm
 
@@ -62,10 +66,6 @@ defmodule BB.Ufactory.Actuator.Gripper do
     controller = Keyword.fetch!(opts, :controller)
     speed = Keyword.get(opts, :speed, 1500)
 
-    # Commands may be delivered over pubsub (BB.Actuator.set_position/4) —
-    # nothing else subscribes this process to its own command topic.
-    BB.subscribe(bb.robot, [:actuator | bb.path])
-
     register_arm_frames(bb.robot, controller, speed)
 
     {:ok, %{bb: bb, controller: controller, speed: speed}}
@@ -88,28 +88,27 @@ defmodule BB.Ufactory.Actuator.Gripper do
     :ok
   end
 
-  # ── handle_cast position commands ────────────────────────────────────────────
+  # ── Accepted command payloads ────────────────────────────────────────────────
+
+  # There is no genuine gripper stop or hold on the RS485 proxy (no position
+  # read-back is implemented), so only Position is declared; the framework
+  # refuses everything else before the driver sees it.
+  @impl BB.Actuator
+  def command_payloads(_opts), do: [Command.Position]
+
+  # ── handle_command/2 — all transports converge here ─────────────────────────
 
   @impl BB.Actuator
-  def handle_cast({:command, %Message{payload: %Command.Position{position: pos}}}, state) do
-    state = apply_gripper_position(pos, state)
-    {:noreply, state}
+  def handle_command(%Message{payload: %Command.Position{position: pos}}, state) do
+    case apply_gripper_position(pos, state) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
-  def handle_cast(_request, state), do: {:noreply, state}
-
-  # ── handle_info — pubsub delivery ──────────────────────────────────────────
-
-  @impl BB.Actuator
-  def handle_info(
-        {:bb, [:actuator | _path], %Message{payload: %Command.Position{position: pos}}},
-        state
-      ) do
-    state = apply_gripper_position(pos, state)
-    {:noreply, state}
+  def handle_command(%Message{payload: payload}, state) do
+    {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
   end
-
-  def handle_info(_msg, state), do: {:noreply, state}
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
@@ -137,14 +136,15 @@ defmodule BB.Ufactory.Actuator.Gripper do
     case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
       :ok ->
         publish_begin_motion(pos_int, state)
+        :ok
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning(
           "[BB.Ufactory.Actuator.Gripper] gripper_position(#{pos_int}) failed: #{inspect(reason)}"
         )
-    end
 
-    state
+        error
+    end
   end
 
   defp publish_begin_motion(pos_int, state) do

@@ -9,7 +9,7 @@ defmodule BB.Ufactory.MixProject do
   Beam Bots integration for UFactory xArm robotic arms.
   """
 
-  @version "0.1.0"
+  @version "0.2.0"
 
   def project do
     [
@@ -20,7 +20,7 @@ defmodule BB.Ufactory.MixProject do
       description: @moduledoc,
       dialyzer: dialyzer(),
       docs: docs(),
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       package: package(),
       start_permanent: Mix.env() == :prod,
@@ -80,9 +80,9 @@ defmodule BB.Ufactory.MixProject do
 
   defp deps do
     [
-      # 0.22+ required: BB.Message monotonic_time/wall_time envelope,
+      # 0.31+ required: see CHANGELOG — tracks the BB.Message envelope,
       # compile-time component behaviour enforcement, Localize-based units.
-      {:bb, "~> 0.22"},
+      {:bb, "~> 0.31"},
 
       # dev/test
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -95,6 +95,7 @@ defmodule BB.Ufactory.MixProject do
       {:igniter, "~> 0.7", only: [:dev, :test], runtime: false},
       {:mimic, "~> 2.3", only: :test, runtime: false},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
+      {:reach, "~> 2.8", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}
     ]
   end

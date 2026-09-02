@@ -57,7 +57,7 @@ end
 ## Requirements
 
 - UFactory xArm arm connected via Ethernet
-- BB framework (`~> 0.22`)
+- BB framework (`~> 0.31`)
 
 ## Usage
 
@@ -125,13 +125,23 @@ end
 ### Joint-Space Motion
 
 ```elixir
-BB.Actuator.set_position(MyRobot, [:base, :j1, :j1_motor], 0.5)
+# Synchronous (bb >= 0.30): returns :ok, or {:error, reason} on refusal
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, 0.5)
+
+# Brake a joint at its current position / actively hold it there
+BB.Actuator.stop(MyRobot, :j1_motor)
+BB.Actuator.hold(MyRobot, :j1_motor)
 ```
 
 ### Cartesian Motion
 
 ```elixir
-BB.Actuator.set_position(MyRobot, [:cartesian, :tcp], {300.0, 0.0, 400.0, 0.0, 0.0, 0.0})
+alias BB.Ufactory.Message.Command.CartesianMove
+
+msg = BB.Message.new!(CartesianMove, :cartesian,
+  x: 300.0, y: 0.0, z: 400.0, roll: 0.0, pitch: 0.0, yaw: 0.0)
+
+BB.call(MyRobot, :cartesian, {:command, msg})
 ```
 
 ### Subscribing to State

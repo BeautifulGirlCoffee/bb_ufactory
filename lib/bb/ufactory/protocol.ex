@@ -247,10 +247,10 @@ defmodule BB.Ufactory.Protocol do
   @doc """
   Sets the arm state.
 
-  State values:
-  - `0` — stop / clear motion queue (also see `cmd_stop/1`)
-  - `3` — start motion (play)
-  - `4` — pause
+  State values (per the xArm SDK's `set_state`):
+  - `0` — motion ("sport") state: ready to execute motion commands
+  - `3` — pause: suspend motion, keep the queued commands
+  - `4` — stop: terminate motion and clear queued commands (see `cmd_stop/1`)
 
   ## Examples
 
@@ -264,10 +264,15 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
-  Sends a stop command (SET_STATE with value 0 — clears motion queue).
+  Sends a stop command (SET_STATE with value 4 — terminates motion and clears
+  queued commands).
+
+  To move again after a stop, return the arm to motion state with
+  `cmd_set_state(txn_id, 0)` — the controller's arm sequence does this on
+  every `:armed` transition.
   """
   @spec cmd_stop(non_neg_integer()) :: binary()
-  def cmd_stop(txn_id), do: cmd_set_state(txn_id, 0)
+  def cmd_stop(txn_id), do: cmd_set_state(txn_id, 4)
 
   @doc """
   Requests the current joint angles from the arm.

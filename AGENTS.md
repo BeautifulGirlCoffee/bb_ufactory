@@ -45,10 +45,10 @@ Controller (GenServer)
     +-- ETS table — shared state between controller and actuators
     |
     v
-Actuator.Joint       — writes set_position to ETS (joint-space)
-Actuator.Cartesian   — sends cmd_move_cartesian via controller call
+Actuator.Joint       — writes set_position to ETS (joint-space); Stop/Hold brake at current position
+Actuator.Cartesian   — sends cmd_move_cartesian via controller call (CartesianMove payload)
 Actuator.Gripper     — sends gripper commands via controller call
-Actuator.LinearTrack — RS485-proxied track position via controller call
+Actuator.LinearTrack — RS485-proxied track position via controller call; Stop re-targets current position
     |
     v publishes (from report frames)
 BB.Message.Sensor.JointState         → [:sensor, controller_name]
@@ -97,10 +97,16 @@ BB.Error.Protocol.Ufactory.ConnectionError
   reduced mode, workspace fence, collision settings).
 
 - **`BB.Ufactory.Actuator.Joint`** — Writes `set_position` to ETS; controller loop
-  batches all joints into a single `cmd_move_joints` frame at 100Hz.
+  batches all joints into a single `cmd_move_joints` frame at 100Hz. Declares
+  `capabilities: [:position_feedback, :effort_feedback]` (the controller
+  publishes JointState from report frames) and accepts `Position`, `Stop`, and
+  `Hold` payloads — Stop/Hold latch the current reported position as the target.
 
 - **`BB.Ufactory.Actuator.Cartesian`** — Sends `cmd_move_cartesian` directly via
-  controller `handle_call({:send_command, frame}, ...)`.
+  controller `handle_call({:send_command, frame}, ...)`. Declares the custom
+  `BB.Ufactory.Message.Command.CartesianMove` payload (6-DOF pose + optional
+  speed/acceleration) so pose commands flow through BB's gated pipeline; a
+  legacy `{:move_cartesian, pose}` raw cast is kept for compatibility.
 
 - **`BB.Ufactory.Actuator.Gripper`** — Gripper G2 position (0–840 mm) via register 0x7C.
 
@@ -162,7 +168,9 @@ The library uses BB's:
 
 ### Testing
 
-Tests use Mimic to mock `BB`, `BB.Process`, `BB.Robot`, and `BB.Safety`. Hardware tests
+Tests use Mimic to mock `BB`, `BB.Process`, `BB.Robot`, and `BB.Safety`. Actuator
+commands are delivered by `BB.Actuator.Server` to `handle_command/2` (bb >= 0.23) —
+unit tests call `handle_command/2` on the callback module directly. Hardware tests
 are tagged `@tag :hardware` and excluded from `mix test` by default. Test support modules
 live in `test/support/`.
 
@@ -180,7 +188,7 @@ Test files mirror the `lib/` structure:
 
 ## Dependencies
 
-- `bb ~> 0.15` — The Beam Bots robotics framework
+- `bb ~> 0.31` — The Beam Bots robotics framework
 
 ## Reference Material
 

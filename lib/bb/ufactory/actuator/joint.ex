@@ -12,14 +12,33 @@ defmodule BB.Ufactory.Actuator.Joint do
   reads all pending `set_position` values and batches them into a single
   `cmd_move_joints` frame.
 
-  Commands are accepted via two delivery paths:
+  All command transports (`BB.Actuator.set_position/4` over pubsub, direct
+  cast, synchronous call) converge on `c:BB.Actuator.handle_command/2` —
+  `BB.Actuator.Server` subscribes to the command topic, checks that the robot
+  is armed, and gates payload types before the driver sees them.
 
-  - **Pubsub** (`BB.Actuator.set_position/4`): arrives as
-    `handle_info({:bb, [:actuator | path], msg}, state)`.
-  - **Direct cast** (`BB.Actuator.set_position!/4`): arrives as
-    `handle_cast({:command, msg}, state)`.
+  ## Accepted commands
 
-  Both paths share the same clamping and ETS write logic.
+  - `Command.Position` — clamp to joint limits, write `set_position` to ETS.
+  - `Command.Stop` — brake this joint by latching its current reported
+    position as the target. The 100 Hz loop keeps commanding that position, so
+    the firmware decelerates the joint and it stays put. If no report frame
+    has arrived yet, the pending target is cleared instead — nothing has been
+    dispatched, so clearing it cancels the motion.
+  - `Command.Hold` — same latch as `Stop`; in position mode, holding the
+    current angle actively resists external force. Refused when the current
+    position is unknown (no report frame yet).
+
+  Per-joint "passive" stop does not exist on this hardware (motor enable is
+  arm-wide), so both `Stop` and `Hold` brake at the current position. Making
+  the whole arm safe is the controller's `disarm/1`.
+
+  ## Capabilities
+
+  Declares `:position_feedback` and `:effort_feedback`: the controller
+  publishes `BB.Message.Sensor.JointState` (angles + torques from every
+  ~100 Hz report frame) on `[:sensor, controller_name]`, so joints driven by
+  this actuator do not need a separate position sensor.
 
   ## ETS Write
 
@@ -74,11 +93,6 @@ defmodule BB.Ufactory.Actuator.Joint do
       limits = intersect_topology_limits(bb, model_limits)
       max_speed = model_config.max_speed_rads
 
-      # Commands may be delivered over pubsub (BB.Actuator.set_position/4,
-      # BB.Motion with delivery: :pubsub) — nothing else subscribes this
-      # process to its own command topic.
-      BB.subscribe(bb.robot, [:actuator | bb.path])
-
       state = %{
         bb: bb,
         joint: joint,
@@ -97,28 +111,51 @@ defmodule BB.Ufactory.Actuator.Joint do
   @impl BB.Actuator
   def disarm(_opts), do: :ok
 
-  # ── Pubsub delivery ──────────────────────────────────────────────────────────
+  # ── Capabilities and accepted command payloads ──────────────────────────────
+
+  # The controller reads position and torque back from every report frame and
+  # publishes them as JointState, so the joints this actuator drives need no
+  # separate position sensor. Velocity is not present in report frames.
+  @impl BB.Actuator
+  def capabilities(_opts), do: [:position_feedback, :effort_feedback]
 
   @impl BB.Actuator
-  def handle_info(
-        {:bb, [:actuator | _path], %Message{payload: %Command.Position{} = cmd}},
-        state
-      ) do
-    state = apply_position_command(cmd, state)
-    {:noreply, state}
-  end
+  def command_payloads(_opts), do: [Command.Position, Command.Stop, Command.Hold]
 
-  def handle_info(_msg, state), do: {:noreply, state}
-
-  # ── Direct cast delivery ─────────────────────────────────────────────────────
+  # ── handle_command/2 — all transports converge here ─────────────────────────
 
   @impl BB.Actuator
-  def handle_cast({:command, %Message{payload: %Command.Position{} = cmd}}, state) do
-    state = apply_position_command(cmd, state)
-    {:noreply, state}
+  def handle_command(%Message{payload: %Command.Position{} = cmd}, state) do
+    {:noreply, apply_position_command(cmd, state)}
   end
 
-  def handle_cast(_request, state), do: {:noreply, state}
+  # Both :immediate and :decelerate stop modes brake at the current position —
+  # the firmware's own planner always decelerates smoothly, so the distinction
+  # has no hardware expression here.
+  def handle_command(%Message{payload: %Command.Stop{}}, state) do
+    case brake_at_current(state) do
+      :ok ->
+        {:noreply, state}
+
+      :no_feedback ->
+        # No report frame yet means the loop has never dispatched a move
+        # (it skips ticks while any joint's position is unknown), so
+        # clearing the pending target cancels the motion outright.
+        clear_set_position(state.ets, state.joint)
+        {:noreply, state}
+    end
+  end
+
+  def handle_command(%Message{payload: %Command.Hold{}}, state) do
+    case brake_at_current(state) do
+      :ok -> {:noreply, state}
+      :no_feedback -> {:reply, {:error, :position_unknown}, state}
+    end
+  end
+
+  def handle_command(%Message{payload: payload}, state) do
+    {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
+  end
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
@@ -126,22 +163,23 @@ defmodule BB.Ufactory.Actuator.Joint do
   # robot's topology DSL (`limit do ... end`), so a user who tightens a
   # joint's range in their robot module gets that range enforced by the
   # clamp. Topology limits can only narrow, never widen, the factory range.
-  # Falls back to the model limits when the topology gives no usable limit
-  # (e.g. hand-built robots in tests without a full DSL).
+  # Falls back to the model limits when the topology gives no usable limit —
+  # the `function_exported?` guard covers hand-built robots in tests that
+  # never define `robot/0`, and the `with` else covers a missing actuator
+  # entry, an unknown joint, or non-numeric limits.
   defp intersect_topology_limits(bb, {model_lower, model_upper} = model_limits) do
     actuator_name = List.last(bb.path)
-    robot = bb.robot.robot()
 
-    with %{joint: joint_name} <- Map.get(robot.actuators, actuator_name),
-         %BB.Robot.Joint{limits: %{lower: lower, upper: upper}} <-
+    with true <- Code.ensure_loaded?(bb.robot) and function_exported?(bb.robot, :robot, 0),
+         robot = bb.robot.robot(),
+         %{joint: joint_name} <- Map.get(robot.actuators, actuator_name),
+         {:ok, %BB.Robot.Joint{limits: %{lower: lower, upper: upper}}} <-
            BB.Robot.get_joint(robot, joint_name),
          true <- is_number(lower) and is_number(upper) do
       {max(model_lower, lower * 1.0), min(model_upper, upper * 1.0)}
     else
       _ -> model_limits
     end
-  rescue
-    _ -> model_limits
   end
 
   defp apply_position_command(%Command.Position{position: position} = cmd, state) do
@@ -157,6 +195,27 @@ defmodule BB.Ufactory.Actuator.Joint do
     cur_pos = write_set_position(state.ets, state.joint, clamped)
     publish_begin_motion(cmd, clamped, cur_pos, state)
     state
+  end
+
+  # Latches the joint's current reported position as its target, so the 100 Hz
+  # loop brakes the joint there. Returns :no_feedback when no report frame has
+  # populated current_position yet.
+  defp brake_at_current(state) do
+    case :ets.lookup(state.ets, state.joint) do
+      [{_joint, cur_pos, _cur_torq, _sp}] when is_number(cur_pos) ->
+        write_set_position(state.ets, state.joint, cur_pos)
+        :ok
+
+      _ ->
+        :no_feedback
+    end
+  end
+
+  defp clear_set_position(ets, joint) do
+    case :ets.lookup(ets, joint) do
+      [{^joint, cur_pos, cur_torq, _sp}] -> :ets.insert(ets, {joint, cur_pos, cur_torq, nil})
+      [] -> :ok
+    end
   end
 
   # Reads the current ETS row to preserve current_position and current_torque,

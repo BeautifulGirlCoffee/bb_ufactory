@@ -34,8 +34,17 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   ## Command Interface
 
-  Receives standard `%BB.Message.Actuator.Command.Position{}` commands, where
-  `position` is the target position in millimetres.
+  All transports converge on `c:BB.Actuator.handle_command/2`. Accepted
+  commands:
+
+  - `Command.Position` — target position in millimetres, clamped to
+    `[0, stroke_mm]`.
+  - `Command.Stop` — reads the track's current position over RS485 and
+    re-targets it, braking the carriage in place. Refused when the position
+    read fails (commanding an assumed position could move the track).
+
+  A synchronous caller (`BB.Actuator.set_position/4`) receives
+  `{:error, reason}` when the controller cannot deliver the frames.
   """
 
   use BB.Actuator,
@@ -76,10 +85,6 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     speed = Keyword.get(opts, :speed, 200)
     stroke_mm = Keyword.get(opts, :stroke_mm, 700)
 
-    # Commands may be delivered over pubsub (BB.Actuator.set_position/4) —
-    # nothing else subscribes this process to its own command topic.
-    BB.subscribe(bb.robot, [:actuator | bb.path])
-
     register_arm_frames(bb.robot, controller)
 
     {:ok, %{bb: bb, controller: controller, speed: speed, stroke_mm: stroke_mm}}
@@ -102,33 +107,46 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     :ok
   end
 
-  # ── handle_cast position commands ────────────────────────────────────────────
+  # ── Accepted command payloads ────────────────────────────────────────────────
 
   @impl BB.Actuator
-  def handle_cast({:command, %Message{payload: %Command.Position{position: pos_mm}}}, state) do
-    state = apply_track_position(pos_mm, state)
-    {:noreply, state}
-  end
+  def command_payloads(_opts), do: [Command.Position, Command.Stop]
 
-  def handle_cast(_request, state), do: {:noreply, state}
-
-  # ── handle_info — pubsub delivery ──────────────────────────────────────────
+  # ── handle_command/2 — all transports converge here ─────────────────────────
 
   @impl BB.Actuator
-  def handle_info(
-        {:bb, [:actuator | _path], %Message{payload: %Command.Position{position: pos_mm}}},
-        state
-      ) do
-    state = apply_track_position(pos_mm, state)
-    {:noreply, state}
+  def handle_command(%Message{payload: %Command.Position{position: pos_mm}}, state) do
+    case apply_track_position(pos_mm, state) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  # Braking the carriage means re-targeting its current position — the servo
+  # tracks the most recent target, so the write preempts the move in flight.
+  # Refused when the position read fails: commanding an assumed position
+  # (e.g. 0.0) would MOVE the track rather than stop it.
+  def handle_command(%Message{payload: %Command.Stop{}}, state) do
+    case read_track_position(state.bb.robot, state.controller) do
+      {:ok, pos_mm} ->
+        case apply_track_position(pos_mm, state) do
+          :ok -> {:noreply, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+
+      :error ->
+        {:reply, {:error, :position_unknown}, state}
+    end
+  end
+
+  def handle_command(%Message{payload: payload}, state) do
+    {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
+  end
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
   defp apply_track_position(pos_mm, state) do
-    clamped = pos_mm |> max(0.0) |> min(state.stroke_mm * 1.0)
+    clamped = pos_mm |> max(0.0) |> min(state.stroke_mm)
 
     if clamped != pos_mm do
       Logger.debug(
@@ -138,21 +156,28 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     end
 
     pos_mm = clamped
-    initial_position = read_track_position(state.bb.robot, state.controller)
+
+    initial_position =
+      case read_track_position(state.bb.robot, state.controller) do
+        {:ok, pos} -> pos
+        :error -> 0.0
+      end
+
     {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, state.speed)
 
     # Speed must be set before position so the arm uses the new speed for this move.
     with :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, spd_frame}),
          :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, pos_frame}) do
       publish_begin_motion(pos_mm, initial_position, state)
+      :ok
     else
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning(
           "[BB.Ufactory.Actuator.LinearTrack] send_command failed: #{inspect(reason)}"
         )
-    end
 
-    state
+        error
+    end
   end
 
   # Registers the enable frame with the controller, which sends it at the end
@@ -177,12 +202,12 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     case BB.Process.call(robot, controller, {:send_and_recv, frame}) do
       {:ok, {_reg, 0x00, params}, _rest} ->
         case Protocol.parse_linear_track_position(params) do
-          {:ok, pos_mm} -> pos_mm
-          _ -> 0.0
+          {:ok, pos_mm} -> {:ok, pos_mm}
+          _ -> :error
         end
 
       _ ->
-        0.0
+        :error
     end
   end
 
