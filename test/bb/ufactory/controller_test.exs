@@ -76,7 +76,7 @@ defmodule BB.Ufactory.ControllerTest do
   # Builds a 135-byte real-time report frame that includes ft_filtered and ft_raw
   # fields (bytes 87–110 and 111–134 respectively). This is the format sent by the
   # arm when the F/T sensor is enabled.
-  defp build_135_byte_frame(opts \\ []) do
+  defp build_135_byte_frame(opts) do
     state = Keyword.get(opts, :state, 0)
     mode = Keyword.get(opts, :mode, 0)
     cmd_count = Keyword.get(opts, :cmd_count, 0)
@@ -1537,6 +1537,39 @@ defmodule BB.Ufactory.ControllerTest do
       # Server never responds; a slow arm must not kill the controller.
       assert {:reply, {:error, :timeout}, _state} =
                Controller.handle_call({:send_and_recv, frame, 50}, {self(), make_ref()}, state)
+    end
+  end
+
+  # ── terminate/2 ──────────────────────────────────────────────────────────────
+
+  describe "terminate/2" do
+    test "cancels the loop and closes both sockets" do
+      {cmd_client, cmd_server} = tcp_pair()
+      {report_client, report_server} = tcp_pair()
+
+      state =
+        make_state(cmd_client, %{
+          report_socket: report_client,
+          loop: BB.Loop.new(%{robot: TestRobot, path: [:xarm]}, clock: {:rate, 100})
+        })
+
+      assert :ok = Controller.terminate(:shutdown, state)
+
+      assert :erlang.port_info(cmd_client) == :undefined
+      assert :erlang.port_info(report_client) == :undefined
+
+      :gen_tcp.close(cmd_server)
+      :gen_tcp.close(report_server)
+    end
+
+    test "tolerates a state with no report socket" do
+      {cmd_client, cmd_server} = tcp_pair()
+      state = make_state(cmd_client)
+
+      assert :ok = Controller.terminate(:shutdown, state)
+      assert :erlang.port_info(cmd_client) == :undefined
+
+      :gen_tcp.close(cmd_server)
     end
   end
 

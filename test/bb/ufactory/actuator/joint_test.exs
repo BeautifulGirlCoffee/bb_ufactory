@@ -363,7 +363,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(1.0, velocity: 0.25)
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, 0.0, 0.0, 1.0, 0.25}] = :ets.lookup(ets, 2)
+      assert [{2, +0.0, +0.0, 1.0, 0.25}] = :ets.lookup(ets, 2)
     end
 
     test "a hint-less command clears a previous velocity hint" do
@@ -373,7 +373,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
 
       assert {:noreply, ^state} = Joint.handle_command(position_msg(1.0), state)
 
-      assert [{2, 0.0, 0.0, 1.0, nil}] = :ets.lookup(ets, 2)
+      assert [{2, +0.0, +0.0, 1.0, nil}] = :ets.lookup(ets, 2)
     end
 
     test "Stop's brake latch clears the velocity hint" do
@@ -387,6 +387,18 @@ defmodule BB.Ufactory.Actuator.JointTest do
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
       assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+    end
+  end
+
+  describe "handle_command with an undeclared payload" do
+    test "replies {:error, {:unsupported_command, module}}" do
+      # Unreachable through the pipeline (command_payloads gates first);
+      # pins the defensive fallback for direct callers.
+      state = make_state(make_ets())
+      msg = Message.new!(Command.Velocity, :motor, velocity: 1.0)
+
+      assert {:reply, {:error, {:unsupported_command, Command.Velocity}}, ^state} =
+               Joint.handle_command(msg, state)
     end
   end
 
@@ -431,7 +443,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = Message.new!(Command.Hold, :motor, [])
       assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, -0.4, 0.0, -0.4, nil}] = :ets.lookup(ets, 2)
+      assert [{2, -0.4, +0.0, -0.4, nil}] = :ets.lookup(ets, 2)
     end
 
     test "refuses when the current position is unknown" do

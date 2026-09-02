@@ -14,6 +14,16 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
   alias BB.Ufactory.Actuator.LinearTrack
   alias BB.Ufactory.Protocol
 
+  describe "handle_command with an undeclared payload" do
+    test "replies {:error, {:unsupported_command, module}}" do
+      state = make_state()
+      msg = Message.new!(Command.Hold, :linear_track, [])
+
+      assert {:reply, {:error, {:unsupported_command, Command.Hold}}, ^state} =
+               LinearTrack.handle_command(msg, state)
+    end
+  end
+
   defp make_state(opts \\ []) do
     %{
       bb: %{robot: TestRobot, path: [:linear_track]},

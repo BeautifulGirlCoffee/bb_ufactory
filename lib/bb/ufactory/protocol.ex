@@ -674,8 +674,8 @@ defmodule BB.Ufactory.Protocol do
   ## Examples
 
       iex> {pos_frame, spd_frame} = BB.Ufactory.Protocol.cmd_linear_track_move(1, 500.0, 200)
-      iex> is_binary(pos_frame) and is_binary(spd_frame)
-      true
+      iex> {byte_size(pos_frame), byte_size(spd_frame)}
+      {19, 17}
   """
   @spec cmd_linear_track_move(non_neg_integer(), float(), non_neg_integer()) ::
           {binary(), binary()}
