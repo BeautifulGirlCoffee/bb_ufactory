@@ -22,7 +22,7 @@ joint index (1–6 for the xArm6).
 
 ### How it works
 
-1. A position command arrives at the actuator (via `BB.Process.cast` or pubsub).
+1. A position command arrives at the actuator (via `BB.Actuator.set_position/4`, pubsub, or cast).
 2. The angle is clamped to the joint's configured limits.
 3. The target angle is written into the controller's **ETS table** under the key
    for that joint.
@@ -38,20 +38,13 @@ smooth multi-joint motion.
 ### Sending a joint-space command
 
 ```elixir
-import BB.Unit
+# Move J1 to 45° and J2 to -30° (commands are independent; both land in ETS).
+# set_position/4 is synchronous: :ok means the command was accepted.
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, :math.pi() / 4)
+:ok = BB.Actuator.set_position(MyRobot, :j2_motor, -:math.pi() / 6)
 
-# Move J1 to 45° and J2 to -30° (commands are independent; both land in ETS)
-BB.Process.cast(robot, :j1_motor, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :j1_motor,
-    position: ~u(45 degree) |> Quantity.to(:radian) |> Quantity.value()
-  )
-})
-
-BB.Process.cast(robot, :j2_motor, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :j2_motor,
-    position: ~u(-30 degree) |> Quantity.to(:radian) |> Quantity.value()
-  )
-})
+# An optional velocity hint caps the batch speed for the move (rad/s):
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, 0.5, velocity: 0.2)
 ```
 
 Both commands are picked up in the same or adjacent loop tick and sent as one
@@ -97,23 +90,36 @@ end
 
 ### How it works
 
-1. A `{:move_cartesian, pose}` cast arrives at the actuator.
+1. A `BB.Ufactory.Message.Command.CartesianMove` command arrives at the
+   actuator through BB's gated command pipeline (the actuator declares the
+   payload via `c:BB.Actuator.command_payloads/1`, so the framework checks
+   the robot is armed before the driver sees it).
 2. A `MOVE_LINE` frame (register 0x15) is built immediately with the pose and
-   the configured speed/acceleration.
+   the configured (or per-command) speed/acceleration.
 3. The frame is forwarded **directly** to the controller via `BB.Process.call/3`
    and sent to the arm over port 502.
 
-Cartesian commands **bypass the ETS batch loop**. Each cast produces exactly one
-wire frame, dispatched synchronously before the call returns.
+Cartesian commands **bypass the ETS batch loop**. Each command produces exactly
+one wire frame, dispatched synchronously before the call returns.
 
 ### Sending a Cartesian command
 
 ```elixir
+alias BB.Ufactory.Message.Command.CartesianMove
+
 # Move TCP to x=300mm, y=0mm, z=400mm, no rotation
-BB.Process.cast(robot, :cartesian, {:move_cartesian, {300.0, 0.0, 400.0, 0.0, 0.0, 0.0}})
+msg = BB.Message.new!(CartesianMove, :cartesian,
+  x: 300.0, y: 0.0, z: 400.0, roll: 0.0, pitch: 0.0, yaw: 0.0)
+
+# Synchronous: returns {:ok, :accepted} once the arm has taken the frame,
+# or {:error, reason} — including a refusal while the robot is disarmed.
+BB.call(robot, :cartesian, {:command, msg})
+
+# Fire-and-forget:
+BB.cast(robot, :cartesian, {:command, msg})
 ```
 
-Pose format: `{x, y, z, roll, pitch, yaw}` where:
+Field units:
 - `x`, `y`, `z` are in **millimetres** relative to the arm base frame
 - `roll`, `pitch`, `yaw` are in **radians**
 
@@ -121,11 +127,23 @@ Pose format: `{x, y, z, roll, pitch, yaw}` where:
 
 ```elixir
 # Slow move for a precision pick
-BB.Process.cast(robot, :cartesian, {:move_cartesian,
-  {200.0, 100.0, 250.0, 0.0, 0.0, 0.0},
-  50.0,    # speed mm/s
-  500.0    # acceleration mm/s²
-})
+msg = BB.Message.new!(CartesianMove, :cartesian,
+  x: 200.0, y: 100.0, z: 250.0, roll: 0.0, pitch: 0.0, yaw: 0.0,
+  speed: 50.0,          # mm/s
+  acceleration: 500.0)  # mm/s²
+
+BB.call(robot, :cartesian, {:command, msg})
+```
+
+### Legacy cast interface (deprecated)
+
+The pre-0.2 raw cast still works but is deprecated: it logs a warning on
+every use, and since 0.2.0 it is **dropped when the robot is not armed**
+(previously it would move a disarmed robot). Prefer `CartesianMove`:
+
+```elixir
+BB.Process.cast(robot, :cartesian, {:move_cartesian, {300.0, 0.0, 400.0, 0.0, 0.0, 0.0}})
+BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, 50.0, 500.0})
 ```
 
 ### Reading the current Cartesian pose

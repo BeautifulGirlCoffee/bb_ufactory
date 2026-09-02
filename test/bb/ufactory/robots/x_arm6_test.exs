@@ -2,6 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# The documented quick-start snippet: compiling these modules IS the test —
+# they exercise `use BB.Ufactory.Robots.XArm6` exactly as README and the
+# tutorials show it.
+defmodule BB.Ufactory.Robots.XArm6Test.QuickStart do
+  use BB.Ufactory.Robots.XArm6, host: "10.0.0.42"
+end
+
+defmodule BB.Ufactory.Robots.XArm6Test.WithAccessories do
+  use BB.Ufactory.Robots.XArm6,
+    gripper: [speed: 1200],
+    linear_track: true,
+    controller: [tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}]
+
+  sensors do
+    sensor(:wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm})
+  end
+end
+
 defmodule BB.Ufactory.Robots.XArm6Test do
   # async: false because start_supervised starts a real process tree
   use ExUnit.Case, async: false
@@ -9,20 +27,24 @@ defmodule BB.Ufactory.Robots.XArm6Test do
   @pi :math.pi()
 
   alias BB.Ufactory.Robots.XArm6
+  alias Spark.Dsl.Extension
 
   describe "robot definition" do
     setup do
       robot = XArm6.robot()
-      joints = BB.Robot.joints_in_order(robot)
-      %{robot: robot, joints: joints}
+      all_joints = BB.Robot.joints_in_order(robot)
+      joints = Enum.filter(all_joints, &(&1.type == :revolute))
+      %{robot: robot, joints: joints, all_joints: all_joints}
     end
 
-    test "defines exactly 6 joints", %{joints: joints} do
+    test "defines exactly 6 revolute joints", %{joints: joints} do
       assert length(joints) == 6
     end
 
-    test "all joints are revolute", %{joints: joints} do
-      assert Enum.all?(joints, &(&1.type == :revolute))
+    test "the only non-revolute joints are fixed accessory mounts", %{all_joints: all_joints} do
+      others = Enum.reject(all_joints, &(&1.type == :revolute))
+      assert Enum.all?(others, &(&1.type == :fixed))
+      assert Enum.map(others, & &1.name) == [:cartesian_mount]
     end
 
     test "joints are named j1 through j6", %{joints: joints} do
@@ -76,8 +98,83 @@ defmodule BB.Ufactory.Robots.XArm6Test do
     end
 
     test "kinematic chain links base to link6 via 6 joints", %{robot: robot} do
-      assert BB.Robot.get_joint(robot, :j1) != nil
-      assert BB.Robot.get_joint(robot, :j6) != nil
+      assert {:ok, %BB.Robot.Joint{}} = BB.Robot.get_joint(robot, :j1)
+      assert {:ok, %BB.Robot.Joint{}} = BB.Robot.get_joint(robot, :j6)
+    end
+  end
+
+  describe "use BB.Ufactory.Robots.XArm6" do
+    alias BB.Ufactory.Robots.XArm6Test.{QuickStart, WithAccessories}
+
+    test "quick-start module defines the full 6-joint robot" do
+      robot = QuickStart.robot()
+
+      joints =
+        robot |> BB.Robot.joints_in_order() |> Enum.filter(&(&1.type == :revolute))
+
+      assert Enum.map(joints, & &1.name) == [:j1, :j2, :j3, :j4, :j5, :j6]
+      assert Map.has_key?(robot.actuators, :j1_motor)
+      refute Map.has_key?(robot.actuators, :gripper)
+
+      # Cartesian is on by default — the README's CartesianMove example must
+      # work against the quick-start robot.
+      assert %{joint: :cartesian_mount} = robot.actuators[:cartesian]
+    end
+
+    test "cartesian: false omits the cartesian actuator" do
+      defmodule NoCartesian do
+        use BB.Ufactory.Robots.XArm6, cartesian: false
+      end
+
+      refute Map.has_key?(NoCartesian.robot().actuators, :cartesian)
+    end
+
+    test "quick-start module matches the base definition's limits" do
+      limits = fn robot ->
+        robot
+        |> BB.Robot.joints_in_order()
+        |> Enum.filter(&(&1.type == :revolute))
+        |> Enum.map(& &1.limits)
+      end
+
+      assert limits.(XArm6.robot()) == limits.(QuickStart.robot())
+    end
+
+    test "accessory options add gripper and track actuators on fixed mounts" do
+      robot = WithAccessories.robot()
+
+      assert %{joint: :gripper_mount} = robot.actuators[:gripper]
+      assert %{joint: :track_mount} = robot.actuators[:track]
+
+      assert {:ok, %BB.Robot.Joint{type: :fixed}} =
+               BB.Robot.get_joint(WithAccessories.robot(), :gripper_mount)
+    end
+
+    test "accessory robot supervisor starts in kinematic simulation" do
+      pid = start_supervised!({WithAccessories, simulation: :kinematic})
+      assert Process.alive?(pid)
+    end
+
+    test "controller option merges extra opts into the child spec" do
+      [controller] = Extension.get_entities(WithAccessories, [:controllers])
+      {BB.Ufactory.Controller, opts} = controller.child_spec
+
+      assert opts[:host] == "192.168.1.111"
+      assert opts[:loop_hz] == 100
+      assert opts[:tcp_offset] == {0.0, 0.0, 172.0, 0.0, 0.0, 0.0}
+    end
+
+    test "unknown options raise at compile time" do
+      assert_raise ArgumentError, ~r/unknown keys/, fn ->
+        defmodule BadOpts do
+          use BB.Ufactory.Robots.XArm6, hostname: "typo"
+        end
+      end
+    end
+
+    test "derived robot supervisor starts in kinematic simulation" do
+      pid = start_supervised!({QuickStart, simulation: :kinematic})
+      assert Process.alive?(pid)
     end
   end
 

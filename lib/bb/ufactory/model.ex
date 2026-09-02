@@ -19,9 +19,14 @@ defmodule BB.Ufactory.Model do
   ## Notes
 
   - All values are in **radians**.
-  - `max_speed_rads` is the maximum joint angular speed (rad/s).
-  - These are the factory hard limits enforced by the firmware. They cannot be
-    widened; commands are clamped to them before being sent to the arm.
+  - `max_speed_rads` is a conservative uniform joint-speed cap (π rad/s =
+    180°/s for every model). UFACTORY's spec sheets rate some joints higher
+    (and Lite6 up to ~220°/s), but the firmware clamps regardless, so this
+    library deliberately under-claims rather than encoding per-joint rates
+    it cannot verify on every firmware revision.
+  - The joint LIMIT tables are the factory hard limits enforced by the
+    firmware. They cannot be widened; commands are clamped to them before
+    being sent to the arm.
   """
 
   @pi :math.pi()

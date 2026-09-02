@@ -53,7 +53,7 @@ defmodule TestRobot do
   @spec make_ets(pos_integer()) :: :ets.table()
   def make_ets(joint_count \\ 6) do
     ets = :ets.new(:test_ets, [:public, :set])
-    for i <- 1..joint_count, do: :ets.insert(ets, {i, nil, nil, nil})
+    for i <- 1..joint_count, do: :ets.insert(ets, {i, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
     ets
   end

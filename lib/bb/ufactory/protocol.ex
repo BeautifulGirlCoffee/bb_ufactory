@@ -131,15 +131,22 @@ defmodule BB.Ufactory.Protocol do
   `params` is the raw parameter binary (fp32 LE fields). Pass `<<>>` for
   commands that take no parameters.
 
+  The transaction id occupies a u16 on the wire, so it wraps modulo 65 536 —
+  callers that maintain their own counter (like `BB.Ufactory.Controller`)
+  can pass an ever-increasing integer without truncation surprises.
+
   ## Examples
 
       iex> BB.Ufactory.Protocol.build_frame(1, 0x0C, <<0x03>>)
+      <<0, 1, 0, 2, 0, 2, 12, 3>>
+
+      iex> BB.Ufactory.Protocol.build_frame(65_537, 0x0C, <<0x03>>)
       <<0, 1, 0, 2, 0, 2, 12, 3>>
   """
   @spec build_frame(non_neg_integer(), byte(), binary()) :: binary()
   def build_frame(transaction_id, register, params) when is_binary(params) do
     length = byte_size(params) + 1
-    <<transaction_id::16, @protocol_id::16, length::16, register::8>> <> params
+    <<rem(transaction_id, 65_536)::16, @protocol_id::16, length::16, register::8>> <> params
   end
 
   @doc """
@@ -247,10 +254,10 @@ defmodule BB.Ufactory.Protocol do
   @doc """
   Sets the arm state.
 
-  State values:
-  - `0` — stop / clear motion queue (also see `cmd_stop/1`)
-  - `3` — start motion (play)
-  - `4` — pause
+  State values (per the xArm SDK's `set_state`):
+  - `0` — motion ("sport") state: ready to execute motion commands
+  - `3` — pause: suspend motion, keep the queued commands
+  - `4` — stop: terminate motion and clear queued commands (see `cmd_stop/1`)
 
   ## Examples
 
@@ -264,10 +271,15 @@ defmodule BB.Ufactory.Protocol do
   end
 
   @doc """
-  Sends a stop command (SET_STATE with value 0 — clears motion queue).
+  Sends a stop command (SET_STATE with value 4 — terminates motion and clears
+  queued commands).
+
+  To move again after a stop, return the arm to motion state with
+  `cmd_set_state(txn_id, 0)` — the controller's arm sequence does this on
+  every `:armed` transition.
   """
   @spec cmd_stop(non_neg_integer()) :: binary()
-  def cmd_stop(txn_id), do: cmd_set_state(txn_id, 0)
+  def cmd_stop(txn_id), do: cmd_set_state(txn_id, 4)
 
   @doc """
   Requests the current joint angles from the arm.
@@ -485,25 +497,31 @@ defmodule BB.Ufactory.Protocol do
   @doc """
   Sets the arm control mode (register 0x13, SET_MODE).
 
-  Mode values:
+  Mode values (per the Python SDK's `set_mode`):
   - `0` — position control (default)
   - `1` — servo/direct-drive mode
   - `2` — joint teaching mode
+  - `3` — cartesian teaching mode (reserved by firmware)
+  - `4` — joint velocity control
+  - `5` — cartesian velocity control
+  - `6` — joint online trajectory planning
+  - `7` — cartesian online trajectory planning
 
   Must be followed by `cmd_set_state(txn_id, 0)` to take effect.
   """
-  @spec cmd_set_mode(non_neg_integer(), non_neg_integer()) :: binary()
-  def cmd_set_mode(txn_id, mode) do
+  @spec cmd_set_mode(non_neg_integer(), 0..7) :: binary()
+  def cmd_set_mode(txn_id, mode) when mode in 0..7 do
     build_frame(txn_id, @reg_set_mode, <<mode::8>>)
   end
 
   @doc """
   Commands a joint-space move to the given angles.
 
-  `angles` must have at most 7 elements (one per joint J1..J7). If fewer than
-  7 are provided, the remainder are padded with `0.0`. This is safe for models
-  with fewer than 7 joints since the arm ignores extra joints beyond its axis
-  count.
+  `angles` must have at most 7 elements (one per joint J1..J7) — more raises
+  `FunctionClauseError`, matching `cmd_get_fk/2` and `cmd_joint_limit_check/2`
+  rather than silently dropping the extras. If fewer than 7 are provided, the
+  remainder are padded with `0.0`; this is safe for models with fewer than 7
+  joints since the arm ignores extra joints beyond its axis count.
 
   The frame payload is 10× fp32 LE: `[j1..j7, speed, accel, 0.0]`.
 
@@ -516,7 +534,7 @@ defmodule BB.Ufactory.Protocol do
       47
   """
   @spec cmd_move_joints(non_neg_integer(), [float()], float(), float()) :: binary()
-  def cmd_move_joints(txn_id, angles, speed, accel) do
+  def cmd_move_joints(txn_id, angles, speed, accel) when length(angles) <= 7 do
     padded = pad_angles(angles, 7)
     floats = padded ++ [speed, accel, 0.0]
     build_frame(txn_id, @reg_move_joints, encode_fp32s(floats))
@@ -563,13 +581,14 @@ defmodule BB.Ufactory.Protocol do
   @doc """
   Sets the gripper position in servo pulse units.
 
-  The Gripper G2 range is **0–840** pulse units. Values outside this range are
-  clamped. The pulse is sent as an int32 big-endian to the TAGET_POS register
+  The Gripper G2 range is **0–850** pulse units (850 = fully open; the
+  SDK's mm→pulse conversion tops out at ~850 for the 84 mm stroke). Values
+  outside this range are clamped. The pulse is sent as an int32 big-endian to the TAGET_POS register
   (0x0700) on the gripper device.
   """
   @spec cmd_gripper_position(non_neg_integer(), non_neg_integer()) :: binary()
   def cmd_gripper_position(txn_id, pos) do
-    clamped = max(0, min(840, pos))
+    clamped = max(0, min(850, pos))
     # int32 big-endian: upper 2 bytes to register 0x0700, lower 2 to 0x0701
     pulse_bytes = <<clamped::32>>
     params = rs485_write_registers(@gripper_device_id, @gripper_reg_taget_pos, pulse_bytes)
@@ -586,7 +605,8 @@ defmodule BB.Ufactory.Protocol do
   """
   @spec cmd_gripper_speed(non_neg_integer(), non_neg_integer()) :: binary()
   def cmd_gripper_speed(txn_id, speed) do
-    spd_bytes = <<speed::unsigned-16>>
+    # Bit syntax would silently wrap values > 0xFFFF; clamp instead.
+    spd_bytes = <<min(speed, 0xFFFF)::unsigned-16>>
     params = rs485_write_registers(@gripper_device_id, @gripper_reg_speed, spd_bytes)
     build_frame(txn_id, @reg_rs485_rtu, params)
   end
@@ -654,15 +674,16 @@ defmodule BB.Ufactory.Protocol do
   ## Examples
 
       iex> {pos_frame, spd_frame} = BB.Ufactory.Protocol.cmd_linear_track_move(1, 500.0, 200)
-      iex> is_binary(pos_frame) and is_binary(spd_frame)
-      true
+      iex> {byte_size(pos_frame), byte_size(spd_frame)}
+      {19, 17}
   """
   @spec cmd_linear_track_move(non_neg_integer(), float(), non_neg_integer()) ::
           {binary(), binary()}
   def cmd_linear_track_move(txn_id, position_mm, speed) do
     pos_units = round(position_mm * 2000)
     pos_bytes = <<pos_units::signed-32>>
-    spd_units = round(speed * 6.667)
+    # Bit syntax would silently wrap values > 0xFFFF; clamp instead.
+    spd_units = min(round(speed * 6.667), 0xFFFF)
     spd_bytes = <<spd_units::unsigned-16>>
 
     pos_frame =
@@ -722,11 +743,14 @@ defmodule BB.Ufactory.Protocol do
   """
   @spec parse_linear_track_position(binary()) :: {:ok, float()} | {:error, :invalid_response}
   def parse_linear_track_position(
-        <<_host::8, _dev::8, _func::8, _bc::8, pos_raw::signed-32, _rest::binary>>
+        <<_host::8, _dev::8, 0x03::8, _bc::8, pos_raw::signed-32, _rest::binary>>
       ) do
     {:ok, pos_raw / 2000}
   end
 
+  # Anything without function code 0x03 (read-holding-registers) is not a
+  # position response — notably RS485 exception replies (func | 0x80, e.g.
+  # 0x83), whose payload would otherwise decode as a garbage position.
   def parse_linear_track_position(_), do: {:error, :invalid_response}
 
   # ── TCP tool offset and payload ─────────────────────────────────────────────

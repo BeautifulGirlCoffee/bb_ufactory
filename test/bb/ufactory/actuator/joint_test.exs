@@ -36,7 +36,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
 
   defp make_ets do
     ets = :ets.new(:joint_test_ets, [:public, :set])
-    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil})
+    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
     ets
   end
@@ -55,6 +55,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
   defp position_msg(position, opts \\ []) do
     Message.new!(Command.Position, :motor,
       position: position * 1.0,
+      velocity: opts[:velocity],
       command_id: opts[:command_id]
     )
   end
@@ -68,9 +69,6 @@ defmodule BB.Ufactory.Actuator.JointTest do
       BB.Process
       |> expect(:call, fn TestRobot, :xarm, :get_ets -> ets end)
       |> expect(:call, fn TestRobot, :xarm, :get_model_config -> @model_config end)
-
-      BB
-      |> stub(:subscribe, fn TestRobot, [:actuator, :j2, :motor] -> :ok end)
 
       opts = [bb: %{robot: TestRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
       assert {:ok, state} = Joint.init(opts)
@@ -91,16 +89,13 @@ defmodule BB.Ufactory.Actuator.JointTest do
         TestRobot, :xarm, :get_model_config -> @model_config
       end)
 
-      BB
-      |> stub(:subscribe, fn TestRobot, _path -> :ok end)
-
       # Joint 1 should have ±2π limits
       opts = [bb: %{robot: TestRobot, path: [:j1, :motor]}, joint: 1, controller: :xarm]
       assert {:ok, state} = Joint.init(opts)
       assert state.limits == {-@two_pi, @two_pi}
     end
 
-    test "subscribes to its own command topic for pubsub delivery" do
+    test "narrows the model limits by the injected motor profile" do
       ets = make_ets()
 
       BB.Process
@@ -109,8 +104,82 @@ defmodule BB.Ufactory.Actuator.JointTest do
         TestRobot, :xarm, :get_model_config -> @model_config
       end)
 
+      # bb builds this from the robot topology's `limit do ... end` block —
+      # a user-narrowed range must be enforced by the clamp.
+      profile = %BB.Actuator.MotorProfile{motor_lower: -1.0, motor_upper: 1.5}
+
+      opts = [
+        bb: %{robot: TestRobot, path: [:j2, :motor]},
+        joint: 2,
+        controller: :xarm,
+        motor_profile: profile
+      ]
+
+      assert {:ok, state} = Joint.init(opts)
+      assert state.limits == {-1.0, 1.5}
+    end
+
+    test "a motor profile wider than the model limits does not widen them" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      profile = %BB.Actuator.MotorProfile{motor_lower: -100.0, motor_upper: 100.0}
+
+      opts = [
+        bb: %{robot: TestRobot, path: [:j2, :motor]},
+        joint: 2,
+        controller: :xarm,
+        motor_profile: profile
+      ]
+
+      assert {:ok, state} = Joint.init(opts)
+      assert state.limits == {@j2_lower, @j2_upper}
+    end
+
+    test "refuses a robot that declares a transmission on the actuator" do
+      defmodule TransmissionRobot do
+        # Minimal robot/0 shape — init only reads .actuators[name].transmission.
+        def robot do
+          %{actuators: %{motor: %{name: :motor, joint: :j2, transmission: %{reduction: 2.0}}}}
+        end
+      end
+
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TransmissionRobot, :xarm, :get_ets -> ets
+        TransmissionRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      opts = [bb: %{robot: TransmissionRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
+
+      # bb hands handle_command MOTOR-space values, but this driver streams
+      # joint angles to the firmware — a non-identity transmission would be
+      # silently wrong on every command.
+      assert {:stop, {:unsupported_transmission, :motor}} = Joint.init(opts)
+    end
+
+    test "does not subscribe to its own command topic (BB.Actuator.Server owns it)" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      # A manual subscription would double-deliver every pubsub command: the
+      # framework's server already subscribes and dispatches to
+      # handle_command/2. Mimic raises here if BB.subscribe is called.
       BB
-      |> expect(:subscribe, fn TestRobot, [:actuator, :j2, :motor] -> :ok end)
+      |> reject(:subscribe, 2)
+      |> reject(:subscribe, 3)
 
       opts = [bb: %{robot: TestRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
       assert {:ok, _state} = Joint.init(opts)
@@ -132,35 +201,49 @@ defmodule BB.Ufactory.Actuator.JointTest do
     end
   end
 
-  # ── handle_cast position commands ────────────────────────────────────────────
+  # ── capabilities/1 and command_payloads/1 ────────────────────────────────────
 
-  describe "handle_cast({:command, %Command.Position{}}, state)" do
+  describe "capabilities/1" do
+    test "declares position and effort feedback (controller publishes JointState)" do
+      assert Joint.capabilities([]) == [:position_feedback, :effort_feedback]
+    end
+  end
+
+  describe "command_payloads/1" do
+    test "declares Position, Stop, and Hold" do
+      assert Joint.command_payloads([]) == [Command.Position, Command.Stop, Command.Hold]
+    end
+  end
+
+  # ── handle_command: Command.Position ─────────────────────────────────────────
+
+  describe "handle_command(%Command.Position{}, state)" do
     test "writes set_position to ETS for an in-range position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.5, 0.1, nil})
+      :ets.insert(ets, {2, 0.5, 0.1, nil, nil})
       state = make_state(ets)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(1.0)
-      assert {:noreply, ^state} = Joint.handle_cast({:command, msg}, state)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
 
-      assert [{2, 0.5, 0.1, 1.0}] = :ets.lookup(ets, 2)
+      assert [{2, 0.5, 0.1, 1.0, nil}] = :ets.lookup(ets, 2)
     end
 
     test "preserves current_position and current_torque when writing set_position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.3, 0.05, nil})
+      :ets.insert(ets, {2, 0.3, 0.05, nil, nil})
       state = make_state(ets)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(1.5)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
 
-      [{2, cur_pos, cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, cur_pos, cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert cur_pos == 0.3
       assert cur_torq == 0.05
       assert set_pos == 1.5
@@ -174,9 +257,9 @@ defmodule BB.Ufactory.Actuator.JointTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(@j2_upper + 1.0)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_upper, 0.0001
     end
 
@@ -188,15 +271,15 @@ defmodule BB.Ufactory.Actuator.JointTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(@j2_lower - 1.0)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_lower, 0.0001
     end
 
     test "publishes BeginMotion with correct initial_position, target_position, expected_arrival" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, nil})
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
       state = make_state(ets)
 
       test_pid = self()
@@ -212,7 +295,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(1.0)
 
       before_ms = System.monotonic_time(:millisecond)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
       after_ms = System.monotonic_time(:millisecond)
 
       assert_receive {:begin_motion, bm}, 500
@@ -237,7 +320,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       end)
 
       msg = position_msg(0.5)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.initial_position, 0.5, 0.0001
@@ -257,54 +340,121 @@ defmodule BB.Ufactory.Actuator.JointTest do
       end)
 
       msg = position_msg(0.5, command_id: ref)
-      Joint.handle_cast({:command, msg}, state)
+      Joint.handle_command(msg, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert bm.command_id == ref
     end
   end
 
-  # ── handle_info pubsub delivery ──────────────────────────────────────────────
-
-  describe "handle_info({:bb, [:actuator | path], %Command.Position{}}, state)" do
-    test "applies the same position command logic as handle_cast" do
-      ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, nil})
-      state = make_state(ets)
-
-      test_pid = self()
-
-      BB
-      |> expect(:publish, fn _robot, _path, %Message{payload: %BeginMotion{} = bm} ->
-        send(test_pid, {:begin_motion, bm})
-        :ok
-      end)
-
-      msg = position_msg(1.0)
-      assert {:noreply, ^state} = Joint.handle_info({:bb, [:actuator, :j2, :motor], msg}, state)
-
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
-      assert_in_delta set_pos, 1.0, 0.0001
-      assert_receive {:begin_motion, _bm}, 500
-    end
-
-    test "clamps positions in the pubsub path the same as in the cast path" do
-      ets = make_ets()
-      state = make_state(ets)
-
+  describe "velocity hints" do
+    setup do
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
-      msg = position_msg(@j2_upper + 5.0)
-      Joint.handle_info({:bb, [:actuator, :j2, :motor], msg}, state)
-
-      [{2, _cur_pos, _cur_torq, set_pos}] = :ets.lookup(ets, 2)
-      assert_in_delta set_pos, @j2_upper, 0.0001
+      :ok
     end
 
-    test "ignores unrecognised messages" do
+    test "stores the velocity hint alongside the target" do
+      ets = make_ets()
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
+      state = make_state(ets)
+
+      msg = position_msg(1.0, velocity: 0.25)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, +0.0, +0.0, 1.0, 0.25}] = :ets.lookup(ets, 2)
+    end
+
+    test "a hint-less command clears a previous velocity hint" do
+      ets = make_ets()
+      :ets.insert(ets, {2, 0.0, 0.0, 0.5, 0.25})
+      state = make_state(ets)
+
+      assert {:noreply, ^state} = Joint.handle_command(position_msg(1.0), state)
+
+      assert [{2, +0.0, +0.0, 1.0, nil}] = :ets.lookup(ets, 2)
+    end
+
+    test "Stop's brake latch clears the velocity hint" do
+      ets = make_ets()
+      # Slow move in progress: braking must happen at full model speed, not
+      # at the leisurely pace the interrupted move requested.
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, 0.1})
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Stop, :motor, mode: :immediate)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+    end
+  end
+
+  describe "handle_command with an undeclared payload" do
+    test "replies {:error, {:unsupported_command, module}}" do
+      # Unreachable through the pipeline (command_payloads gates first);
+      # pins the defensive fallback for direct callers.
       state = make_state(make_ets())
-      assert {:noreply, ^state} = Joint.handle_info(:unexpected, state)
+      msg = Message.new!(Command.Velocity, :motor, velocity: 1.0)
+
+      assert {:reply, {:error, {:unsupported_command, Command.Velocity}}, ^state} =
+               Joint.handle_command(msg, state)
+    end
+  end
+
+  # ── handle_command: Command.Stop ─────────────────────────────────────────────
+
+  describe "handle_command(%Command.Stop{}, state)" do
+    test "latches the current reported position as the target" do
+      ets = make_ets()
+      # Joint travelling: current 0.7, commanded target 1.5
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, nil})
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Stop, :motor, mode: :immediate)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      # Target becomes the current position, so the 100 Hz loop brakes there.
+      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+    end
+
+    test "clears the pending target when no report frame has arrived yet" do
+      ets = make_ets()
+      # set_position written, but current_position never reported: the loop
+      # has been skipping ticks, so nothing was dispatched.
+      :ets.insert(ets, {2, nil, nil, 1.5, nil})
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Stop, :motor, mode: :immediate)
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
+    end
+  end
+
+  # ── handle_command: Command.Hold ─────────────────────────────────────────────
+
+  describe "handle_command(%Command.Hold{}, state)" do
+    test "latches the current reported position as the target" do
+      ets = make_ets()
+      :ets.insert(ets, {2, -0.4, 0.0, 1.0, nil})
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Hold, :motor, [])
+      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+
+      assert [{2, -0.4, +0.0, -0.4, nil}] = :ets.lookup(ets, 2)
+    end
+
+    test "refuses when the current position is unknown" do
+      ets = make_ets()
+      state = make_state(ets)
+
+      msg = Message.new!(Command.Hold, :motor, [])
+      assert {:reply, {:error, :position_unknown}, ^state} = Joint.handle_command(msg, state)
+
+      # Nothing written
+      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
     end
   end
 

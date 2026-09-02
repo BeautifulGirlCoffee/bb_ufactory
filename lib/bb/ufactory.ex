@@ -39,7 +39,23 @@ defmodule BB.Ufactory do
   which provides the complete six-joint topology and only requires a host address:
 
       defmodule MyRobot do
-        use BB.Ufactory.Robots.XArm6
+        use BB.Ufactory.Robots.XArm6, host: "192.168.1.111"
+      end
+
+  Accessories and controller configuration are options of the same macro
+  (`gripper:`, `linear_track:`, `controller:`) — see
+  `BB.Ufactory.Robots.XArm6` for the full list.
+
+  ## Full Robot Definition Example
+
+  For a topology `use BB.Ufactory.Robots.XArm6` cannot express (renamed
+  joints, the arm composed into a larger robot), define it with `use BB`
+  directly. Accessory actuators (Cartesian, gripper, linear track) hang off
+  **fixed mount joints** — bb's DSL only allows actuators under joints:
+
+      defmodule MyRobot do
+        use BB
+        import BB.Unit
 
         controllers do
           controller :xarm, {BB.Ufactory.Controller,
@@ -48,133 +64,76 @@ defmodule BB.Ufactory do
             loop_hz: 100
           }
         end
-      end
-
-  ## Full Robot Definition Example
-
-  For custom topologies or to add accessories, define the robot with `use BB`
-  directly. The example below combines all available components:
-
-      defmodule MyRobot do
-        use BB
-        import BB.Unit
-
-        controller :xarm, {BB.Ufactory.Controller,
-          host: "192.168.1.111",
-          model: :xarm6,
-          loop_hz: 100
-        }
 
         topology do
           link :base do
             joint :j1 do
               type :revolute
+
               limit do
                 lower ~u(-360 degree)
                 upper ~u(360 degree)
                 effort ~u(50 newton_meter)
                 velocity ~u(180 degree_per_second)
               end
+
               actuator :j1_motor, {BB.Ufactory.Actuator.Joint, joint: 1, controller: :xarm}
 
               link :link1 do
-                joint :j2 do
-                  type :revolute
-                  limit do
-                    lower ~u(-118 degree)
-                    upper ~u(120 degree)
-                    effort ~u(50 newton_meter)
-                    velocity ~u(180 degree_per_second)
+                # ... joints j2–j6 nest here exactly like j1, ending in :link6.
+                # Copy the full chain (with per-joint limits) from the source
+                # of BB.Ufactory.Robots.XArm6.
+
+                joint :cartesian_mount do
+                  type :fixed
+
+                  # Optional: Cartesian actuator — commands end-effector pose
+                  actuator :cartesian, {BB.Ufactory.Actuator.Cartesian,
+                    controller: :xarm,
+                    speed: 100.0,
+                    acceleration: 2000.0
+                  }
+
+                  link :cartesian_body do
                   end
-                  actuator :j2_motor, {BB.Ufactory.Actuator.Joint, joint: 2, controller: :xarm}
+                end
 
-                  link :link2 do
-                    joint :j3 do
-                      type :revolute
-                      limit do
-                        lower ~u(-225 degree)
-                        upper ~u(11 degree)
-                        effort ~u(32 newton_meter)
-                        velocity ~u(180 degree_per_second)
-                      end
-                      actuator :j3_motor, {BB.Ufactory.Actuator.Joint, joint: 3, controller: :xarm}
+                joint :gripper_mount do
+                  type :fixed
 
-                      link :link3 do
-                        joint :j4 do
-                          type :revolute
-                          limit do
-                            lower ~u(-360 degree)
-                            upper ~u(360 degree)
-                            effort ~u(32 newton_meter)
-                            velocity ~u(180 degree_per_second)
-                          end
-                          actuator :j4_motor, {BB.Ufactory.Actuator.Joint, joint: 4, controller: :xarm}
+                  # Optional: Gripper G2 — position in pulse units (0–850)
+                  actuator :gripper, {BB.Ufactory.Actuator.Gripper,
+                    controller: :xarm,
+                    speed: 1500
+                  }
 
-                          link :link4 do
-                            joint :j5 do
-                              type :revolute
-                              limit do
-                                lower ~u(-97 degree)
-                                upper ~u(180 degree)
-                                effort ~u(32 newton_meter)
-                                velocity ~u(180 degree_per_second)
-                              end
-                              actuator :j5_motor, {BB.Ufactory.Actuator.Joint, joint: 5, controller: :xarm}
-
-                              link :link5 do
-                                joint :j6 do
-                                  type :revolute
-                                  limit do
-                                    lower ~u(-360 degree)
-                                    upper ~u(360 degree)
-                                    effort ~u(20 newton_meter)
-                                    velocity ~u(180 degree_per_second)
-                                  end
-                                  actuator :j6_motor, {BB.Ufactory.Actuator.Joint, joint: 6, controller: :xarm}
-
-                                  link :link6 do
-                                  end
-                                end
-                              end
-                            end
-                          end
-                        end
-                      end
-                    end
+                  link :gripper_body do
                   end
                 end
               end
             end
 
-            # Optional: Cartesian actuator — commands end-effector pose directly
-            actuator :cartesian, {BB.Ufactory.Actuator.Cartesian,
-              controller: :xarm,
-              speed: 100.0,
-              acceleration: 2000.0
-            }
+            joint :track_mount do
+              type :fixed
 
-            # Optional: Gripper G2 — position in pulse units (0–840)
-            actuator :gripper, {BB.Ufactory.Actuator.Gripper,
-              controller: :xarm,
-              speed: 1500
-            }
+              # Optional: Linear track — position in millimetres
+              actuator :track, {BB.Ufactory.Actuator.LinearTrack,
+                controller: :xarm,
+                speed: 200
+              }
 
-            # Optional: Linear track — position in millimetres
-            actuator :track, {BB.Ufactory.Actuator.LinearTrack,
-              controller: :xarm,
-              speed: 200
-            }
+              link :track_body do
+              end
+            end
           end
         end
 
         sensors do
           # Optional: UFactory Force/Torque sensor — publishes BB.Ufactory.Message.Wrench
-          sensor :wrench, {BB.Ufactory.Sensor.ForceTorque,
-            controller: :xarm,
-            poll_interval_ms: 20
-          }
+          sensor :wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm}
         end
       end
+
 
   ## Module Inventory
 
@@ -187,9 +146,9 @@ defmodule BB.Ufactory do
   | `BB.Ufactory.Model` | Per-model joint counts and limits (xArm5/6/7, Lite6, xArm850) |
   | `BB.Ufactory.Actuator.Joint` | `BB.Actuator` — joint-space position via ETS + 100 Hz loop |
   | `BB.Ufactory.Actuator.Cartesian` | `BB.Actuator` — Cartesian end-effector pose via `MOVE_LINE` |
-  | `BB.Ufactory.Actuator.Gripper` | `BB.Actuator` — Gripper G2 position (pulse units 0–840) |
+  | `BB.Ufactory.Actuator.Gripper` | `BB.Actuator` — Gripper G2 position (pulse units 0–850) |
   | `BB.Ufactory.Actuator.LinearTrack` | `BB.Actuator` — linear track position in mm (RS485 proxy) |
-  | `BB.Ufactory.Sensor.ForceTorque` | `BB.Sensor` — polls register 0xC8, publishes `Wrench` |
+  | `BB.Ufactory.Sensor.ForceTorque` | `BB.Sensor` — forwards report-stream F/T data, publishes `Wrench` |
   | `BB.Ufactory.Message.ArmStatus` | State, mode, error/warning codes from the report socket |
   | `BB.Ufactory.Message.CartesianPose` | TCP pose (x/y/z/roll/pitch/yaw) from report socket |
   | `BB.Ufactory.Message.Wrench` | Fx/Fy/Fz/Tx/Ty/Tz from the F/T sensor |
@@ -203,8 +162,9 @@ defmodule BB.Ufactory do
   - **Angles on the wire are always radians.** BB also uses radians, so no conversion is needed.
   - **Mixed endianness:** u16 header fields are big-endian; fp32 payload fields are little-endian.
     The only exception is the linear track position, which is int32 big-endian.
-  - **Heartbeat:** The controller sends `<<0, 0, 0, 1, 0, 2, 0, 0>>` every second on the command
-    socket to keep the connection alive.
+  - **Heartbeat:** The controller sends a bare GET_STATE request
+    (`<<0, 0, 0, 2, 0, 1, 0x0D>>`) every second on the command socket to keep
+    the connection alive.
   - **Modbus-TCP variant:** The protocol identifier in the header is `0x0002` (not the standard
     Modbus `0x0000`). The developer manual is the authoritative spec.
   """

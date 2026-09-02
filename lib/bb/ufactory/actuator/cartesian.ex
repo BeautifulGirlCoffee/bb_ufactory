@@ -16,17 +16,35 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   ## Command Interface
 
-  Cartesian commands use a custom GenServer cast rather than the standard
-  scalar `%Command.Position{}` message (which only holds a single float).
-  Send commands via:
+  The actuator declares `BB.Ufactory.Message.Command.CartesianMove` via
+  `c:BB.Actuator.command_payloads/1`, so pose commands travel through BB's
+  gated command pipeline (armed check, refusals reaching the caller):
 
-      BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
+      alias BB.Ufactory.Message.Command.CartesianMove
+
+      msg = BB.Message.new!(CartesianMove, :tcp,
+        x: 300.0, y: 0.0, z: 400.0, roll: 3.14159, pitch: 0.0, yaw: 0.0)
+
+      # Synchronous — learn whether the arm accepted the command:
+      {:ok, :accepted} = BB.call(MyRobot, :tcp, {:command, msg})
+
+      # Fire-and-forget:
+      BB.cast(MyRobot, :tcp, {:command, msg})
 
   - `x`, `y`, `z` — position in **millimetres**
   - `roll`, `pitch`, `yaw` — orientation in **radians**
 
-  Speed and acceleration default to the values configured in `options_schema`
-  and can be overridden per-command by passing `{:move_cartesian, pose, speed, accel}`.
+  `speed` and `acceleration` default to the values configured in
+  `options_schema` and can be overridden per-command in the payload.
+
+  ### Legacy cast interface (deprecated)
+
+  The pre-0.2 raw cast is still accepted for backwards compatibility: it
+  logs a deprecation warning on every use and is **dropped when the robot
+  is not armed** — prefer `CartesianMove`:
+
+      BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
+      BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, speed, accel})
   """
 
   use BB.Actuator,
@@ -52,6 +70,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
+  alias BB.Ufactory.Message.Command.CartesianMove
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -84,20 +103,79 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   @impl BB.Actuator
   def disarm(_opts), do: :ok
 
-  # ── Direct cast: {:move_cartesian, pose} ────────────────────────────────────
+  # ── Accepted command payloads ────────────────────────────────────────────────
+
+  # MOVE_LINE has no scoped stop: firmware state 4 halts the whole arm and
+  # clears every queued command, which would silently fight the 100 Hz joint
+  # streaming loop. Stopping the arm is the safety system's job (disarm), so
+  # only the pose command is declared here.
+  @impl BB.Actuator
+  def command_payloads(_opts), do: [CartesianMove]
+
+  # ── handle_command/2 — gated command pipeline ────────────────────────────────
+
+  @impl BB.Actuator
+  def handle_command(%Message{payload: %CartesianMove{} = cmd}, state) do
+    # The payload accepts integers for ergonomics (`x: 300`); normalize to
+    # floats before they reach the fp32 encoders.
+    pose = {
+      :erlang.float(cmd.x),
+      :erlang.float(cmd.y),
+      :erlang.float(cmd.z),
+      :erlang.float(cmd.roll),
+      :erlang.float(cmd.pitch),
+      :erlang.float(cmd.yaw)
+    }
+
+    speed = :erlang.float(cmd.speed || state.speed)
+    accel = :erlang.float(cmd.acceleration || state.acceleration)
+
+    case send_cartesian(pose, speed, accel, state) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_command(%Message{payload: payload}, state) do
+    {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
+  end
+
+  # ── Legacy direct cast: {:move_cartesian, pose} ─────────────────────────────
+  #
+  # Deprecated: prefer the CartesianMove payload. bb's command pipeline never
+  # sees these casts, so the armed check is enforced HERE — without it, a
+  # disarmed robot would happily execute a MOVE_LINE (disarm_action :hold
+  # sends no SET_STATE 4, so the firmware remains motion-ready).
 
   @impl BB.Actuator
   def handle_cast({:move_cartesian, {_x, _y, _z, _roll, _pitch, _yaw} = pose}, state) do
-    send_cartesian(pose, state.speed, state.acceleration, state)
+    legacy_cast_move(pose, state.speed, state.acceleration, state)
     {:noreply, state}
   end
 
   def handle_cast({:move_cartesian, pose, speed, accel}, state) do
-    send_cartesian(pose, speed * 1.0, accel * 1.0, state)
+    legacy_cast_move(pose, speed * 1.0, accel * 1.0, state)
     {:noreply, state}
   end
 
   def handle_cast(_request, state), do: {:noreply, state}
+
+  defp legacy_cast_move(pose, speed, accel, state) do
+    if BB.Safety.armed?(state.bb.robot) do
+      Logger.warning(
+        "[BB.Ufactory.Actuator.Cartesian] {:move_cartesian, ...} casts are deprecated — " <>
+          "send a BB.Ufactory.Message.Command.CartesianMove through the command pipeline"
+      )
+
+      send_cartesian(pose, speed, accel, state)
+    else
+      Logger.warning(
+        "[BB.Ufactory.Actuator.Cartesian] Dropped {:move_cartesian, ...} cast: robot is not armed"
+      )
+
+      :ok
+    end
+  end
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
@@ -107,9 +185,11 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
       :ok ->
         publish_begin_motion(pose, speed, state)
+        :ok
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning("[BB.Ufactory.Actuator.Cartesian] send_command failed: #{inspect(reason)}")
+        error
     end
   end
 

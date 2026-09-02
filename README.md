@@ -24,7 +24,7 @@ a real-time report socket (port 30003) that pushes joint state at ~100Hz.
 
 - **Joint-space motion** — Command individual joints; batched at 100Hz via ETS
 - **Cartesian-space motion** — Command end-effector pose directly; IK solved on-arm
-- **Gripper support** — Gripper G2 position control (0–840 mm)
+- **Gripper support** — Gripper G2 position control (pulse units 0–850)
 - **Force/torque sensor** — F/T data streamed from 135-byte report frames (Fx/Fy/Fz/Tx/Ty/Tz)
 - **Collision detection** — Configurable sensitivity, rebound, and self-collision check; publishes collision events
 - **Linear track** — RS485-proxied linear axis position control
@@ -49,7 +49,7 @@ Add `bb_ufactory` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:bb_ufactory, "~> 0.1.0"}
+    {:bb_ufactory, "~> 0.2"}
   ]
 end
 ```
@@ -57,27 +57,21 @@ end
 ## Requirements
 
 - UFactory xArm arm connected via Ethernet
-- BB framework (`~> 0.22`)
+- BB framework (`~> 0.31`)
 
 ## Usage
 
 ### Quick Start with the Pre-Built xArm6 Robot
 
 `BB.Ufactory.Robots.XArm6` provides a ready-made robot definition with correct joint
-limits, effort values, and actuator wiring. Use it as a base and override the controller
-host:
+limits, effort values, and actuator wiring. Use it as a base and pass your arm's
+address (and any accessories) as options:
 
 ```elixir
 defmodule MyRobot do
-  use BB.Ufactory.Robots.XArm6
-
-  controllers do
-    controller :xarm, {BB.Ufactory.Controller,
-      host: "192.168.1.111",
-      model: :xarm6,
-      loop_hz: 100
-    }
-  end
+  use BB.Ufactory.Robots.XArm6,
+    host: "192.168.1.111",
+    gripper: true               # optional; also :linear_track
 end
 ```
 
@@ -125,13 +119,23 @@ end
 ### Joint-Space Motion
 
 ```elixir
-BB.Actuator.set_position(MyRobot, [:base, :j1, :j1_motor], 0.5)
+# Synchronous (bb >= 0.30): returns :ok, or {:error, reason} on refusal
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, 0.5)
+
+# Brake a joint at its current position / actively hold it there
+BB.Actuator.stop(MyRobot, :j1_motor)
+BB.Actuator.hold(MyRobot, :j1_motor)
 ```
 
 ### Cartesian Motion
 
 ```elixir
-BB.Actuator.set_position(MyRobot, [:cartesian, :tcp], {300.0, 0.0, 400.0, 0.0, 0.0, 0.0})
+alias BB.Ufactory.Message.Command.CartesianMove
+
+msg = BB.Message.new!(CartesianMove, :cartesian,
+  x: 300.0, y: 0.0, z: 400.0, roll: 0.0, pitch: 0.0, yaw: 0.0)
+
+BB.call(MyRobot, :cartesian, {:command, msg})
 ```
 
 ### Subscribing to State
@@ -183,7 +187,7 @@ BB.subscribe(MyRobot, [:sensor, :collision])
 |--------|-------------|
 | `BB.Ufactory.Actuator.Joint` | Joint-space position (radians), via ETS + 100Hz loop |
 | `BB.Ufactory.Actuator.Cartesian` | Cartesian pose (mm + radians), direct command |
-| `BB.Ufactory.Actuator.Gripper` | Gripper G2 position (0–840 mm) |
+| `BB.Ufactory.Actuator.Gripper` | Gripper G2 position (pulse units 0–850) |
 | `BB.Ufactory.Actuator.LinearTrack` | Linear track position (mm), RS485-proxied |
 
 ### Sensors

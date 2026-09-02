@@ -256,9 +256,11 @@ end
 
 # ── Joint wave — small movements through each joint ─────────────────────────
 #
-# BB.Actuator.set_position! sends a position command directly to the named
-# actuator. The Joint actuator clamps to limits, writes to ETS, and the
-# controller's 100 Hz loop batches into protocol frames automatically.
+# BB.Actuator.set_position sends a position command to the named actuator and
+# waits for it to be accepted (bb >= 0.30 made it synchronous, so a refusal
+# would surface here as {:error, reason}). The Joint actuator clamps to
+# limits, writes to ETS, and the controller's 100 Hz loop batches into
+# protocol frames automatically.
 
 offsets = [
   {:j1_motor, 0.10},
@@ -293,11 +295,11 @@ for {motor, offset} <- offsets do
   target = initial + offset
 
   log.("  #{motor} → #{Float.round(target, 4)} rad (+#{offset})")
-  BB.Actuator.set_position!(DemoRobot, motor, target)
+  BB.Actuator.set_position(DemoRobot, motor, target)
   Process.sleep(1_500)
 
   log.("  #{motor} → #{Float.round(initial, 4)} rad (return)")
-  BB.Actuator.set_position!(DemoRobot, motor, initial)
+  BB.Actuator.set_position(DemoRobot, motor, initial)
   Process.sleep(1_500)
 end
 
@@ -306,43 +308,43 @@ log.("Joint wave complete.")
 # ── Gripper ──────────────────────────────────────────────────────────────────
 #
 # The gripper is wired into the topology as a prismatic joint with actuator
-# name :gripper. BB.Actuator.set_position! sends a Command.Position directly
+# name :gripper. BB.Actuator.set_position sends a Command.Position
 # to the Gripper actuator, which converts to a protocol frame and sends
 # through the controller. Position is in pulse units (0 = closed, 840 = open).
 
 log.("Opening gripper...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 840.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 840.0)
 Process.sleep(1_500)
 
 log.("Closing gripper...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 0.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 0.0)
 Process.sleep(1_500)
 
 log.("Opening gripper...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 840.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 840.0)
 Process.sleep(1_500)
 
 # ── Linear track ─────────────────────────────────────────────────────────────
 #
 # The linear track is wired as a prismatic joint at the base of the chain.
-# BB.Actuator.set_position! sends the target position in mm.
+# BB.Actuator.set_position sends the target position in mm.
 # The LinearTrack actuator reads current position, sends speed + position
 # frames through the controller, and publishes BeginMotion with real travel
 # distance — all from a single function call.
 
 log.("Closing gripper for travel...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 0.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 0.0)
 Process.sleep(1_500)
 
 log.("Moving track 50 mm forward...")
 BB.subscribe(DemoRobot, [:actuator])
 
 # Read current track position from the actuator's initial_position in BeginMotion
-BB.Actuator.set_position!(DemoRobot, :linear_track, 950.0)
+BB.Actuator.set_position(DemoRobot, :linear_track, 950.0)
 Process.sleep(3_000)
 
 log.("Moving track back...")
-BB.Actuator.set_position!(DemoRobot, :linear_track, 900.0)
+BB.Actuator.set_position(DemoRobot, :linear_track, 900.0)
 Process.sleep(3_000)
 
 # ── Multi-joint simultaneous movement ────────────────────────────────────────
@@ -359,7 +361,7 @@ log.("Starting multi-joint simultaneous movement...")
 for {motor, offset} <- Enum.zip(motors, multi_offsets) do
   joint_name = Map.fetch!(joint_name_for_motor, motor)
   initial = Map.get(initial_positions, joint_name, 0.0)
-  BB.Actuator.set_position!(DemoRobot, motor, initial + offset)
+  BB.Actuator.set_position(DemoRobot, motor, initial + offset)
 end
 
 log.("  All 6 joints shifted simultaneously")
@@ -368,7 +370,7 @@ Process.sleep(2_000)
 for motor <- motors do
   joint_name = Map.fetch!(joint_name_for_motor, motor)
   initial = Map.get(initial_positions, joint_name, 0.0)
-  BB.Actuator.set_position!(DemoRobot, motor, initial)
+  BB.Actuator.set_position(DemoRobot, motor, initial)
 end
 
 log.("  All 6 joints returned simultaneously")
@@ -378,8 +380,8 @@ log.("Multi-joint move complete.")
 # ── Cartesian motion ────────────────────────────────────────────────────────
 #
 # The Cartesian actuator commands the whole arm in task space (x,y,z,r,p,y)
-# using the arm's built-in IK solver. It's wired as a second actuator on
-# the j6 joint and accessed via BB.Process.cast.
+# using the arm's built-in IK solver, driven through BB's gated command
+# pipeline with a CartesianMove payload (see `move` below).
 
 BB.subscribe(DemoRobot, [:sensor, :xarm, :tcp_pose])
 Process.sleep(100)
@@ -402,21 +404,29 @@ if pose do
 
   log.("  Moving TCP +20mm X, +20mm Y...")
 
-  BB.Process.cast(
-    DemoRobot,
-    :cartesian,
-    {:move_cartesian, {pose.x + 20.0, pose.y + 20.0, pose.z, pose.roll, pose.pitch, pose.yaw}}
-  )
+  # CartesianMove travels through BB's gated command pipeline: the robot must
+  # be armed, and the synchronous call reports whether the arm accepted it.
+  move = fn x, y, z, roll, pitch, yaw ->
+    msg =
+      BB.Message.new!(BB.Ufactory.Message.Command.CartesianMove, :cartesian,
+        x: x,
+        y: y,
+        z: z,
+        roll: roll,
+        pitch: pitch,
+        yaw: yaw
+      )
+
+    BB.call(DemoRobot, :cartesian, {:command, msg})
+  end
+
+  move.(pose.x + 20.0, pose.y + 20.0, pose.z, pose.roll, pose.pitch, pose.yaw)
 
   Process.sleep(2_000)
 
   log.("  Returning TCP to original position...")
 
-  BB.Process.cast(
-    DemoRobot,
-    :cartesian,
-    {:move_cartesian, {pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw}}
-  )
+  move.(pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw)
 
   Process.sleep(2_000)
   log.("Cartesian motion complete.")
@@ -427,11 +437,11 @@ end
 # ── Final gripper flourish ──────────────────────────────────────────────────
 
 log.("Opening gripper...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 840.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 840.0)
 Process.sleep(1_000)
 
 log.("Closing gripper...")
-BB.Actuator.set_position!(DemoRobot, :gripper, 0.0)
+BB.Actuator.set_position(DemoRobot, :gripper, 0.0)
 Process.sleep(1_000)
 
 # ── Read final positions ─────────────────────────────────────────────────────

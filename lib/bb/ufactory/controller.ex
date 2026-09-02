@@ -20,7 +20,7 @@ defmodule BB.Ufactory.Controller do
   actuators. Per-joint rows are keyed by joint index (1-based integer):
 
       {joint_index, current_position :: float | nil, current_torque :: float | nil,
-       set_position :: float | nil}
+       set_position :: float | nil, set_velocity :: float | nil}
 
   The arm-level row is keyed by `:arm`:
 
@@ -135,6 +135,24 @@ defmodule BB.Ufactory.Controller do
           "Enable the Cartesian workspace fence defined by `tcp_boundary`. " <>
             "Has no effect if `tcp_boundary` is nil (register 0x3B)."
       ],
+      report_stale_ms: [
+        type: :pos_integer,
+        default: 250,
+        doc:
+          "Maximum age of the last report frame before the 100 Hz loop stops " <>
+            "dispatching joint moves. Reports are pushed at ~100 Hz, so stale " <>
+            "feedback means the loop would command the arm blind — joints " <>
+            "without an explicit target get re-driven to their last-known angle."
+      ],
+      feedback_loss_fatal_ms: [
+        type: :pos_integer,
+        default: 3_000,
+        doc:
+          "How long the loop may keep skipping ticks on stale feedback (while " <>
+            "armed with motion pending) before the controller stops and reports " <>
+            "to `BB.Safety` — so a dead report link cannot leave the robot " <>
+            "armed and blind indefinitely."
+      ],
       auto_clear_errors: [
         type: :boolean,
         default: true,
@@ -168,6 +186,7 @@ defmodule BB.Ufactory.Controller do
 
   alias BB.Error.Protocol.Ufactory.ConnectionError
   alias BB.Error.Protocol.Ufactory.HardwareFault
+  alias BB.Loop
   alias BB.Message
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
@@ -209,7 +228,20 @@ defmodule BB.Ufactory.Controller do
               :hold -> Protocol.cmd_enable(0, false)
             end
 
-          :gen_tcp.send(sock, frame)
+          # Last-resort safety path: wait briefly for the firmware's response
+          # so the log distinguishes a delivered stop from a dropped one.
+          # Failures are still swallowed — this callback must never raise.
+          with :ok <- :gen_tcp.send(sock, frame),
+               {:ok, _ack} <- :gen_tcp.recv(sock, 0, 500) do
+            :ok
+          else
+            {:error, reason} ->
+              Logger.warning(
+                "[BB.Ufactory.Controller] Out-of-band disarm (#{disarm_action}) to " <>
+                  "#{host}:#{port} unconfirmed: #{inspect(reason)}"
+              )
+          end
+
           :gen_tcp.close(sock)
 
         {:error, _reason} ->
@@ -236,7 +268,6 @@ defmodule BB.Ufactory.Controller do
     disarm_action = Keyword.get(opts, :disarm_action, :stop)
 
     model_config = Model.get(model)
-    loop_interval_ms = max(1, div(1_000, loop_hz))
     controller_name = List.last(bb.path)
 
     charlist_host = String.to_charlist(host)
@@ -263,7 +294,12 @@ defmodule BB.Ufactory.Controller do
 
       BB.subscribe(bb.robot, [:state_machine])
 
-      Process.send_after(self(), :loop, loop_interval_ms)
+      # BB.Loop schedules against absolute monotonic deadlines, so the
+      # control loop holds its configured rate rather than drifting by each
+      # tick's processing time, and overruns surface as [:bb, :loop, :tick]
+      # :skipped telemetry instead of a silent backlog of stale ticks.
+      loop = bb |> Loop.new(clock: {:rate, loop_hz}) |> Loop.arm()
+
       Process.send_after(self(), :heartbeat, heartbeat_interval_ms)
 
       state = %{
@@ -273,7 +309,7 @@ defmodule BB.Ufactory.Controller do
         report_port: report_port,
         model_config: model_config,
         controller_name: controller_name,
-        loop_interval_ms: loop_interval_ms,
+        loop: loop,
         heartbeat_interval_ms: heartbeat_interval_ms,
         disarm_action: disarm_action,
         cmd_socket: cmd_socket,
@@ -286,6 +322,11 @@ defmodule BB.Ufactory.Controller do
         reconnect_attempts: 0,
         report_reconnect_pending: false,
         move_skip_logged: false,
+        last_report_at: nil,
+        feedback_stale_since: nil,
+        feedback_stale_logged: false,
+        report_stale_ms: Keyword.get(opts, :report_stale_ms, 250),
+        feedback_loss_fatal_ms: Keyword.get(opts, :feedback_loss_fatal_ms, 3_000),
         arm_frames: [],
         auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
         error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
@@ -316,14 +357,22 @@ defmodule BB.Ufactory.Controller do
   # ── Control loop ─────────────────────────────────────────────────────────────
 
   @impl BB.Controller
-  def handle_info(:loop, state) do
+  def handle_info(:tick, state) do
+    # tick/1 re-arms the timer against the next absolute deadline before the
+    # work runs, so a slow tick delays nothing and whole missed periods are
+    # skipped rather than delivered back-to-back.
+    {_dt, _skipped, loop} = Loop.tick(state.loop)
+    state = %{state | loop: loop}
+
     case maybe_send_joint_move(state) do
       {:ok, state} ->
-        Process.send_after(self(), :loop, state.loop_interval_ms)
         {:noreply, state}
 
       {:fatal, reason, state} ->
         cmd_socket_fatal(reason, state)
+
+      {:feedback_loss, state} ->
+        feedback_loss_fatal(state)
     end
   end
 
@@ -467,21 +516,30 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
+  # While armed, the 100 Hz move stream keeps responses in flight that a
+  # pre-send drain cannot clear, so the reply is matched by REGISTER: frames
+  # for other registers are skipped, and partial frames are accumulated until
+  # the deadline. Without this, an RS485 read could consume a move-ack and
+  # refuse (e.g.) a linear-track Stop on a perfectly healthy link.
+  #
+  # The default timeout is deliberately tick-compatible: this call blocks the
+  # controller GenServer, and a multi-second wait would stall joint streaming
+  # while the robot stays armed.
+  @send_recv_timeout_ms 500
+
   def handle_call({:send_and_recv, frame}, from, state) do
-    handle_call({:send_and_recv, frame, 5_000}, from, state)
+    handle_call({:send_and_recv, frame, @send_recv_timeout_ms}, from, state)
   end
 
   def handle_call({:send_and_recv, frame, timeout}, _from, state) do
     drain_recv_buffer(state.cmd_socket)
     state = %{state | txn_id: next_txn(state.txn_id)}
+    <<_txn::16, _proto::16, _len::16, register::8, _::binary>> = frame
 
-    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
-         {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, timeout) do
-      {:reply, Protocol.parse_response(data), state}
-    else
-      # A recv timeout is a normal slow-response condition, not socket death.
-      {:error, :timeout} = error ->
-        {:reply, error, state}
+    case :gen_tcp.send(state.cmd_socket, frame) do
+      :ok ->
+        deadline = System.monotonic_time(:millisecond) + timeout
+        await_matching_response(state, register, <<>>, deadline)
 
       {:error, reason} = error ->
         {:stop, fatal_stop_reason(reason, state), error, state}
@@ -507,8 +565,13 @@ defmodule BB.Ufactory.Controller do
 
     if BB.Safety.armed?(state.bb.robot) do
       case send_frames(frames, state) do
-        {:ok, state} -> {:reply, :ok, state}
-        {:fatal, reason, state} -> {:stop, fatal_stop_reason(reason, state), :ok, state}
+        {:ok, state} ->
+          {:reply, :ok, state}
+
+        # The frames did NOT reach the arm — the accessory must not believe
+        # otherwise. The controller still stops (dead command socket).
+        {:fatal, reason, state} ->
+          {:stop, fatal_stop_reason(reason, state), {:error, reason}, state}
       end
     else
       {:reply, :ok, state}
@@ -531,6 +594,7 @@ defmodule BB.Ufactory.Controller do
 
   @impl BB.Controller
   def terminate(_reason, state) do
+    if state[:loop], do: Loop.cancel(state.loop)
     if state.cmd_socket, do: :gen_tcp.close(state.cmd_socket)
     if state.report_socket, do: :gen_tcp.close(state.report_socket)
     :ok
@@ -640,15 +704,19 @@ defmodule BB.Ufactory.Controller do
     # Build the ETS table name from known module atoms to avoid dynamic atom creation.
     table_name = Module.concat([robot, "Controller", controller_name])
 
+    # Always hand out the NAME, not a tid: actuators cache this handle, and
+    # name-based access survives a controller crash-restart (the restarted
+    # controller re-registers the name), while a stale tid would make every
+    # actuator ETS call raise. :ets.new/2 with :named_table returns the name.
     ets =
       case :ets.whereis(table_name) do
         :undefined -> :ets.new(table_name, [:public, :set, :named_table])
-        existing -> existing
+        _existing -> table_name
       end
 
     # Pre-populate per-joint rows
     for i <- 1..joint_count do
-      :ets.insert(ets, {i, nil, nil, nil})
+      :ets.insert(ets, {i, nil, nil, nil, nil})
     end
 
     # Arm-level row
@@ -662,30 +730,107 @@ defmodule BB.Ufactory.Controller do
     rows = for i <- 1..joint_count, do: :ets.lookup(state.ets, i)
     rows = List.flatten(rows)
 
-    pending? = Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos} -> set_pos != nil end)
+    pending? =
+      Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos != nil end)
 
-    if pending? and BB.Safety.armed?(state.bb.robot) do
-      positions =
-        Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} -> set_pos || cur_pos end)
+    cond do
+      not (pending? and BB.Safety.armed?(state.bb.robot)) ->
+        {:ok, %{state | feedback_stale_since: nil}}
 
-      # Never substitute a default for an unknown joint position: commanding
-      # 0.0 for joints whose current angle has not yet been reported would
-      # sweep the whole arm toward the zero pose. Skip the tick until a report
-      # frame has populated every joint.
-      if Enum.any?(positions, &is_nil/1) do
-        {:ok, log_move_skip_once(state)}
-      else
-        max_speed = state.model_config.max_speed_rads
-        # Use a conservative default for acceleration (rad/s²); the arm's own
-        # motion planner will further clamp this per its firmware configuration.
-        max_accel = max_speed * 10.0
+      feedback_stale?(state) ->
+        handle_stale_feedback(state)
 
-        frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
-        send_command(frame, %{state | move_skip_logged: false})
-      end
-    else
-      {:ok, state}
+      true ->
+        state = %{state | feedback_stale_since: nil, feedback_stale_logged: false}
+        dispatch_joint_move(rows, state)
     end
+  end
+
+  defp dispatch_joint_move(rows, state) do
+    positions =
+      Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos || cur_pos end)
+
+    # Never substitute a default for an unknown joint position: commanding
+    # 0.0 for joints whose current angle has not yet been reported would
+    # sweep the whole arm toward the zero pose. Skip the tick until a report
+    # frame has populated every joint.
+    if Enum.any?(positions, &is_nil/1) do
+      {:ok, log_move_skip_once(state)}
+    else
+      speed = batch_speed(rows, state.model_config.max_speed_rads)
+      # Acceleration scales with the commanded speed (rad/s²); the arm's own
+      # motion planner will further clamp this per its firmware configuration.
+      accel = speed * 10.0
+
+      frame = Protocol.cmd_move_joints(state.txn_id, positions, speed, accel)
+      send_command(frame, %{state | move_skip_logged: false})
+    end
+  end
+
+  # cmd_move_joints takes a single speed for the whole batch, so honor the
+  # SLOWEST pending velocity hint (a faster joint can only be as slow as
+  # asked, never faster than allowed). Hints are clamped into (0, max_speed].
+  defp batch_speed(rows, max_speed) do
+    rows
+    |> Enum.map(fn {_i, _cur_pos, _cur_torq, _set_pos, set_vel} -> set_vel end)
+    |> Enum.filter(&is_number/1)
+    |> case do
+      [] -> max_speed
+      hints -> hints |> Enum.min() |> max(0.01) |> min(max_speed)
+    end
+  end
+
+  # Reports are pushed at ~100 Hz, so feedback is stale when the report socket
+  # is down or no frame has arrived within report_stale_ms. Streaming moves
+  # against frozen positions would command the arm blind: joints without an
+  # explicit target are re-driven to their last-known (possibly wrong) angle.
+  defp feedback_stale?(state) do
+    state.report_socket == nil or state.last_report_at == nil or
+      System.monotonic_time(:millisecond) - state.last_report_at > state.report_stale_ms
+  end
+
+  defp handle_stale_feedback(state) do
+    now = System.monotonic_time(:millisecond)
+    since = state.feedback_stale_since || now
+    state = %{state | feedback_stale_since: since}
+
+    if now - since >= state.feedback_loss_fatal_ms do
+      {:feedback_loss, state}
+    else
+      {:ok, log_feedback_stale_once(state)}
+    end
+  end
+
+  defp log_feedback_stale_once(%{feedback_stale_logged: true} = state), do: state
+
+  defp log_feedback_stale_once(state) do
+    Logger.warning(
+      "[BB.Ufactory.Controller] Skipping joint moves for #{state.controller_name}: " <>
+        "report feedback stale (socket down or no frame within #{state.report_stale_ms} ms)"
+    )
+
+    %{state | feedback_stale_logged: true}
+  end
+
+  # A dead report link must not leave the robot armed and blind indefinitely:
+  # after feedback_loss_fatal_ms of continuous staleness with motion pending,
+  # stop the controller so bb's supervision and safety escalation take over —
+  # the same recovery path as a dead command socket.
+  defp feedback_loss_fatal(state) do
+    error =
+      ConnectionError.exception(
+        host: state.host,
+        port: state.report_port,
+        reason: :report_feedback_loss
+      )
+
+    Logger.error(
+      "[BB.Ufactory.Controller] No report feedback for #{state.feedback_loss_fatal_ms} ms " <>
+        "with motion pending for #{state.controller_name} — stopping controller"
+    )
+
+    BB.Safety.report_error(state.bb.robot, state.bb.path, error)
+    {:stop, error, state}
   end
 
   defp log_move_skip_once(%{move_skip_logged: true} = state), do: state
@@ -736,22 +881,23 @@ defmodule BB.Ufactory.Controller do
   end
 
   defp update_from_report(report, state) do
+    state = %{state | last_report_at: System.monotonic_time(:millisecond)}
     joint_count = state.model_config.joints
     angles = Enum.take(report.angles, joint_count)
     torques = Enum.take(report.torques, joint_count)
 
-    # Update per-joint ETS rows, preserving set_position
+    # Update ONLY the current_position/current_torque columns. The Joint
+    # actuator writes the set_position column from its own process; a
+    # read-whole-row-then-insert here could interleave with that write and
+    # resurrect a stale target — silently dropping a fresh command, or
+    # undoing a Stop/Hold brake latch. :ets.update_element/3 is atomic and
+    # leaves the actuator's column untouched.
     angles
     |> Enum.zip(torques)
     |> Enum.with_index(1)
     |> Enum.each(fn {{angle, torque}, idx} ->
-      set_pos =
-        case :ets.lookup(state.ets, idx) do
-          [{^idx, _cur, _torq, sp}] -> sp
-          [] -> nil
-        end
-
-      :ets.insert(state.ets, {idx, angle, torque, set_pos})
+      :ets.update_element(state.ets, idx, [{2, angle}, {3, torque}]) ||
+        :ets.insert(state.ets, {idx, angle, torque, nil, nil})
     end)
 
     # Update arm-level row
@@ -926,18 +1072,16 @@ defmodule BB.Ufactory.Controller do
 
   # Walks complete response frames, skipping non-GET_ERROR responses.
   defp scan_for_error_response(buffer) do
-    case Protocol.parse_response(buffer) do
-      {:ok, {0x0F, _status, <<error_code::8, _rest::binary>>}, _tail} ->
+    case scan_for_response(buffer, 0x0F) do
+      {:found, {_reg, _status, <<error_code::8, _rest::binary>>}, _tail} ->
         {:found, error_code}
 
-      {:ok, {_other_register, _status, _params}, tail} ->
-        scan_for_error_response(tail)
-
-      {:more} ->
-        {:more, buffer}
-
-      {:error, _reason} ->
+      # A GET_ERROR response with an empty params field is malformed.
+      {:found, _malformed, _tail} ->
         :desync
+
+      other ->
+        other
     end
   end
 
@@ -1056,6 +1200,63 @@ defmodule BB.Ufactory.Controller do
 
   defp cmd_socket_fatal(reason, state) do
     {:stop, fatal_stop_reason(reason, state), state}
+  end
+
+  defp await_matching_response(state, register, buffer, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:reply, {:error, :timeout}, state}
+    else
+      recv_and_match(state, register, buffer, deadline, remaining)
+    end
+  end
+
+  defp recv_and_match(state, register, buffer, deadline, remaining) do
+    case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
+      {:ok, data} ->
+        match_response(state, register, buffer <> data, deadline)
+
+      {:error, :timeout} ->
+        {:reply, {:error, :timeout}, state}
+
+      {:error, reason} = error ->
+        {:stop, fatal_stop_reason(reason, state), error, state}
+    end
+  end
+
+  defp match_response(state, register, buffer, deadline) do
+    case scan_for_response(buffer, register) do
+      {:found, response, tail} ->
+        {:reply, {:ok, response, tail}, state}
+
+      {:more, rest} ->
+        await_matching_response(state, register, rest, deadline)
+
+      # Desynchronized stream (corrupt length/protocol id): frame
+      # boundaries cannot be recovered mid-stream. Report it; the
+      # drain at the start of the next request clears the buffer.
+      :desync ->
+        {:reply, {:error, :desync}, state}
+    end
+  end
+
+  # Walks complete response frames, skipping responses for other registers
+  # (in-flight move-acks, heartbeat replies).
+  defp scan_for_response(buffer, register) do
+    case Protocol.parse_response(buffer) do
+      {:ok, {^register, _status, _params} = response, tail} ->
+        {:found, response, tail}
+
+      {:ok, {_other_register, _status, _params}, tail} ->
+        scan_for_response(tail, register)
+
+      {:more} ->
+        {:more, buffer}
+
+      {:error, _reason} ->
+        :desync
+    end
   end
 
   # Drains any stale unread responses from a TCP socket's receive buffer.

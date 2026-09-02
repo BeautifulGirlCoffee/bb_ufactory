@@ -19,7 +19,7 @@ defmodule BB.Ufactory.Registers do
   @spec motion_en() :: non_neg_integer()
   def motion_en, do: 0x0B
 
-  @doc "SET_STATE — arm state; 0 = stop/clear motion, 3 = play, 4 = pause"
+  @doc "SET_STATE — arm state; 0 = motion (\"sport\"), 3 = pause, 4 = stop/clear queued commands"
   @spec set_state() :: non_neg_integer()
   def set_state, do: 0x0C
 
