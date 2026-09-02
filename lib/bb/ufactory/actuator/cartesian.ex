@@ -26,7 +26,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
         x: 300.0, y: 0.0, z: 400.0, roll: 3.14159, pitch: 0.0, yaw: 0.0)
 
       # Synchronous — learn whether the arm accepted the command:
-      :ok = BB.call(MyRobot, :tcp, {:command, msg})
+      {:ok, :accepted} = BB.call(MyRobot, :tcp, {:command, msg})
 
       # Fire-and-forget:
       BB.cast(MyRobot, :tcp, {:command, msg})

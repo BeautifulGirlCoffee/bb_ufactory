@@ -439,7 +439,7 @@ defmodule BB.Ufactory.SimulatorTest do
                      5_000
 
       target = hd(js0.positions) + 0.2
-      BB.Actuator.set_position!(Robot, :j1_motor, target)
+      assert :ok = BB.Actuator.set_position(Robot, :j1_motor, target)
 
       assert await_joint(1, target, 30_000), "J1 did not converge to #{target}"
 
