@@ -477,24 +477,82 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
+  # While armed, the 100 Hz move stream keeps responses in flight that a
+  # pre-send drain cannot clear, so the reply is matched by REGISTER: frames
+  # for other registers are skipped, and partial frames are accumulated until
+  # the deadline. Without this, an RS485 read could consume a move-ack and
+  # refuse (e.g.) a linear-track Stop on a perfectly healthy link.
+  #
+  # The default timeout is deliberately tick-compatible: this call blocks the
+  # controller GenServer, and a multi-second wait would stall joint streaming
+  # while the robot stays armed.
+  @send_recv_timeout_ms 500
+
   def handle_call({:send_and_recv, frame}, from, state) do
-    handle_call({:send_and_recv, frame, 5_000}, from, state)
+    handle_call({:send_and_recv, frame, @send_recv_timeout_ms}, from, state)
   end
 
   def handle_call({:send_and_recv, frame, timeout}, _from, state) do
     drain_recv_buffer(state.cmd_socket)
     state = %{state | txn_id: next_txn(state.txn_id)}
+    <<_txn::16, _proto::16, _len::16, register::8, _::binary>> = frame
 
-    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
-         {:ok, data} <- :gen_tcp.recv(state.cmd_socket, 0, timeout) do
-      {:reply, Protocol.parse_response(data), state}
-    else
-      # A recv timeout is a normal slow-response condition, not socket death.
-      {:error, :timeout} = error ->
-        {:reply, error, state}
+    case :gen_tcp.send(state.cmd_socket, frame) do
+      :ok ->
+        deadline = System.monotonic_time(:millisecond) + timeout
+        await_matching_response(state, register, <<>>, deadline)
 
       {:error, reason} = error ->
         {:stop, fatal_stop_reason(reason, state), error, state}
+    end
+  end
+
+  defp await_matching_response(state, register, buffer, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:reply, {:error, :timeout}, state}
+    else
+      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
+        {:ok, data} ->
+          case scan_for_response(buffer <> data, register) do
+            {:found, response, tail} ->
+              {:reply, {:ok, response, tail}, state}
+
+            {:more, rest} ->
+              await_matching_response(state, register, rest, deadline)
+
+            # Desynchronized stream (corrupt length/protocol id): frame
+            # boundaries cannot be recovered mid-stream. Report it; the
+            # drain at the start of the next request clears the buffer.
+            :desync ->
+              {:reply, {:error, :desync}, state}
+          end
+
+        {:error, :timeout} ->
+          {:reply, {:error, :timeout}, state}
+
+        {:error, reason} = error ->
+          {:stop, fatal_stop_reason(reason, state), error, state}
+      end
+    end
+  end
+
+  # Walks complete response frames, skipping responses for other registers
+  # (in-flight move-acks, heartbeat replies).
+  defp scan_for_response(buffer, register) do
+    case Protocol.parse_response(buffer) do
+      {:ok, {^register, _status, _params} = response, tail} ->
+        {:found, response, tail}
+
+      {:ok, {_other_register, _status, _params}, tail} ->
+        scan_for_response(tail, register)
+
+      {:more} ->
+        {:more, buffer}
+
+      {:error, _reason} ->
+        :desync
     end
   end
 
@@ -937,18 +995,16 @@ defmodule BB.Ufactory.Controller do
 
   # Walks complete response frames, skipping non-GET_ERROR responses.
   defp scan_for_error_response(buffer) do
-    case Protocol.parse_response(buffer) do
-      {:ok, {0x0F, _status, <<error_code::8, _rest::binary>>}, _tail} ->
+    case scan_for_response(buffer, 0x0F) do
+      {:found, {_reg, _status, <<error_code::8, _rest::binary>>}, _tail} ->
         {:found, error_code}
 
-      {:ok, {_other_register, _status, _params}, tail} ->
-        scan_for_error_response(tail)
-
-      {:more} ->
-        {:more, buffer}
-
-      {:error, _reason} ->
+      # A GET_ERROR response with an empty params field is malformed.
+      {:found, _malformed, _tail} ->
         :desync
+
+      other ->
+        other
     end
   end
 

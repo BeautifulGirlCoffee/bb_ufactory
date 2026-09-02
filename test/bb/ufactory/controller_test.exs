@@ -1131,6 +1131,65 @@ defmodule BB.Ufactory.ControllerTest do
 
       Task.await(task, 2_000)
     end
+
+    test "send_and_recv skips in-flight responses for other registers",
+         %{state: state, cmd_server: cmd_server} do
+      # An RS485 read racing the 100 Hz move stream: a move-ack (0x1D) lands
+      # after the drain but before the RS485 (0x7C) response. The reply must
+      # be the 0x7C frame, not the move-ack.
+      rs485_frame = Protocol.build_frame(0, 0x7C, <<0x0B, 0x01, 0x03>>)
+      move_ack = Protocol.build_frame(0, 0x1D, <<0x00>>)
+      rs485_response =
+        Protocol.build_frame(0, 0x7C, <<0x00, 0x0B, 0x01, 0x03, 0x04, 0, 0, 0x0F, 0x42>>)
+
+      task =
+        Task.async(fn ->
+          {:ok, _data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          :gen_tcp.send(cmd_server, move_ack <> rs485_response)
+        end)
+
+      assert {:reply, {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, _::binary>>}, <<>>}, _new_state} =
+               Controller.handle_call({:send_and_recv, rs485_frame}, {self(), make_ref()}, state)
+
+      Task.await(task, 2_000)
+    end
+
+    test "send_and_recv reassembles a response split across TCP segments",
+         %{state: state, cmd_server: cmd_server} do
+      frame = Protocol.cmd_get_error(0)
+      response = Protocol.build_frame(0, 0x0F, <<0x00, 0x00>>)
+      <<first::binary-size(4), second::binary>> = response
+
+      task =
+        Task.async(fn ->
+          {:ok, _data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          :gen_tcp.send(cmd_server, first)
+          Process.sleep(30)
+          :gen_tcp.send(cmd_server, second)
+        end)
+
+      assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, <<>>}, _new_state} =
+               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+
+      Task.await(task, 2_000)
+    end
+
+    test "send_and_recv times out when only foreign responses arrive",
+         %{state: state, cmd_server: cmd_server} do
+      frame = Protocol.build_frame(0, 0x7C, <<0x0B, 0x01, 0x03>>)
+      move_ack = Protocol.build_frame(0, 0x1D, <<0x00>>)
+
+      task =
+        Task.async(fn ->
+          {:ok, _data} = :gen_tcp.recv(cmd_server, 0, 2_000)
+          :gen_tcp.send(cmd_server, move_ack)
+        end)
+
+      assert {:reply, {:error, :timeout}, _new_state} =
+               Controller.handle_call({:send_and_recv, frame, 150}, {self(), make_ref()}, state)
+
+      Task.await(task, 2_000)
+    end
   end
 
   # ── handle_info(:tick) — control loop ────────────────────────────────────────
