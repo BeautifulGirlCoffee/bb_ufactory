@@ -204,9 +204,10 @@ defmodule BB.Ufactory.Simulator do
   Sends a command frame and returns the parsed response.
 
   Drains stale responses first, then sends `frame` (built with
-  `BB.Ufactory.Protocol`) and parses the reply. Returns
-  `{:ok, {register, status, params}, rest}`, `{:more}` on a truncated
-  response, or `{:error, reason}`.
+  `BB.Ufactory.Protocol`) and parses the reply, accumulating TCP segments
+  until a complete frame arrives or `timeout` elapses. Returns
+  `{:ok, {register, status, params}, rest}` or `{:error, reason}`
+  (`{:error, :timeout}` when no complete response arrived in time).
 
   ## Examples
 
@@ -216,13 +217,34 @@ defmodule BB.Ufactory.Simulator do
         Simulator.command(cmd, Protocol.cmd_get_error(0))
   """
   @spec command(:gen_tcp.socket(), binary(), timeout()) ::
-          {:ok, {byte(), byte(), binary()}, binary()} | {:more} | {:error, term()}
+          {:ok, {byte(), byte(), binary()}, binary()} | {:error, term()}
   def command(socket, frame, timeout \\ 5_000) do
     drain(socket)
 
-    with :ok <- :gen_tcp.send(socket, frame),
-         {:ok, data} <- :gen_tcp.recv(socket, 0, timeout) do
-      Protocol.parse_response(data)
+    case :gen_tcp.send(socket, frame) do
+      :ok -> recv_response(socket, <<>>, System.monotonic_time(:millisecond) + timeout)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp recv_response(socket, buffer, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, :timeout}
+    else
+      case :gen_tcp.recv(socket, 0, remaining) do
+        {:ok, data} ->
+          buffer = buffer <> data
+
+          case Protocol.parse_response(buffer) do
+            {:more} -> recv_response(socket, buffer, deadline)
+            other -> other
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
     end
   end
 

@@ -228,7 +228,20 @@ defmodule BB.Ufactory.Controller do
               :hold -> Protocol.cmd_enable(0, false)
             end
 
-          :gen_tcp.send(sock, frame)
+          # Last-resort safety path: wait briefly for the firmware's response
+          # so the log distinguishes a delivered stop from a dropped one.
+          # Failures are still swallowed — this callback must never raise.
+          with :ok <- :gen_tcp.send(sock, frame),
+               {:ok, _ack} <- :gen_tcp.recv(sock, 0, 500) do
+            :ok
+          else
+            {:error, reason} ->
+              Logger.warning(
+                "[BB.Ufactory.Controller] Out-of-band disarm (#{disarm_action}) to " <>
+                  "#{host}:#{port} unconfirmed: #{inspect(reason)}"
+              )
+          end
+
           :gen_tcp.close(sock)
 
         {:error, _reason} ->
@@ -601,8 +614,13 @@ defmodule BB.Ufactory.Controller do
 
     if BB.Safety.armed?(state.bb.robot) do
       case send_frames(frames, state) do
-        {:ok, state} -> {:reply, :ok, state}
-        {:fatal, reason, state} -> {:stop, fatal_stop_reason(reason, state), :ok, state}
+        {:ok, state} ->
+          {:reply, :ok, state}
+
+        # The frames did NOT reach the arm — the accessory must not believe
+        # otherwise. The controller still stops (dead command socket).
+        {:fatal, reason, state} ->
+          {:stop, fatal_stop_reason(reason, state), {:error, reason}, state}
       end
     else
       {:reply, :ok, state}
@@ -735,10 +753,14 @@ defmodule BB.Ufactory.Controller do
     # Build the ETS table name from known module atoms to avoid dynamic atom creation.
     table_name = Module.concat([robot, "Controller", controller_name])
 
+    # Always hand out the NAME, not a tid: actuators cache this handle, and
+    # name-based access survives a controller crash-restart (the restarted
+    # controller re-registers the name), while a stale tid would make every
+    # actuator ETS call raise. :ets.new/2 with :named_table returns the name.
     ets =
       case :ets.whereis(table_name) do
         :undefined -> :ets.new(table_name, [:public, :set, :named_table])
-        existing -> existing
+        _existing -> table_name
       end
 
     # Pre-populate per-joint rows

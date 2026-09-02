@@ -1558,6 +1558,27 @@ defmodule BB.Ufactory.ControllerTest do
       assert data == frame
     end
 
+    test "replies with the error when an armed-time send fails",
+         %{state: state, cmd_server: cmd_server} do
+      BB.Safety
+      |> expect(:armed?, fn TestRobot -> true end)
+      |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
+
+      :gen_tcp.close(cmd_server)
+      :gen_tcp.close(state.cmd_socket)
+
+      frame = Protocol.cmd_gripper_enable(0, true)
+
+      # The accessory must not be told :ok when its enable frames never
+      # reached the arm; the controller still stops (dead command socket).
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, {:error, _reason}, _state} =
+               Controller.handle_call(
+                 {:register_arm_frames, :gripper, [frame]},
+                 {self(), make_ref()},
+                 state
+               )
+    end
+
     test "re-registration under the same label replaces the previous frames",
          %{state: state} do
       BB.Safety
