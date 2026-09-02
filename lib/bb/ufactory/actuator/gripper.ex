@@ -7,8 +7,8 @@ defmodule BB.Ufactory.Actuator.Gripper do
   Gripper G2 position actuator for xArm arms.
 
   Controls the UFactory Gripper G2 via the xArm RS485 RTU proxy (register
-  0x7C). Position is expressed in **pulse units** (0–840). The G2 range is
-  0–840, capped at 840 in `BB.Ufactory.Protocol.cmd_gripper_position/2`.
+  0x7C). Position is expressed in **pulse units** (0–850, where 850 is
+  fully open), capped in `BB.Ufactory.Protocol.cmd_gripper_position/2`.
 
   ## Lifecycle
 
@@ -23,7 +23,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   ## Command Interface
 
   Receives standard `%BB.Message.Actuator.Command.Position{}` commands, where
-  `position` is the target position in pulse units (0.0–840.0). Non-integer
+  `position` is the target position in pulse units (0.0–850.0). Non-integer
   values are rounded to the nearest integer. All transports converge on
   `c:BB.Actuator.handle_command/2`; only `Command.Position` is declared, so
   the framework refuses other payload types before the driver sees them. A
@@ -132,7 +132,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   end
 
   defp apply_gripper_position(pos, state) do
-    pos_int = round(pos) |> max(0) |> min(840)
+    pos_int = round(pos) |> max(0) |> min(850)
 
     frame = Protocol.cmd_gripper_position(0, pos_int)
 

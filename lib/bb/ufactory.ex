@@ -149,7 +149,7 @@ defmodule BB.Ufactory do
               acceleration: 2000.0
             }
 
-            # Optional: Gripper G2 — position in pulse units (0–840)
+            # Optional: Gripper G2 — position in pulse units (0–850)
             actuator :gripper, {BB.Ufactory.Actuator.Gripper,
               controller: :xarm,
               speed: 1500
@@ -183,7 +183,7 @@ defmodule BB.Ufactory do
   | `BB.Ufactory.Model` | Per-model joint counts and limits (xArm5/6/7, Lite6, xArm850) |
   | `BB.Ufactory.Actuator.Joint` | `BB.Actuator` — joint-space position via ETS + 100 Hz loop |
   | `BB.Ufactory.Actuator.Cartesian` | `BB.Actuator` — Cartesian end-effector pose via `MOVE_LINE` |
-  | `BB.Ufactory.Actuator.Gripper` | `BB.Actuator` — Gripper G2 position (pulse units 0–840) |
+  | `BB.Ufactory.Actuator.Gripper` | `BB.Actuator` — Gripper G2 position (pulse units 0–850) |
   | `BB.Ufactory.Actuator.LinearTrack` | `BB.Actuator` — linear track position in mm (RS485 proxy) |
   | `BB.Ufactory.Sensor.ForceTorque` | `BB.Sensor` — polls register 0xC8, publishes `Wrench` |
   | `BB.Ufactory.Message.ArmStatus` | State, mode, error/warning codes from the report socket |

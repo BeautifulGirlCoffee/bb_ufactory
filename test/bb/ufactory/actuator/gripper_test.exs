@@ -155,12 +155,12 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       Gripper.handle_command(msg, state)
     end
 
-    test "clamps position above 840 to 840" do
+    test "clamps position above 850 to 850" do
       state = make_state()
 
       BB.Process
       |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        expected = Protocol.cmd_gripper_position(0, 840)
+        expected = Protocol.cmd_gripper_position(0, 850)
         assert frame == expected
         :ok
       end)

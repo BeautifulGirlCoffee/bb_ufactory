@@ -331,18 +331,16 @@ defmodule BB.Ufactory.ProtocolTest do
       assert_in_delta List.last(floats), 0.0, 1.0e-9
     end
 
-    test "truncates angle list longer than 7 to exactly 7 joints" do
+    test "raises for more than 7 angles instead of silently dropping them" do
       angles = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
-      frame = Protocol.cmd_move_joints(0, angles, 1.0, 10.0)
-      params = binary_part(frame, 7, 40)
-      floats = Protocol.decode_fp32s(params, 10)
 
-      assert_in_delta Enum.at(floats, 6), 7.0, 1.0e-6
-      assert_in_delta Enum.at(floats, 7), 1.0, 1.0e-6
+      assert_raise FunctionClauseError, fn ->
+        Protocol.cmd_move_joints(0, angles, 1.0, 10.0)
+      end
     end
 
-    test "produces the same 47-byte frame size regardless of input angle count" do
-      for count <- [0, 3, 6, 7, 10] do
+    test "produces the same 47-byte frame size for any accepted angle count" do
+      for count <- [0, 3, 6, 7] do
         angles = List.duplicate(0.5, count)
         frame = Protocol.cmd_move_joints(0, angles, 1.0, 1.0)
         assert byte_size(frame) == 47, "expected 47 bytes for #{count} angles"
@@ -384,14 +382,129 @@ defmodule BB.Ufactory.ProtocolTest do
 
   # ── cmd_gripper_position (clamp) ─────────────────────────────────────────────
 
+  # Byte-exact RS485 frame pins. Every accessory frame is asserted down to the
+  # host id, device id, Modbus function, servo register address, register
+  # count, and payload — derived from the Python SDK's constants (host 0x09 =
+  # gripper/tool-port bus with GRIPPER_ID 8; host 0x0B = control-box bus with
+  # track id 1; CON_EN 0x0100, POS_SPD 0x0303, TAGET_POS 0x0700, read 0x0A20).
+  # Self-referential assertions ("register is 0x7C", "enable != disable")
+  # cannot catch a swapped bus or register — the class of bug that produced
+  # the original cmd_stop fault.
+  describe "RS485 accessory frames are byte-exact" do
+    test "cmd_gripper_enable/2 writes 1/0 to CON_EN on the gripper bus" do
+      # header(txn 0, proto 2, len 11) 0x7C | host 9, dev 8, func 0x10,
+      # addr 0x0100, count 1, bytes 2, value 0/1
+      assert Protocol.cmd_gripper_enable(0, true) ==
+               <<0, 0, 0, 2, 0, 11, 0x7C, 0x09, 0x08, 0x10, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00,
+                 0x01>>
+
+      assert Protocol.cmd_gripper_enable(0, false) ==
+               <<0, 0, 0, 2, 0, 11, 0x7C, 0x09, 0x08, 0x10, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00,
+                 0x00>>
+    end
+
+    test "cmd_gripper_speed/2 writes raw pulse/s to POS_SPD on the gripper bus" do
+      # 800 = 0x0320 written to addr 0x0303
+      assert Protocol.cmd_gripper_speed(0, 800) ==
+               <<0, 0, 0, 2, 0, 11, 0x7C, 0x09, 0x08, 0x10, 0x03, 0x03, 0x00, 0x01, 0x02, 0x03,
+                 0x20>>
+    end
+
+    test "cmd_gripper_position/2 writes int32 BE pulses to TAGET_POS on the gripper bus" do
+      # 850 = 0x00000352 written to addr 0x0700 (2 registers, 4 bytes)
+      assert Protocol.cmd_gripper_position(0, 850) ==
+               <<0, 0, 0, 2, 0, 13, 0x7C, 0x09, 0x08, 0x10, 0x07, 0x00, 0x00, 0x02, 0x04, 0x00,
+                 0x00, 0x03, 0x52>>
+    end
+
+    test "cmd_linear_track_enable/2 writes to CON_EN on the CONTROL-BOX bus" do
+      # host 0x0B and device 1 — a swap onto the gripper bus (0x09/8) would
+      # energise the wrong device and pass any self-referential assertion.
+      assert Protocol.cmd_linear_track_enable(0, true) ==
+               <<0, 0, 0, 2, 0, 11, 0x7C, 0x0B, 0x01, 0x10, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00,
+                 0x01>>
+    end
+
+    test "cmd_linear_track_move/3 writes pos*2000 int32 BE and speed*6.667 u16" do
+      {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, 500.0, 200)
+
+      # 500.0 mm * 2000 = 1_000_000 = 0x000F4240 to addr 0x0700
+      assert pos_frame ==
+               <<0, 0, 0, 2, 0, 13, 0x7C, 0x0B, 0x01, 0x10, 0x07, 0x00, 0x00, 0x02, 0x04, 0x00,
+                 0x0F, 0x42, 0x40>>
+
+      # round(200 * 6.667) = 1333 = 0x0535 to addr 0x0303
+      assert spd_frame ==
+               <<0, 0, 0, 2, 0, 11, 0x7C, 0x0B, 0x01, 0x10, 0x03, 0x03, 0x00, 0x01, 0x02, 0x05,
+                 0x35>>
+    end
+
+    test "cmd_linear_track_read_position/1 reads 2 registers at 0x0A20 (func 0x03)" do
+      assert Protocol.cmd_linear_track_read_position(0) ==
+               <<0, 0, 0, 2, 0, 8, 0x7C, 0x0B, 0x01, 0x03, 0x0A, 0x20, 0x00, 0x02>>
+    end
+  end
+
+  describe "cmd_clean_warn/1" do
+    test "builds a bare CLEAN_WAR frame (register 0x11)" do
+      assert Protocol.cmd_clean_warn(1) == <<0, 1, 0, 2, 0, 1, 0x11>>
+    end
+  end
+
+  describe "u16 speed field clamping" do
+    test "cmd_gripper_speed/2 clamps to 0xFFFF instead of wrapping" do
+      assert Protocol.cmd_gripper_speed(0, 70_000) == Protocol.cmd_gripper_speed(0, 0xFFFF)
+
+      refute Protocol.cmd_gripper_speed(0, 70_000) ==
+               Protocol.cmd_gripper_speed(0, 70_000 - 0x10000)
+    end
+
+    test "cmd_linear_track_move/3 clamps the speed units to 0xFFFF" do
+      # 10_000 mm/s * 6.667 = 66_670 > 0xFFFF — must clamp, not wrap to a
+      # slow crawl.
+      {_pos, spd_wrapping} = Protocol.cmd_linear_track_move(0, 0.0, 10_000)
+      {_pos, spd_max} = Protocol.cmd_linear_track_move(0, 0.0, 9_830)
+      assert spd_wrapping == spd_max
+    end
+  end
+
+  describe "cmd_set_mode/2 mode guard" do
+    test "accepts firmware modes 0..7 and rejects others" do
+      for mode <- 0..7 do
+        assert is_binary(Protocol.cmd_set_mode(0, mode))
+      end
+
+      assert_raise FunctionClauseError, fn -> Protocol.cmd_set_mode(0, 8) end
+      assert_raise FunctionClauseError, fn -> Protocol.cmd_set_mode(0, -1) end
+    end
+  end
+
+  describe "parse_linear_track_position/1 function-code check" do
+    test "rejects an RS485 exception response (func 0x83)" do
+      # Exception replies carry func | 0x80; their payload must not decode
+      # as a position.
+      assert {:error, :invalid_response} =
+               Protocol.parse_linear_track_position(
+                 <<0x0B, 0x01, 0x83, 0x04, 0x00, 0x0F, 0x42, 0x40>>
+               )
+    end
+
+    test "rejects a write-multiple ack (func 0x10)" do
+      assert {:error, :invalid_response} =
+               Protocol.parse_linear_track_position(
+                 <<0x0B, 0x01, 0x10, 0x04, 0x00, 0x0F, 0x42, 0x40>>
+               )
+    end
+  end
+
   describe "cmd_gripper_position/2" do
     test "uses register 0x7C (RS485_RTU proxy)" do
       frame = Protocol.cmd_gripper_position(0, 500)
       assert binary_part(frame, 6, 1) == <<0x7C>>
     end
 
-    test "clamps value above 840 to 840" do
-      frame_max = Protocol.cmd_gripper_position(0, 840)
+    test "clamps value above 850 to 850 (fully open per the SDK)" do
+      frame_max = Protocol.cmd_gripper_position(0, 850)
       frame_over = Protocol.cmd_gripper_position(0, 1000)
       # Both should produce the same payload (same clamped pulse)
       assert frame_max == frame_over

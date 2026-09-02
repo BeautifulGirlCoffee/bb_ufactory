@@ -23,9 +23,9 @@ They all share the same `BB.Ufactory.Controller` instance.
 The UFactory Gripper G2 connects to the arm's RS485 tool port. Commands are
 proxied through the main TCP command socket via register 0x7C.
 
-**Position units:** pulse units in the range **0–840**. The relationship to
+**Position units:** pulse units in the range **0–850**. The relationship to
 physical jaw opening depends on the gripper model, but the full range spans from
-fully closed (0) to fully open (840).
+fully closed (0) to fully open (850).
 
 ### Adding the Gripper
 
@@ -50,10 +50,10 @@ Send a `%BB.Message.Actuator.Command.Position{}` with the target position in
 pulse units:
 
 ```elixir
-# Open gripper (840 = fully open)
+# Open gripper (850 = fully open)
 BB.Process.cast(robot, :gripper, {:command,
   BB.Message.new!(BB.Message.Actuator.Command.Position, :gripper,
-    position: 840.0
+    position: 850.0
   )
 })
 
@@ -65,7 +65,7 @@ BB.Process.cast(robot, :gripper, {:command,
 })
 ```
 
-Positions outside 0–840 are automatically clamped by the actuator.
+Positions outside 0–850 are automatically clamped by the actuator.
 
 ### Disarm Behaviour
 

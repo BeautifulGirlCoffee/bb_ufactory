@@ -24,7 +24,7 @@ a real-time report socket (port 30003) that pushes joint state at ~100Hz.
 
 - **Joint-space motion** — Command individual joints; batched at 100Hz via ETS
 - **Cartesian-space motion** — Command end-effector pose directly; IK solved on-arm
-- **Gripper support** — Gripper G2 position control (0–840 mm)
+- **Gripper support** — Gripper G2 position control (pulse units 0–850)
 - **Force/torque sensor** — F/T data streamed from 135-byte report frames (Fx/Fy/Fz/Tx/Ty/Tz)
 - **Collision detection** — Configurable sensitivity, rebound, and self-collision check; publishes collision events
 - **Linear track** — RS485-proxied linear axis position control
@@ -187,7 +187,7 @@ BB.subscribe(MyRobot, [:sensor, :collision])
 |--------|-------------|
 | `BB.Ufactory.Actuator.Joint` | Joint-space position (radians), via ETS + 100Hz loop |
 | `BB.Ufactory.Actuator.Cartesian` | Cartesian pose (mm + radians), direct command |
-| `BB.Ufactory.Actuator.Gripper` | Gripper G2 position (0–840 mm) |
+| `BB.Ufactory.Actuator.Gripper` | Gripper G2 position (pulse units 0–850) |
 | `BB.Ufactory.Actuator.LinearTrack` | Linear track position (mm), RS485-proxied |
 
 ### Sensors

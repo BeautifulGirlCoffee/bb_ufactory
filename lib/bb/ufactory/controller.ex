@@ -546,55 +546,6 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  defp await_matching_response(state, register, buffer, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      {:reply, {:error, :timeout}, state}
-    else
-      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
-        {:ok, data} ->
-          case scan_for_response(buffer <> data, register) do
-            {:found, response, tail} ->
-              {:reply, {:ok, response, tail}, state}
-
-            {:more, rest} ->
-              await_matching_response(state, register, rest, deadline)
-
-            # Desynchronized stream (corrupt length/protocol id): frame
-            # boundaries cannot be recovered mid-stream. Report it; the
-            # drain at the start of the next request clears the buffer.
-            :desync ->
-              {:reply, {:error, :desync}, state}
-          end
-
-        {:error, :timeout} ->
-          {:reply, {:error, :timeout}, state}
-
-        {:error, reason} = error ->
-          {:stop, fatal_stop_reason(reason, state), error, state}
-      end
-    end
-  end
-
-  # Walks complete response frames, skipping responses for other registers
-  # (in-flight move-acks, heartbeat replies).
-  defp scan_for_response(buffer, register) do
-    case Protocol.parse_response(buffer) do
-      {:ok, {^register, _status, _params} = response, tail} ->
-        {:found, response, tail}
-
-      {:ok, {_other_register, _status, _params}, tail} ->
-        scan_for_response(tail, register)
-
-      {:more} ->
-        {:more, buffer}
-
-      {:error, _reason} ->
-        :desync
-    end
-  end
-
   # ── handle_call: arm-frame registration ──────────────────────────────────────
   #
   # Accessories (gripper, linear track, F/T sensor) register the frames that
@@ -1249,6 +1200,55 @@ defmodule BB.Ufactory.Controller do
 
   defp cmd_socket_fatal(reason, state) do
     {:stop, fatal_stop_reason(reason, state), state}
+  end
+
+  defp await_matching_response(state, register, buffer, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:reply, {:error, :timeout}, state}
+    else
+      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
+        {:ok, data} ->
+          case scan_for_response(buffer <> data, register) do
+            {:found, response, tail} ->
+              {:reply, {:ok, response, tail}, state}
+
+            {:more, rest} ->
+              await_matching_response(state, register, rest, deadline)
+
+            # Desynchronized stream (corrupt length/protocol id): frame
+            # boundaries cannot be recovered mid-stream. Report it; the
+            # drain at the start of the next request clears the buffer.
+            :desync ->
+              {:reply, {:error, :desync}, state}
+          end
+
+        {:error, :timeout} ->
+          {:reply, {:error, :timeout}, state}
+
+        {:error, reason} = error ->
+          {:stop, fatal_stop_reason(reason, state), error, state}
+      end
+    end
+  end
+
+  # Walks complete response frames, skipping responses for other registers
+  # (in-flight move-acks, heartbeat replies).
+  defp scan_for_response(buffer, register) do
+    case Protocol.parse_response(buffer) do
+      {:ok, {^register, _status, _params} = response, tail} ->
+        {:found, response, tail}
+
+      {:ok, {_other_register, _status, _params}, tail} ->
+        scan_for_response(tail, register)
+
+      {:more} ->
+        {:more, buffer}
+
+      {:error, _reason} ->
+        :desync
+    end
   end
 
   # Drains any stale unread responses from a TCP socket's receive buffer.
