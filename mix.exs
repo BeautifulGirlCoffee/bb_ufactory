@@ -96,7 +96,8 @@ defmodule BB.Ufactory.MixProject do
       {:mimic, "~> 2.3", only: :test, runtime: false},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:reach, "~> 2.8", only: [:dev, :test], runtime: false},
-      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}
+      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
+      {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end
 
