@@ -211,23 +211,30 @@ defmodule BB.Ufactory.Actuator.Joint do
     end
   end
 
+  # The controller's report handler writes the current_position and
+  # current_torque columns of the same rows at ~100 Hz from its own process.
+  # Writes here must therefore touch ONLY the set_position column — a
+  # read-whole-row-then-insert could interleave with a report update and
+  # clobber a fresh angle (or let the controller resurrect a stale target).
+  # :ets.update_element/3 is atomic per row.
   defp clear_set_position(ets, joint) do
-    case :ets.lookup(ets, joint) do
-      [{^joint, cur_pos, cur_torq, _sp}] -> :ets.insert(ets, {joint, cur_pos, cur_torq, nil})
-      [] -> :ok
-    end
+    :ets.update_element(ets, joint, {4, nil})
+    :ok
   end
 
-  # Reads the current ETS row to preserve current_position and current_torque,
-  # then writes only the set_position field. Returns current_position (may be nil).
+  # Writes only the set_position column. Returns current_position (may be
+  # nil); the read is advisory (BeginMotion's initial-position estimate), so
+  # a report frame landing between the lookup and the update is harmless.
   defp write_set_position(ets, joint, set_pos) do
-    {cur_pos, cur_torq} =
+    cur_pos =
       case :ets.lookup(ets, joint) do
-        [{^joint, cp, ct, _sp}] -> {cp, ct}
-        [] -> {nil, nil}
+        [{^joint, cp, _ct, _sp}] -> cp
+        [] -> nil
       end
 
-    :ets.insert(ets, {joint, cur_pos, cur_torq, set_pos})
+    :ets.update_element(ets, joint, {4, set_pos}) ||
+      :ets.insert(ets, {joint, nil, nil, set_pos})
+
     cur_pos
   end
 

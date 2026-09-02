@@ -751,18 +751,18 @@ defmodule BB.Ufactory.Controller do
     angles = Enum.take(report.angles, joint_count)
     torques = Enum.take(report.torques, joint_count)
 
-    # Update per-joint ETS rows, preserving set_position
+    # Update ONLY the current_position/current_torque columns. The Joint
+    # actuator writes the set_position column from its own process; a
+    # read-whole-row-then-insert here could interleave with that write and
+    # resurrect a stale target — silently dropping a fresh command, or
+    # undoing a Stop/Hold brake latch. :ets.update_element/3 is atomic and
+    # leaves the actuator's column untouched.
     angles
     |> Enum.zip(torques)
     |> Enum.with_index(1)
     |> Enum.each(fn {{angle, torque}, idx} ->
-      set_pos =
-        case :ets.lookup(state.ets, idx) do
-          [{^idx, _cur, _torq, sp}] -> sp
-          [] -> nil
-        end
-
-      :ets.insert(state.ets, {idx, angle, torque, set_pos})
+      :ets.update_element(state.ets, idx, [{2, angle}, {3, torque}]) ||
+        :ets.insert(state.ets, {idx, angle, torque, nil})
     end)
 
     # Update arm-level row

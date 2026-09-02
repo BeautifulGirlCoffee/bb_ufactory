@@ -523,6 +523,50 @@ defmodule BB.Ufactory.ControllerTest do
       assert set_pos == 1.57
     end
 
+    test "report ingestion never clobbers a concurrently written set_position", %{state: state} do
+      # Regression: update_from_report used to read the whole row and insert
+      # it back, racing the Joint actuator's set_position writes from another
+      # process — a lost write is a silently dropped command, or an undone
+      # Stop/Hold brake latch.
+      frame = build_87_byte_frame(angles: List.duplicate(0.25, 7))
+
+      joint_state = %{
+        bb: %{robot: TestRobot, path: [:j1, :motor]},
+        joint: 1,
+        controller: :xarm,
+        ets: state.ets,
+        limits: {-6.28, 6.28},
+        max_speed: :math.pi()
+      }
+
+      test_pid = self()
+
+      reporter =
+        Task.async(fn ->
+          receive do
+            :go -> :ok
+          end
+
+          Enum.each(1..1_000, fn _ ->
+            Controller.handle_info({:tcp, nil, frame}, state)
+          end)
+        end)
+
+      BB |> allow(test_pid, reporter.pid)
+      BB.Safety |> allow(test_pid, reporter.pid)
+      send(reporter.pid, :go)
+
+      for i <- 1..1_000 do
+        target = i / 10_000
+        msg = Message.new!(BB.Message.Actuator.Command.Position, :motor, position: target)
+
+        assert {:noreply, _} = BB.Ufactory.Actuator.Joint.handle_command(msg, joint_state)
+        assert [{1, _cur, _torq, ^target}] = :ets.lookup(state.ets, 1)
+      end
+
+      Task.await(reporter, 30_000)
+    end
+
     test "publishes JointState message", %{state: state} do
       angles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
       frame = build_87_byte_frame(angles: angles)
