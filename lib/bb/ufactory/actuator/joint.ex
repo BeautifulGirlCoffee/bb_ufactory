@@ -84,25 +84,35 @@ defmodule BB.Ufactory.Actuator.Joint do
     ets = BB.Process.call(bb.robot, controller, :get_ets)
     model_config = BB.Process.call(bb.robot, controller, :get_model_config)
 
-    if joint > model_config.joints do
-      # Fail at init instead of crash-looping with a MatchError on the first
-      # position command (Enum.at below would return nil limits).
-      {:stop, {:invalid_joint, joint, model_config.joints}}
-    else
-      model_limits = Enum.at(model_config.limits, joint - 1)
-      limits = intersect_topology_limits(bb, model_limits)
-      max_speed = model_config.max_speed_rads
+    cond do
+      joint > model_config.joints ->
+        # Fail at init instead of crash-looping with a MatchError on the first
+        # position command (Enum.at below would return nil limits).
+        {:stop, {:invalid_joint, joint, model_config.joints}}
 
-      state = %{
-        bb: bb,
-        joint: joint,
-        controller: controller,
-        ets: ets,
-        limits: limits,
-        max_speed: max_speed
-      }
+      transmission_declared?(bb) ->
+        # bb converts Position commands into MOTOR space before
+        # handle_command, but this driver streams the value to the firmware
+        # as a JOINT angle — with any non-identity transmission the two
+        # spaces differ and every command would be silently wrong. xArm
+        # joints are directly driven; refuse the configuration outright.
+        {:stop, {:unsupported_transmission, List.last(bb.path)}}
 
-      {:ok, state}
+      true ->
+        model_limits = Enum.at(model_config.limits, joint - 1)
+        limits = intersect_topology_limits(opts, model_limits)
+        max_speed = model_config.max_speed_rads
+
+        state = %{
+          bb: bb,
+          joint: joint,
+          controller: controller,
+          ets: ets,
+          limits: limits,
+          max_speed: max_speed
+        }
+
+        {:ok, state}
     end
   end
 
@@ -148,8 +158,17 @@ defmodule BB.Ufactory.Actuator.Joint do
 
   def handle_command(%Message{payload: %Command.Hold{}}, state) do
     case brake_at_current(state) do
-      :ok -> {:noreply, state}
-      :no_feedback -> {:reply, {:error, :position_unknown}, state}
+      :ok ->
+        {:noreply, state}
+
+      :no_feedback ->
+        # Logged because pubsub/cast delivery discards the error reply — a
+        # refused brake must leave a trace somewhere.
+        Logger.warning(
+          "[BB.Ufactory.Actuator.Joint] J#{state.joint} Hold refused: current position unknown"
+        )
+
+        {:reply, {:error, :position_unknown}, state}
     end
   end
 
@@ -159,27 +178,33 @@ defmodule BB.Ufactory.Actuator.Joint do
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
-  # Narrows the factory model limits by the joint limits declared in the
-  # robot's topology DSL (`limit do ... end`), so a user who tightens a
-  # joint's range in their robot module gets that range enforced by the
-  # clamp. Topology limits can only narrow, never widen, the factory range.
-  # Falls back to the model limits when the topology gives no usable limit —
-  # the `function_exported?` guard covers hand-built robots in tests that
-  # never define `robot/0`, and the `with` else covers a missing actuator
-  # entry, an unknown joint, or non-numeric limits.
-  defp intersect_topology_limits(bb, {model_lower, model_upper} = model_limits) do
-    actuator_name = List.last(bb.path)
+  # bb resolves the topology's `limit do ... end` block into a MotorProfile
+  # and injects it into the resolved opts, so a user who tightens a joint's
+  # range in their robot module gets that range enforced by the clamp.
+  # Topology limits can only narrow, never widen, the factory range (the
+  # firmware enforces the factory limits regardless). Hand-built option
+  # lists (tests, scripts) carry no profile — fall back to the model limits.
+  # Motor space equals joint space here because init refuses transmissions.
+  defp intersect_topology_limits(opts, {model_lower, model_upper} = model_limits) do
+    case Keyword.get(opts, :motor_profile) do
+      %BB.Actuator.MotorProfile{motor_lower: lower, motor_upper: upper}
+      when is_number(lower) and is_number(upper) ->
+        {max(model_lower, lower * 1.0), min(model_upper, upper * 1.0)}
 
-    with true <- Code.ensure_loaded?(bb.robot) and function_exported?(bb.robot, :robot, 0),
-         robot = bb.robot.robot(),
-         %{joint: joint_name} <- Map.get(robot.actuators, actuator_name),
-         {:ok, %BB.Robot.Joint{limits: %{lower: lower, upper: upper}}} <-
-           BB.Robot.get_joint(robot, joint_name),
-         true <- is_number(lower) and is_number(upper) do
-      {max(model_lower, lower * 1.0), min(model_upper, upper * 1.0)}
-    else
-      _ -> model_limits
+      _ ->
+        model_limits
     end
+  end
+
+  # True when the robot's topology declares a transmission on this actuator.
+  # The `function_exported?` guard covers hand-built robots in tests that
+  # never define `robot/0`.
+  defp transmission_declared?(bb) do
+    Code.ensure_loaded?(bb.robot) and function_exported?(bb.robot, :robot, 0) and
+      match?(
+        %{transmission: transmission} when not is_nil(transmission),
+        Map.get(bb.robot.robot().actuators, List.last(bb.path))
+      )
   end
 
   defp apply_position_command(%Command.Position{position: position} = cmd, state) do

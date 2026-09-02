@@ -95,6 +95,76 @@ defmodule BB.Ufactory.Actuator.JointTest do
       assert state.limits == {-@two_pi, @two_pi}
     end
 
+    test "narrows the model limits by the injected motor profile" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      # bb builds this from the robot topology's `limit do ... end` block —
+      # a user-narrowed range must be enforced by the clamp.
+      profile = %BB.Actuator.MotorProfile{motor_lower: -1.0, motor_upper: 1.5}
+
+      opts = [
+        bb: %{robot: TestRobot, path: [:j2, :motor]},
+        joint: 2,
+        controller: :xarm,
+        motor_profile: profile
+      ]
+
+      assert {:ok, state} = Joint.init(opts)
+      assert state.limits == {-1.0, 1.5}
+    end
+
+    test "a motor profile wider than the model limits does not widen them" do
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TestRobot, :xarm, :get_ets -> ets
+        TestRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      profile = %BB.Actuator.MotorProfile{motor_lower: -100.0, motor_upper: 100.0}
+
+      opts = [
+        bb: %{robot: TestRobot, path: [:j2, :motor]},
+        joint: 2,
+        controller: :xarm,
+        motor_profile: profile
+      ]
+
+      assert {:ok, state} = Joint.init(opts)
+      assert state.limits == {@j2_lower, @j2_upper}
+    end
+
+    test "refuses a robot that declares a transmission on the actuator" do
+      defmodule TransmissionRobot do
+        # Minimal robot/0 shape — init only reads .actuators[name].transmission.
+        def robot do
+          %{actuators: %{motor: %{name: :motor, joint: :j2, transmission: %{reduction: 2.0}}}}
+        end
+      end
+
+      ets = make_ets()
+
+      BB.Process
+      |> stub(:call, fn
+        TransmissionRobot, :xarm, :get_ets -> ets
+        TransmissionRobot, :xarm, :get_model_config -> @model_config
+      end)
+
+      opts = [bb: %{robot: TransmissionRobot, path: [:j2, :motor]}, joint: 2, controller: :xarm]
+
+      # bb hands handle_command MOTOR-space values, but this driver streams
+      # joint angles to the firmware — a non-identity transmission would be
+      # silently wrong on every command.
+      assert {:stop, {:unsupported_transmission, :motor}} = Joint.init(opts)
+    end
+
     test "does not subscribe to its own command topic (BB.Actuator.Server owns it)" do
       ets = make_ets()
 

@@ -116,7 +116,13 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   @impl BB.Actuator
   def handle_command(%Message{payload: %Command.Position{position: pos_mm}}, state) do
-    case apply_track_position(pos_mm, state) do
+    initial =
+      case read_track_position(state.bb.robot, state.controller) do
+        {:ok, pos} -> pos
+        :error -> nil
+      end
+
+    case apply_track_position(pos_mm, initial, state) do
       :ok -> {:noreply, state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
@@ -125,16 +131,23 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   # Braking the carriage means re-targeting its current position — the servo
   # tracks the most recent target, so the write preempts the move in flight.
   # Refused when the position read fails: commanding an assumed position
-  # (e.g. 0.0) would MOVE the track rather than stop it.
+  # (e.g. 0.0) would MOVE the track rather than stop it. The read doubles as
+  # BeginMotion's initial position so a Stop performs exactly one RS485
+  # round-trip — braking latency must not pay for a second read.
   def handle_command(%Message{payload: %Command.Stop{}}, state) do
     case read_track_position(state.bb.robot, state.controller) do
       {:ok, pos_mm} ->
-        case apply_track_position(pos_mm, state) do
+        case apply_track_position(pos_mm, pos_mm, state) do
           :ok -> {:noreply, state}
           {:error, reason} -> {:reply, {:error, reason}, state}
         end
 
       :error ->
+        Logger.warning(
+          "[BB.Ufactory.Actuator.LinearTrack] Stop refused: position read failed — " <>
+            "the carriage may still be moving"
+        )
+
         {:reply, {:error, :position_unknown}, state}
     end
   end
@@ -145,7 +158,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
-  defp apply_track_position(pos_mm, state) do
+  defp apply_track_position(pos_mm, initial_position, state) do
     clamped = pos_mm |> max(0.0) |> min(state.stroke_mm)
 
     if clamped != pos_mm do
@@ -156,12 +169,6 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     end
 
     pos_mm = clamped
-
-    initial_position =
-      case read_track_position(state.bb.robot, state.controller) do
-        {:ok, pos} -> pos
-        :error -> 0.0
-      end
 
     {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, state.speed)
 
@@ -211,8 +218,11 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     end
   end
 
+  # A failed initial-position read falls back to the target (zero travel
+  # estimate) rather than fabricating a 0.0 start the carriage never held.
   defp publish_begin_motion(pos_mm, initial_position, state) do
     actuator_name = List.last(state.bb.path)
+    initial_position = initial_position || pos_mm
     travel_distance = abs(pos_mm - initial_position)
     travel_ms = round(travel_distance / max(state.speed, 1) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms

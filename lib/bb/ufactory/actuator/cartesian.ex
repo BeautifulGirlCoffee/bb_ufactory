@@ -116,11 +116,11 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   @impl BB.Actuator
   def handle_command(%Message{payload: %CartesianMove{} = cmd}, state) do
-    # Both operands are already floats: the payload schema types speed and
-    # acceleration as :float, and init/1 coerces the configured defaults.
-    pose = {cmd.x, cmd.y, cmd.z, cmd.roll, cmd.pitch, cmd.yaw}
-    speed = cmd.speed || state.speed
-    accel = cmd.acceleration || state.acceleration
+    # The payload accepts integers for ergonomics (`x: 300`); normalize to
+    # floats before they reach the fp32 encoders.
+    pose = {cmd.x * 1.0, cmd.y * 1.0, cmd.z * 1.0, cmd.roll * 1.0, cmd.pitch * 1.0, cmd.yaw * 1.0}
+    speed = (cmd.speed || state.speed) * 1.0
+    accel = (cmd.acceleration || state.acceleration) * 1.0
 
     case send_cartesian(pose, speed, accel, state) do
       :ok -> {:noreply, state}
@@ -133,19 +133,41 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   end
 
   # ── Legacy direct cast: {:move_cartesian, pose} ─────────────────────────────
+  #
+  # Deprecated: prefer the CartesianMove payload. bb's command pipeline never
+  # sees these casts, so the armed check is enforced HERE — without it, a
+  # disarmed robot would happily execute a MOVE_LINE (disarm_action :hold
+  # sends no SET_STATE 4, so the firmware remains motion-ready).
 
   @impl BB.Actuator
   def handle_cast({:move_cartesian, {_x, _y, _z, _roll, _pitch, _yaw} = pose}, state) do
-    send_cartesian(pose, state.speed, state.acceleration, state)
+    legacy_cast_move(pose, state.speed, state.acceleration, state)
     {:noreply, state}
   end
 
   def handle_cast({:move_cartesian, pose, speed, accel}, state) do
-    send_cartesian(pose, speed * 1.0, accel * 1.0, state)
+    legacy_cast_move(pose, speed * 1.0, accel * 1.0, state)
     {:noreply, state}
   end
 
   def handle_cast(_request, state), do: {:noreply, state}
+
+  defp legacy_cast_move(pose, speed, accel, state) do
+    if BB.Safety.armed?(state.bb.robot) do
+      Logger.warning(
+        "[BB.Ufactory.Actuator.Cartesian] {:move_cartesian, ...} casts are deprecated — " <>
+          "send a BB.Ufactory.Message.Command.CartesianMove through the command pipeline"
+      )
+
+      send_cartesian(pose, speed, accel, state)
+    else
+      Logger.warning(
+        "[BB.Ufactory.Actuator.Cartesian] Dropped {:move_cartesian, ...} cast: robot is not armed"
+      )
+
+      :ok
+    end
+  end
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 

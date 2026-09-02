@@ -39,21 +39,23 @@ defmodule BB.Ufactory.Message.Command.CartesianMove do
 
   defstruct [:x, :y, :z, :roll, :pitch, :yaw, :speed, :acceleration, :command_id]
 
+  # `number` rather than `float`: `x: 300` is as natural as `x: 300.0`, and
+  # the wire encoders accept both. The actuator normalizes to floats.
   use BB.Message,
     schema: [
-      x: [type: :float, required: true, doc: "Target X position in mm"],
-      y: [type: :float, required: true, doc: "Target Y position in mm"],
-      z: [type: :float, required: true, doc: "Target Z position in mm"],
-      roll: [type: :float, required: true, doc: "Target roll in radians"],
-      pitch: [type: :float, required: true, doc: "Target pitch in radians"],
-      yaw: [type: :float, required: true, doc: "Target yaw in radians"],
+      x: [type: {:or, [:float, :integer]}, required: true, doc: "Target X position in mm"],
+      y: [type: {:or, [:float, :integer]}, required: true, doc: "Target Y position in mm"],
+      z: [type: {:or, [:float, :integer]}, required: true, doc: "Target Z position in mm"],
+      roll: [type: {:or, [:float, :integer]}, required: true, doc: "Target roll in radians"],
+      pitch: [type: {:or, [:float, :integer]}, required: true, doc: "Target pitch in radians"],
+      yaw: [type: {:or, [:float, :integer]}, required: true, doc: "Target yaw in radians"],
       speed: [
-        type: {:or, [nil, :float]},
+        type: {:or, [nil, :float, :integer]},
         required: false,
         doc: "TCP linear speed in mm/s (actuator default when nil)"
       ],
       acceleration: [
-        type: {:or, [nil, :float]},
+        type: {:or, [nil, :float, :integer]},
         required: false,
         doc: "TCP linear acceleration in mm/s² (actuator default when nil)"
       ],
@@ -65,14 +67,14 @@ defmodule BB.Ufactory.Message.Command.CartesianMove do
     ]
 
   @type t :: %__MODULE__{
-          x: float(),
-          y: float(),
-          z: float(),
-          roll: float(),
-          pitch: float(),
-          yaw: float(),
-          speed: float() | nil,
-          acceleration: float() | nil,
+          x: number(),
+          y: number(),
+          z: number(),
+          roll: number(),
+          pitch: number(),
+          yaw: number(),
+          speed: number() | nil,
+          acceleration: number() | nil,
           command_id: reference() | nil
         }
 end

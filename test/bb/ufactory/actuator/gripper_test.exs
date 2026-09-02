@@ -18,7 +18,8 @@ defmodule BB.Ufactory.Actuator.GripperTest do
     %{
       bb: %{robot: TestRobot, path: [:gripper]},
       controller: :xarm,
-      speed: Keyword.get(opts, :speed, 1500)
+      speed: Keyword.get(opts, :speed, 1500),
+      last_commanded: Keyword.get(opts, :last_commanded)
     }
   end
 
@@ -113,7 +114,28 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(420.0)
-      assert {:noreply, ^state} = Gripper.handle_command(msg, state)
+      assert {:noreply, new_state} = Gripper.handle_command(msg, state)
+      assert new_state.last_commanded == 420
+    end
+
+    test "BeginMotion uses the last commanded position as initial estimate" do
+      state = make_state(last_commanded: 700)
+      test_pid = self()
+
+      BB.Process
+      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+
+      BB
+      |> expect(:publish, fn TestRobot, [:actuator, :gripper], msg ->
+        send(test_pid, {:begin_motion, msg.payload})
+        :ok
+      end)
+
+      assert {:noreply, _new_state} = Gripper.handle_command(position_msg(100.0), state)
+
+      assert_receive {:begin_motion, bm}
+      assert bm.initial_position == 700.0
+      assert bm.target_position == 100.0
     end
 
     test "rounds float position to nearest integer" do

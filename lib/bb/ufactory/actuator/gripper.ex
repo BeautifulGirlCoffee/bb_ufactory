@@ -68,7 +68,10 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
     register_arm_frames(bb.robot, controller, speed)
 
-    {:ok, %{bb: bb, controller: controller, speed: speed}}
+    # last_commanded: the RS485 proxy implements no position read-back, so
+    # the last commanded target is the best available initial-position
+    # estimate for BeginMotion (nil until the first command).
+    {:ok, %{bb: bb, controller: controller, speed: speed, last_commanded: nil}}
   end
 
   # ── disarm/1 — disable gripper via controller ───────────────────────────────
@@ -101,7 +104,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   @impl BB.Actuator
   def handle_command(%Message{payload: %Command.Position{position: pos}}, state) do
     case apply_gripper_position(pos, state) do
-      :ok -> {:noreply, state}
+      {:ok, new_state} -> {:noreply, new_state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
@@ -136,7 +139,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
     case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
       :ok ->
         publish_begin_motion(pos_int, state)
-        :ok
+        {:ok, %{state | last_commanded: pos_int}}
 
       {:error, reason} = error ->
         Logger.warning(
@@ -149,12 +152,15 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
   defp publish_begin_motion(pos_int, state) do
     actuator_name = List.last(state.bb.path)
-    # Gripper moves at `speed` pulse units/s; estimate travel assuming worst case from 0.
-    travel_ms = round(pos_int / max(state.speed, 1) * 1000)
+    # The last commanded target is the initial-position estimate; before the
+    # first command the jaw position is unknown, so fall back to the old
+    # worst-case-from-0 travel estimate rather than claiming zero travel.
+    initial = state.last_commanded || 0
+    travel_ms = round(abs(pos_int - initial) / max(state.speed, 1) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
     case Message.new(BeginMotion, actuator_name,
-           initial_position: 0.0,
+           initial_position: initial * 1.0,
            target_position: pos_int * 1.0,
            expected_arrival: expected_arrival,
            command_type: :position

@@ -107,6 +107,36 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       assert {:noreply, ^state} = Cartesian.handle_command(msg, state)
     end
 
+    test "accepts integer pose fields and normalizes them to floats" do
+      state = make_state()
+      # `x: 300` is as natural as `x: 300.0` — the schema takes both, and
+      # the encoder must receive floats.
+      expected_frame =
+        Protocol.cmd_move_cartesian(0, {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}, 80.0, 2000.0)
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+        assert frame == expected_frame
+        :ok
+      end)
+
+      BB
+      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
+
+      msg =
+        Message.new!(CartesianMove, :cartesian,
+          x: 300,
+          y: 0,
+          z: 200,
+          roll: 0,
+          pitch: 0,
+          yaw: 0,
+          speed: 80
+        )
+
+      assert {:noreply, ^state} = Cartesian.handle_command(msg, state)
+    end
+
     test "uses per-command speed and acceleration from the payload" do
       state = make_state()
       pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
@@ -164,6 +194,27 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
   # ── handle_cast {:move_cartesian, pose} (legacy interface) ───────────────────
 
   describe "handle_cast({:move_cartesian, pose}, state)" do
+    setup do
+      # The legacy cast path enforces the armed check itself (bb's command
+      # pipeline never sees casts); these tests exercise the armed case.
+      BB.Safety
+      |> stub(:armed?, fn TestRobot -> true end)
+
+      :ok
+    end
+
+    test "drops the cast when the robot is not armed" do
+      BB.Safety
+      |> expect(:armed?, fn TestRobot -> false end)
+
+      # No :send_command expectation: reaching the controller would fail the
+      # Mimic verification.
+      state = make_state()
+      pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
+
+      assert {:noreply, ^state} = Cartesian.handle_cast({:move_cartesian, pose}, state)
+    end
+
     test "sends cmd_move_cartesian frame via controller call" do
       state = make_state()
       pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
