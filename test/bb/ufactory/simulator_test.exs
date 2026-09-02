@@ -323,6 +323,83 @@ defmodule BB.Ufactory.SimulatorTest do
     end
   end
 
+  # ── Firmware stop semantics ─────────────────────────────────────────────────
+  #
+  # cmd_stop's SET_STATE value was shipped inverted (state 0 = motion-ready,
+  # not stop) and every unit test passed, because unit tests can only assert
+  # frame bytes — a byte-correct frame with the wrong register VALUE is
+  # indistinguishable without firmware. This tier is the only place the
+  # semantics are actually exercised.
+
+  describe "firmware stop semantics" do
+    test "cmd_stop halts an in-flight move short of its target and clears the queue" do
+      {:ok, cmd} = connect_command()
+      {:ok, report} = connect_report()
+      prepare_arm(cmd)
+
+      {:ok, initial, rest} = read_report(report)
+      initial_angles = Enum.take(initial.angles, @joints)
+      start_j1 = hd(initial_angles)
+      # A long, slow move so there is ample time to stop it mid-flight.
+      target_j1 = start_j1 + 1.2
+      target_angles = List.replace_at(initial_angles, 0, target_j1)
+
+      :ok = :gen_tcp.send(cmd, Protocol.cmd_move_joints(10, target_angles, 0.3, 3.0))
+
+      # Wait until the joint has visibly started moving...
+      assert {:ok, _frame, _rest} =
+               await_report(report, rest, 15_000, fn r ->
+                 abs(hd(r.angles) - start_j1) > 0.1
+               end)
+
+      # ...then stop. SET_STATE 4 must terminate the motion and clear the
+      # queued command — the inverted frame (SET_STATE 0) would let the move
+      # run to completion.
+      send_frame(cmd, Protocol.cmd_stop(11))
+
+      assert {:ok, halted} = await_halt(1, 15_000)
+      halted_j1 = hd(halted.angles)
+
+      assert abs(halted_j1 - target_j1) > 0.3,
+             "J1 reached its target (#{target_j1}) despite cmd_stop — " <>
+               "SET_STATE semantics are wrong"
+
+      # Stopped means STOPPED: the cleared queue must not resume the move.
+      Process.sleep(1_500)
+      {:ok, later} = current_state()
+      assert_in_delta hd(later.angles), halted_j1, 0.05
+
+      # SET_STATE 0 (motion) re-enables the arm; return to the initial pose.
+      prepare_arm(cmd)
+      {:ok, _first, rest2} = read_report(report)
+      :ok = :gen_tcp.send(cmd, Protocol.cmd_move_joints(12, initial_angles, 0.8, 8.0))
+
+      assert {:ok, _frame, _rest} =
+               await_report(report, rest2, 20_000, fn r ->
+                 abs(hd(r.angles) - start_j1) < 0.02
+               end)
+
+      :gen_tcp.close(cmd)
+      :gen_tcp.close(report)
+    end
+  end
+
+  # Waits until a joint's reported angle is stable across two samples taken
+  # 400 ms apart (fresh report connections, so no stale buffered frames).
+  defp await_halt(_joint_idx, deadline_ms) when deadline_ms <= 0, do: :timeout
+
+  defp await_halt(joint_idx, deadline_ms) do
+    {:ok, a} = current_state()
+    Process.sleep(400)
+    {:ok, b} = current_state()
+
+    if abs(Enum.at(a.angles, joint_idx - 1) - Enum.at(b.angles, joint_idx - 1)) < 0.005 do
+      {:ok, b}
+    else
+      await_halt(joint_idx, deadline_ms - 400)
+    end
+  end
+
   # Polls GET_ERROR once via command/2 (which drains stale responses).
   # Retries on a non-0x0F response (an in-flight reply to an earlier
   # fire-and-forget frame).
@@ -444,6 +521,77 @@ defmodule BB.Ufactory.SimulatorTest do
       assert await_joint(1, target, 30_000), "J1 did not converge to #{target}"
 
       assert :ok = BB.Safety.disarm(Robot)
+    end
+
+    test "Stop through the actuator brakes J1 short of its target and holds" do
+      BB.subscribe(Robot, [:sensor, :xarm])
+
+      assert :ok = BB.Safety.arm(Robot)
+      Process.sleep(1_000)
+
+      assert_receive {:bb, _, %BB.Message{payload: %BB.Message.Sensor.JointState{} = js0}},
+                     5_000
+
+      start = hd(js0.positions)
+      target = start + 1.0
+
+      # A slow move (velocity hint) so there is time to stop it mid-flight.
+      assert :ok = BB.Actuator.set_position(Robot, :j1_motor, target, velocity: 0.25)
+      assert await_moved(1, start, 0.1, 20_000), "J1 never started moving"
+
+      # Stop latches the current reported position as the loop target.
+      assert {:ok, _accepted} = BB.Actuator.stop_sync(Robot, :j1_motor)
+
+      # The joint must settle short of the original target...
+      halted = await_stable(1, 15_000)
+      assert is_number(halted), "J1 never settled after Stop"
+      assert abs(halted - target) > 0.3, "J1 reached its target despite Stop"
+
+      # ...and STAY there (the latched brake target keeps it in place).
+      Process.sleep(1_500)
+      later = drain_latest_position(1) || halted
+      assert_in_delta later, halted, 0.05
+
+      assert :ok = BB.Safety.disarm(Robot)
+    end
+
+    defp await_moved(_index, _from, _delta, deadline_ms) when deadline_ms <= 0, do: false
+
+    defp await_moved(index, from, delta, deadline_ms) do
+      receive do
+        {:bb, _, %BB.Message{payload: %BB.Message.Sensor.JointState{positions: positions}}} ->
+          if abs(Enum.at(positions, index - 1) - from) > delta do
+            true
+          else
+            await_moved(index, from, delta, deadline_ms - 10)
+          end
+      after
+        1_000 -> await_moved(index, from, delta, deadline_ms - 1_000)
+      end
+    end
+
+    # Latest JointState position currently in the mailbox (nil when none).
+    defp drain_latest_position(index, latest \\ nil) do
+      receive do
+        {:bb, _, %BB.Message{payload: %BB.Message.Sensor.JointState{positions: positions}}} ->
+          drain_latest_position(index, Enum.at(positions, index - 1))
+      after
+        0 -> latest
+      end
+    end
+
+    # Position once two samples ~500 ms apart agree within 5 mrad.
+    defp await_stable(_index, deadline_ms) when deadline_ms <= 0, do: nil
+
+    defp await_stable(index, deadline_ms) do
+      a = drain_latest_position(index)
+      Process.sleep(500)
+      b = drain_latest_position(index)
+
+      cond do
+        is_number(a) and is_number(b) and abs(a - b) < 0.005 -> b
+        true -> await_stable(index, deadline_ms - 500)
+      end
     end
 
     defp await_joint(_index, _target, deadline_ms) when deadline_ms <= 0, do: false
