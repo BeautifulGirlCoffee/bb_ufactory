@@ -135,6 +135,24 @@ defmodule BB.Ufactory.Controller do
           "Enable the Cartesian workspace fence defined by `tcp_boundary`. " <>
             "Has no effect if `tcp_boundary` is nil (register 0x3B)."
       ],
+      report_stale_ms: [
+        type: :pos_integer,
+        default: 250,
+        doc:
+          "Maximum age of the last report frame before the 100 Hz loop stops " <>
+            "dispatching joint moves. Reports are pushed at ~100 Hz, so stale " <>
+            "feedback means the loop would command the arm blind — joints " <>
+            "without an explicit target get re-driven to their last-known angle."
+      ],
+      feedback_loss_fatal_ms: [
+        type: :pos_integer,
+        default: 3_000,
+        doc:
+          "How long the loop may keep skipping ticks on stale feedback (while " <>
+            "armed with motion pending) before the controller stops and reports " <>
+            "to `BB.Safety` — so a dead report link cannot leave the robot " <>
+            "armed and blind indefinitely."
+      ],
       auto_clear_errors: [
         type: :boolean,
         default: true,
@@ -291,6 +309,11 @@ defmodule BB.Ufactory.Controller do
         reconnect_attempts: 0,
         report_reconnect_pending: false,
         move_skip_logged: false,
+        last_report_at: nil,
+        feedback_stale_since: nil,
+        feedback_stale_logged: false,
+        report_stale_ms: Keyword.get(opts, :report_stale_ms, 250),
+        feedback_loss_fatal_ms: Keyword.get(opts, :feedback_loss_fatal_ms, 3_000),
         arm_frames: [],
         auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
         error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
@@ -334,6 +357,9 @@ defmodule BB.Ufactory.Controller do
 
       {:fatal, reason, state} ->
         cmd_socket_fatal(reason, state)
+
+      {:feedback_loss, state} ->
+        feedback_loss_fatal(state)
     end
   end
 
@@ -733,28 +759,91 @@ defmodule BB.Ufactory.Controller do
 
     pending? = Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos} -> set_pos != nil end)
 
-    if pending? and BB.Safety.armed?(state.bb.robot) do
-      positions =
-        Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} -> set_pos || cur_pos end)
+    cond do
+      not (pending? and BB.Safety.armed?(state.bb.robot)) ->
+        {:ok, %{state | feedback_stale_since: nil}}
 
-      # Never substitute a default for an unknown joint position: commanding
-      # 0.0 for joints whose current angle has not yet been reported would
-      # sweep the whole arm toward the zero pose. Skip the tick until a report
-      # frame has populated every joint.
-      if Enum.any?(positions, &is_nil/1) do
-        {:ok, log_move_skip_once(state)}
-      else
-        max_speed = state.model_config.max_speed_rads
-        # Use a conservative default for acceleration (rad/s²); the arm's own
-        # motion planner will further clamp this per its firmware configuration.
-        max_accel = max_speed * 10.0
+      feedback_stale?(state) ->
+        handle_stale_feedback(state)
 
-        frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
-        send_command(frame, %{state | move_skip_logged: false})
-      end
-    else
-      {:ok, state}
+      true ->
+        state = %{state | feedback_stale_since: nil, feedback_stale_logged: false}
+        dispatch_joint_move(rows, state)
     end
+  end
+
+  defp dispatch_joint_move(rows, state) do
+    positions =
+      Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos} -> set_pos || cur_pos end)
+
+    # Never substitute a default for an unknown joint position: commanding
+    # 0.0 for joints whose current angle has not yet been reported would
+    # sweep the whole arm toward the zero pose. Skip the tick until a report
+    # frame has populated every joint.
+    if Enum.any?(positions, &is_nil/1) do
+      {:ok, log_move_skip_once(state)}
+    else
+      max_speed = state.model_config.max_speed_rads
+      # Use a conservative default for acceleration (rad/s²); the arm's own
+      # motion planner will further clamp this per its firmware configuration.
+      max_accel = max_speed * 10.0
+
+      frame = Protocol.cmd_move_joints(state.txn_id, positions, max_speed, max_accel)
+      send_command(frame, %{state | move_skip_logged: false})
+    end
+  end
+
+  # Reports are pushed at ~100 Hz, so feedback is stale when the report socket
+  # is down or no frame has arrived within report_stale_ms. Streaming moves
+  # against frozen positions would command the arm blind: joints without an
+  # explicit target are re-driven to their last-known (possibly wrong) angle.
+  defp feedback_stale?(state) do
+    state.report_socket == nil or state.last_report_at == nil or
+      System.monotonic_time(:millisecond) - state.last_report_at > state.report_stale_ms
+  end
+
+  defp handle_stale_feedback(state) do
+    now = System.monotonic_time(:millisecond)
+    since = state.feedback_stale_since || now
+    state = %{state | feedback_stale_since: since}
+
+    if now - since >= state.feedback_loss_fatal_ms do
+      {:feedback_loss, state}
+    else
+      {:ok, log_feedback_stale_once(state)}
+    end
+  end
+
+  defp log_feedback_stale_once(%{feedback_stale_logged: true} = state), do: state
+
+  defp log_feedback_stale_once(state) do
+    Logger.warning(
+      "[BB.Ufactory.Controller] Skipping joint moves for #{state.controller_name}: " <>
+        "report feedback stale (socket down or no frame within #{state.report_stale_ms} ms)"
+    )
+
+    %{state | feedback_stale_logged: true}
+  end
+
+  # A dead report link must not leave the robot armed and blind indefinitely:
+  # after feedback_loss_fatal_ms of continuous staleness with motion pending,
+  # stop the controller so bb's supervision and safety escalation take over —
+  # the same recovery path as a dead command socket.
+  defp feedback_loss_fatal(state) do
+    error =
+      ConnectionError.exception(
+        host: state.host,
+        port: state.report_port,
+        reason: :report_feedback_loss
+      )
+
+    Logger.error(
+      "[BB.Ufactory.Controller] No report feedback for #{state.feedback_loss_fatal_ms} ms " <>
+        "with motion pending for #{state.controller_name} — stopping controller"
+    )
+
+    BB.Safety.report_error(state.bb.robot, state.bb.path, error)
+    {:stop, error, state}
   end
 
   defp log_move_skip_once(%{move_skip_logged: true} = state), do: state
@@ -805,6 +894,7 @@ defmodule BB.Ufactory.Controller do
   end
 
   defp update_from_report(report, state) do
+    state = %{state | last_report_at: System.monotonic_time(:millisecond)}
     joint_count = state.model_config.joints
     angles = Enum.take(report.angles, joint_count)
     torques = Enum.take(report.torques, joint_count)

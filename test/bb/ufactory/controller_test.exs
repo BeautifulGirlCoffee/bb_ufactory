@@ -128,6 +128,11 @@ defmodule BB.Ufactory.ControllerTest do
       reconnect_attempts: 0,
       report_reconnect_pending: false,
       move_skip_logged: false,
+      last_report_at: nil,
+      feedback_stale_since: nil,
+      feedback_stale_logged: false,
+      report_stale_ms: 250,
+      feedback_loss_fatal_ms: 3_000,
       arm_frames: [],
       tcp_offset: nil,
       tcp_load: nil,
@@ -1201,7 +1206,13 @@ defmodule BB.Ufactory.ControllerTest do
       BB.Safety
       |> stub(:armed?, fn _robot -> true end)
 
-      state = make_state(cmd_client)
+      # Healthy report feedback: the loop refuses to dispatch on a downed
+      # report socket or stale last_report_at (see the freshness-gate tests).
+      state =
+        make_state(cmd_client, %{
+          report_socket: :fake_report_socket,
+          last_report_at: System.monotonic_time(:millisecond)
+        })
 
       on_exit(fn ->
         :gen_tcp.close(cmd_client)
@@ -1209,6 +1220,73 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       %{state: state, cmd_server: cmd_server}
+    end
+
+    test "skips joint moves while the report socket is down", %{
+      state: state,
+      cmd_server: cmd_server
+    } do
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      state = %{state | report_socket: nil}
+
+      assert {:noreply, new_state} = Controller.handle_info(:tick, state)
+      assert new_state.feedback_stale_logged
+      assert is_integer(new_state.feedback_stale_since)
+      assert {:error, :timeout} = recv_all(cmd_server, 50)
+    end
+
+    test "skips joint moves when the last report frame is stale", %{
+      state: state,
+      cmd_server: cmd_server
+    } do
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+      state = %{state | last_report_at: System.monotonic_time(:millisecond) - 1_000}
+
+      assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
+      assert {:error, :timeout} = recv_all(cmd_server, 50)
+    end
+
+    test "stops the controller after prolonged feedback loss with motion pending",
+         %{state: state} do
+      BB.Safety
+      |> expect(:report_error, fn TestRobot, [:xarm], error ->
+        assert error.__struct__ == BB.Error.Protocol.Ufactory.ConnectionError
+        assert error.reason == :report_feedback_loss
+        :ok
+      end)
+
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+
+      state = %{
+        state
+        | report_socket: nil,
+          feedback_stale_since: System.monotonic_time(:millisecond) - 4_000
+      }
+
+      assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
+               Controller.handle_info(:tick, state)
+    end
+
+    test "resumes dispatch once report feedback is fresh again", %{
+      state: state,
+      cmd_server: cmd_server
+    } do
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5})
+
+      stale = %{state | report_socket: nil}
+      assert {:noreply, stale_state} = Controller.handle_info(:tick, stale)
+      assert {:error, :timeout} = recv_all(cmd_server, 50)
+
+      fresh = %{
+        stale_state
+        | report_socket: :fake_report_socket,
+          last_report_at: System.monotonic_time(:millisecond)
+      }
+
+      assert {:noreply, resumed} = Controller.handle_info(:tick, fresh)
+      assert resumed.feedback_stale_since == nil
+      assert {:ok, data} = recv_all(cmd_server, 200)
+      assert byte_size(data) > 0
     end
 
     test "sends cmd_move_joints when set_positions are pending and robot is armed",
@@ -1377,6 +1455,12 @@ defmodule BB.Ufactory.ControllerTest do
       BB.Safety
       |> stub(:armed?, fn TestRobot -> true end)
       |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
+
+      state = %{
+        state
+        | report_socket: :fake_report_socket,
+          last_report_at: System.monotonic_time(:millisecond)
+      }
 
       for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0})
 
