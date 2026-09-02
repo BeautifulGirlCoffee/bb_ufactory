@@ -22,7 +22,7 @@ joint index (1–6 for the xArm6).
 
 ### How it works
 
-1. A position command arrives at the actuator (via `BB.Process.cast` or pubsub).
+1. A position command arrives at the actuator (via `BB.Actuator.set_position/4`, pubsub, or cast).
 2. The angle is clamped to the joint's configured limits.
 3. The target angle is written into the controller's **ETS table** under the key
    for that joint.
@@ -38,20 +38,13 @@ smooth multi-joint motion.
 ### Sending a joint-space command
 
 ```elixir
-import BB.Unit
+# Move J1 to 45° and J2 to -30° (commands are independent; both land in ETS).
+# set_position/4 is synchronous: :ok means the command was accepted.
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, :math.pi() / 4)
+:ok = BB.Actuator.set_position(MyRobot, :j2_motor, -:math.pi() / 6)
 
-# Move J1 to 45° and J2 to -30° (commands are independent; both land in ETS)
-BB.Process.cast(robot, :j1_motor, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :j1_motor,
-    position: ~u(45 degree) |> Quantity.to(:radian) |> Quantity.value()
-  )
-})
-
-BB.Process.cast(robot, :j2_motor, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :j2_motor,
-    position: ~u(-30 degree) |> Quantity.to(:radian) |> Quantity.value()
-  )
-})
+# An optional velocity hint caps the batch speed for the move (rad/s):
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, 0.5, velocity: 0.2)
 ```
 
 Both commands are picked up in the same or adjacent loop tick and sent as one
@@ -142,10 +135,11 @@ msg = BB.Message.new!(CartesianMove, :cartesian,
 BB.call(robot, :cartesian, {:command, msg})
 ```
 
-### Legacy cast interface
+### Legacy cast interface (deprecated)
 
-The pre-0.2 raw cast still works, but it bypasses the armed check that the
-command pipeline provides:
+The pre-0.2 raw cast still works but is deprecated: it logs a warning on
+every use, and since 0.2.0 it is **dropped when the robot is not armed**
+(previously it would move a disarmed robot). Prefer `CartesianMove`:
 
 ```elixir
 BB.Process.cast(robot, :cartesian, {:move_cartesian, {300.0, 0.0, 400.0, 0.0, 0.0, 0.0}})

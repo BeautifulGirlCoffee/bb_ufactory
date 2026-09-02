@@ -46,33 +46,27 @@ arrive.
 
 ### Commanding the Gripper
 
-Send a `%BB.Message.Actuator.Command.Position{}` with the target position in
-pulse units:
+Command the target position in pulse units — `BB.Actuator.set_position/4`
+is synchronous, so a refusal (robot disarmed, controller unreachable)
+comes back as `{:error, reason}` instead of vanishing:
 
 ```elixir
 # Open gripper (850 = fully open)
-BB.Process.cast(robot, :gripper, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :gripper,
-    position: 850.0
-  )
-})
+:ok = BB.Actuator.set_position(MyRobot, :gripper, 850.0)
 
 # Close gripper (0 = fully closed)
-BB.Process.cast(robot, :gripper, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :gripper,
-    position: 0.0
-  )
-})
+:ok = BB.Actuator.set_position(MyRobot, :gripper, 0.0)
 ```
 
 Positions outside 0–850 are automatically clamped by the actuator.
 
 ### Disarm Behaviour
 
-When the robot is disarmed, `Actuator.Gripper` opens a **fresh TCP connection**
-directly to the arm (bypassing the controller GenServer) and sends
-`cmd_gripper_enable(false)`. This ensures the gripper releases reliably even
-if the controller has crashed.
+When the robot is disarmed, `Actuator.Gripper` sends
+`cmd_gripper_enable(false)` through the controller, best-effort: if the
+controller is down the attempt is swallowed. (The controller's own `disarm/1`
+is the layer that opens a fresh TCP connection to stop the *arm* even after a
+crash — the gripper has no independent connection of its own.)
 
 ---
 
@@ -81,8 +75,10 @@ if the controller has crashed.
 The UFactory F/T sensor attaches to the tool flange and reports six-axis wrench
 data: forces Fx/Fy/Fz (Newtons) and torques Tx/Ty/Tz (Newton-metres).
 
-The sensor is polled at a configurable rate (default 50 Hz) by sending
-`cmd_get_ft_data()` (register 0xC8) via the controller.
+Wrench data is **push-based**: once the sensor is enabled (register 0xC9),
+the arm includes `ft_filtered` values in its 135+ byte real-time report
+frames, and the controller publishes a `BB.Ufactory.Message.Wrench` for each
+one — no polling is involved.
 
 ### Adding the Sensor
 
@@ -114,8 +110,9 @@ end
 
 ### Disarm Behaviour
 
-On disarm, the sensor sends `cmd_ft_sensor_enable(false)` via a fresh TCP
-connection to deactivate the hardware.
+On disarm, the sensor sends `cmd_ft_sensor_enable(false)` through the
+controller, best-effort: if the controller is already down, the attempt is
+silently ignored.
 
 ---
 
@@ -148,13 +145,13 @@ end
 Position is given in millimetres:
 
 ```elixir
-# Move track to 500 mm from the home position
-BB.Process.cast(robot, :track, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :track,
-    position: 500.0
-  )
-})
+# Move track to 500 mm from the home position (synchronous)
+:ok = BB.Actuator.set_position(MyRobot, :track, 500.0)
 ```
+
+`BB.Actuator.stop(MyRobot, :track)` brakes the carriage by re-targeting its
+current position (read over RS485); the stop is refused with
+`{:error, :position_unknown}` if the read fails.
 
 Under the hood, the actuator sends two sequential frames: a speed-set frame
 followed by a position-set frame. Speed must arrive first so the arm uses the

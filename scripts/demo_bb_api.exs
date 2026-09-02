@@ -380,8 +380,8 @@ log.("Multi-joint move complete.")
 # ── Cartesian motion ────────────────────────────────────────────────────────
 #
 # The Cartesian actuator commands the whole arm in task space (x,y,z,r,p,y)
-# using the arm's built-in IK solver. It's wired as a second actuator on
-# the j6 joint and accessed via BB.Process.cast.
+# using the arm's built-in IK solver, driven through BB's gated command
+# pipeline with a CartesianMove payload (see `move` below).
 
 BB.subscribe(DemoRobot, [:sensor, :xarm, :tcp_pose])
 Process.sleep(100)

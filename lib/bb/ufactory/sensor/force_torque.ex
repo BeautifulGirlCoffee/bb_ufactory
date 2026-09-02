@@ -47,11 +47,6 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
         type: :atom,
         required: true,
         doc: "Name of the xArm controller in the robot's registry"
-      ],
-      poll_interval_ms: [
-        type: :pos_integer,
-        default: 20,
-        doc: "Kept for API compatibility; data rate is driven by the controller's report socket"
       ]
     ]
 

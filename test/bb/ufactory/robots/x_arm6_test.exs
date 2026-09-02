@@ -31,16 +31,19 @@ defmodule BB.Ufactory.Robots.XArm6Test do
   describe "robot definition" do
     setup do
       robot = XArm6.robot()
-      joints = BB.Robot.joints_in_order(robot)
-      %{robot: robot, joints: joints}
+      all_joints = BB.Robot.joints_in_order(robot)
+      joints = Enum.filter(all_joints, &(&1.type == :revolute))
+      %{robot: robot, joints: joints, all_joints: all_joints}
     end
 
-    test "defines exactly 6 joints", %{joints: joints} do
+    test "defines exactly 6 revolute joints", %{joints: joints} do
       assert length(joints) == 6
     end
 
-    test "all joints are revolute", %{joints: joints} do
-      assert Enum.all?(joints, &(&1.type == :revolute))
+    test "the only non-revolute joints are fixed accessory mounts", %{all_joints: all_joints} do
+      others = Enum.reject(all_joints, &(&1.type == :revolute))
+      assert Enum.all?(others, &(&1.type == :fixed))
+      assert Enum.map(others, & &1.name) == [:cartesian_mount]
     end
 
     test "joints are named j1 through j6", %{joints: joints} do
@@ -104,17 +107,36 @@ defmodule BB.Ufactory.Robots.XArm6Test do
 
     test "quick-start module defines the full 6-joint robot" do
       robot = QuickStart.robot()
-      joints = BB.Robot.joints_in_order(robot)
+
+      joints =
+        robot |> BB.Robot.joints_in_order() |> Enum.filter(&(&1.type == :revolute))
 
       assert Enum.map(joints, & &1.name) == [:j1, :j2, :j3, :j4, :j5, :j6]
       assert Map.has_key?(robot.actuators, :j1_motor)
       refute Map.has_key?(robot.actuators, :gripper)
+
+      # Cartesian is on by default — the README's CartesianMove example must
+      # work against the quick-start robot.
+      assert %{joint: :cartesian_mount} = robot.actuators[:cartesian]
+    end
+
+    test "cartesian: false omits the cartesian actuator" do
+      defmodule NoCartesian do
+        use BB.Ufactory.Robots.XArm6, cartesian: false
+      end
+
+      refute Map.has_key?(NoCartesian.robot().actuators, :cartesian)
     end
 
     test "quick-start module matches the base definition's limits" do
-      base = Enum.map(BB.Robot.joints_in_order(XArm6.robot()), & &1.limits)
-      derived = Enum.map(BB.Robot.joints_in_order(QuickStart.robot()), & &1.limits)
-      assert base == derived
+      limits = fn robot ->
+        robot
+        |> BB.Robot.joints_in_order()
+        |> Enum.filter(&(&1.type == :revolute))
+        |> Enum.map(& &1.limits)
+      end
+
+      assert limits.(XArm6.robot()) == limits.(QuickStart.robot())
     end
 
     test "accessory options add gripper and track actuators on fixed mounts" do

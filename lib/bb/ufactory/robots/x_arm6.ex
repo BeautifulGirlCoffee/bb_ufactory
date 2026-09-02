@@ -15,6 +15,7 @@ defmodule BB.Ufactory.Robots.XArm6.Definition do
         loop_hz: 100,
         simulation: :mock,
         controller: [],
+        cartesian: true,
         gripper: false,
         linear_track: false
       )
@@ -23,6 +24,15 @@ defmodule BB.Ufactory.Robots.XArm6.Definition do
       Keyword.merge(
         [host: opts[:host], model: :xarm6, loop_hz: opts[:loop_hz]],
         opts[:controller]
+      )
+
+    cartesian_mount =
+      mount_ast(
+        :cartesian_mount,
+        :cartesian_body,
+        :cartesian,
+        BB.Ufactory.Actuator.Cartesian,
+        opts[:cartesian]
       )
 
     gripper_mount =
@@ -150,7 +160,7 @@ defmodule BB.Ufactory.Robots.XArm6.Definition do
                                 )
 
                                 link :link6 do
-                                  (unquote_splicing(gripper_mount))
+                                  (unquote_splicing(cartesian_mount ++ gripper_mount))
                                 end
                               end
                             end
@@ -232,6 +242,10 @@ defmodule BB.Ufactory.Robots.XArm6 do
   * `:controller` — extra `BB.Ufactory.Controller` options merged into the
     child spec, e.g. `[tcp_offset: {0.0, 0.0, 172.0, 0.0, 0.0, 0.0},
     reduced_mode: true]`
+  * `:cartesian` — a `:cartesian` actuator (`BB.Ufactory.Actuator.Cartesian`)
+    on a fixed mount at `:link6`, for `CartesianMove` commands. **Enabled by
+    default** (it needs no extra hardware); pass `false` to omit, or a
+    keyword list of actuator options (e.g. `[speed: 150.0]`)
   * `:gripper` — `true` (or a keyword list of `BB.Ufactory.Actuator.Gripper`
     options, e.g. `[speed: 1500]`) adds a `:gripper` actuator on a fixed
     mount joint at `:link6` (the TCP)
