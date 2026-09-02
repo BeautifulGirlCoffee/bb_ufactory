@@ -37,11 +37,11 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   `speed` and `acceleration` default to the values configured in
   `options_schema` and can be overridden per-command in the payload.
 
-  ### Legacy cast interface
+  ### Legacy cast interface (deprecated)
 
-  The pre-0.2 raw cast is still accepted for backwards compatibility, but it
-  bypasses the armed check the command pipeline provides — prefer
-  `CartesianMove`:
+  The pre-0.2 raw cast is still accepted for backwards compatibility: it
+  logs a deprecation warning on every use and is **dropped when the robot
+  is not armed** — prefer `CartesianMove`:
 
       BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
       BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, speed, accel})
@@ -118,9 +118,17 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   def handle_command(%Message{payload: %CartesianMove{} = cmd}, state) do
     # The payload accepts integers for ergonomics (`x: 300`); normalize to
     # floats before they reach the fp32 encoders.
-    pose = {cmd.x * 1.0, cmd.y * 1.0, cmd.z * 1.0, cmd.roll * 1.0, cmd.pitch * 1.0, cmd.yaw * 1.0}
-    speed = (cmd.speed || state.speed) * 1.0
-    accel = (cmd.acceleration || state.acceleration) * 1.0
+    pose = {
+      :erlang.float(cmd.x),
+      :erlang.float(cmd.y),
+      :erlang.float(cmd.z),
+      :erlang.float(cmd.roll),
+      :erlang.float(cmd.pitch),
+      :erlang.float(cmd.yaw)
+    }
+
+    speed = :erlang.float(cmd.speed || state.speed)
+    accel = :erlang.float(cmd.acceleration || state.acceleration)
 
     case send_cartesian(pose, speed, accel, state) do
       :ok -> {:noreply, state}

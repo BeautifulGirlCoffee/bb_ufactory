@@ -9,8 +9,10 @@ defmodule BB.Ufactory.ControllerTest do
   import Bitwise
 
   alias BB.Message
+  alias BB.Message.Actuator.Command
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
+  alias BB.Ufactory.Actuator.Joint, as: JointActuator
   alias BB.Ufactory.Controller
   alias BB.Ufactory.Message.CartesianPose
   alias BB.Ufactory.Message.Wrench
@@ -563,9 +565,9 @@ defmodule BB.Ufactory.ControllerTest do
 
       for i <- 1..1_000 do
         target = i / 10_000
-        msg = Message.new!(BB.Message.Actuator.Command.Position, :motor, position: target)
+        msg = Message.new!(Command.Position, :motor, position: target)
 
-        assert {:noreply, _} = BB.Ufactory.Actuator.Joint.handle_command(msg, joint_state)
+        assert {:noreply, _} = JointActuator.handle_command(msg, joint_state)
         assert [{1, _cur, _torq, ^target, _vel}] = :ets.lookup(state.ets, 1)
       end
 

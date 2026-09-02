@@ -588,9 +588,10 @@ defmodule BB.Ufactory.SimulatorTest do
       Process.sleep(500)
       b = drain_latest_position(index)
 
-      cond do
-        is_number(a) and is_number(b) and abs(a - b) < 0.005 -> b
-        true -> await_stable(index, deadline_ms - 500)
+      if is_number(a) and is_number(b) and abs(a - b) < 0.005 do
+        b
+      else
+        await_stable(index, deadline_ms - 500)
       end
     end
 

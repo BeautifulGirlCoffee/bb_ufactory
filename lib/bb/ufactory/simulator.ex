@@ -230,21 +230,19 @@ defmodule BB.Ufactory.Simulator do
   defp recv_response(socket, buffer, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    if remaining <= 0 do
-      {:error, :timeout}
+    with true <- remaining > 0,
+         {:ok, data} <- :gen_tcp.recv(socket, 0, remaining) do
+      parse_or_continue(socket, buffer <> data, deadline)
     else
-      case :gen_tcp.recv(socket, 0, remaining) do
-        {:ok, data} ->
-          buffer = buffer <> data
+      false -> {:error, :timeout}
+      {:error, _reason} = error -> error
+    end
+  end
 
-          case Protocol.parse_response(buffer) do
-            {:more} -> recv_response(socket, buffer, deadline)
-            other -> other
-          end
-
-        {:error, _reason} = error ->
-          error
-      end
+  defp parse_or_continue(socket, buffer, deadline) do
+    case Protocol.parse_response(buffer) do
+      {:more} -> recv_response(socket, buffer, deadline)
+      other -> other
     end
   end
 

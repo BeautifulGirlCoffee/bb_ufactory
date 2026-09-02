@@ -1208,28 +1208,36 @@ defmodule BB.Ufactory.Controller do
     if remaining <= 0 do
       {:reply, {:error, :timeout}, state}
     else
-      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
-        {:ok, data} ->
-          case scan_for_response(buffer <> data, register) do
-            {:found, response, tail} ->
-              {:reply, {:ok, response, tail}, state}
+      recv_and_match(state, register, buffer, deadline, remaining)
+    end
+  end
 
-            {:more, rest} ->
-              await_matching_response(state, register, rest, deadline)
+  defp recv_and_match(state, register, buffer, deadline, remaining) do
+    case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
+      {:ok, data} ->
+        match_response(state, register, buffer <> data, deadline)
 
-            # Desynchronized stream (corrupt length/protocol id): frame
-            # boundaries cannot be recovered mid-stream. Report it; the
-            # drain at the start of the next request clears the buffer.
-            :desync ->
-              {:reply, {:error, :desync}, state}
-          end
+      {:error, :timeout} ->
+        {:reply, {:error, :timeout}, state}
 
-        {:error, :timeout} ->
-          {:reply, {:error, :timeout}, state}
+      {:error, reason} = error ->
+        {:stop, fatal_stop_reason(reason, state), error, state}
+    end
+  end
 
-        {:error, reason} = error ->
-          {:stop, fatal_stop_reason(reason, state), error, state}
-      end
+  defp match_response(state, register, buffer, deadline) do
+    case scan_for_response(buffer, register) do
+      {:found, response, tail} ->
+        {:reply, {:ok, response, tail}, state}
+
+      {:more, rest} ->
+        await_matching_response(state, register, rest, deadline)
+
+      # Desynchronized stream (corrupt length/protocol id): frame
+      # boundaries cannot be recovered mid-stream. Report it; the
+      # drain at the start of the next request clears the buffer.
+      :desync ->
+        {:reply, {:error, :desync}, state}
     end
   end
 

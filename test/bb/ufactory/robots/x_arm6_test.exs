@@ -27,6 +27,7 @@ defmodule BB.Ufactory.Robots.XArm6Test do
   @pi :math.pi()
 
   alias BB.Ufactory.Robots.XArm6
+  alias Spark.Dsl.Extension
 
   describe "robot definition" do
     setup do
@@ -155,7 +156,7 @@ defmodule BB.Ufactory.Robots.XArm6Test do
     end
 
     test "controller option merges extra opts into the child spec" do
-      [controller] = Spark.Dsl.Extension.get_entities(WithAccessories, [:controllers])
+      [controller] = Extension.get_entities(WithAccessories, [:controllers])
       {BB.Ufactory.Controller, opts} = controller.child_spec
 
       assert opts[:host] == "192.168.1.111"

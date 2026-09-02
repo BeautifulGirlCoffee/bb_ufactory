@@ -272,6 +272,8 @@ defmodule BB.Ufactory.Robots.XArm6 do
   started directly, which the library's own simulator tests do.
   """
 
+  # credo:disable-for-lines:12 Credo.Check.Design.AliasUsage
+  # (An alias inside the __using__ quote would leak into the caller's scope.)
   require BB.Ufactory.Robots.XArm6.Definition
 
   BB.Ufactory.Robots.XArm6.Definition.define()
