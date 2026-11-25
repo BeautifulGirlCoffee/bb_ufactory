@@ -743,7 +743,7 @@ defmodule BB.Ufactory.Protocol do
   """
   @spec parse_linear_track_position(binary()) :: {:ok, float()} | {:error, :invalid_response}
   def parse_linear_track_position(
-        <<_host::8, _dev::8, 0x03::8, _bc::8, pos_raw::signed-32, _rest::binary>>
+        <<@control_box_rs485_host_id, @linear_track_device_id, 0x03, 4, pos_raw::signed-32>>
       ) do
     {:ok, pos_raw / 2000}
   end
@@ -864,8 +864,8 @@ defmodule BB.Ufactory.Protocol do
   When the fence is enabled via `cmd_set_fence_on/2`, the arm stops if the
   TCP pose exceeds these limits.
 
-  Encoded as 6× signed 32-bit **big-endian** integers (same endianness
-  exception as the linear track position register).
+  The wire uses signed little-endian 32-bit integers, maximum then minimum
+  for each axis. The public arguments take minimum then maximum.
   """
   @spec cmd_set_tcp_boundary(
           non_neg_integer(),
@@ -878,8 +878,8 @@ defmodule BB.Ufactory.Protocol do
         ) :: binary()
   def cmd_set_tcp_boundary(txn_id, x_min, x_max, y_min, y_max, z_min, z_max) do
     payload =
-      <<x_min::signed-32, x_max::signed-32, y_min::signed-32, y_max::signed-32, z_min::signed-32,
-        z_max::signed-32>>
+      <<x_max::little-signed-32, x_min::little-signed-32, y_max::little-signed-32,
+        y_min::little-signed-32, z_max::little-signed-32, z_min::little-signed-32>>
 
     build_frame(txn_id, @reg_set_limit_xyz, payload)
   end

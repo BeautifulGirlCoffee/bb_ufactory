@@ -11,8 +11,8 @@ defmodule BB.Ufactory.Controller do
   - **Port 502** — command socket: sends register frames, receives responses,
     sends the 1-second heartbeat to keep the connection alive.
   - **Port 30003** — real-time report socket: receives arm-pushed state frames
-    at ~100 Hz. The socket is opened in `active: true` mode so incoming frames
-    arrive as `{:tcp, socket, data}` messages without polling.
+    at ~100 Hz. A socket reader timestamps incoming data and forwards it
+    to the controller for parsing and publication.
 
   ## ETS Table
 
@@ -29,6 +29,8 @@ defmodule BB.Ufactory.Controller do
   Actuators write `set_position` into the ETS table. The 100 Hz control loop
   reads all pending positions and batches them into a single `cmd_move_joints`
   frame per tick. The controller only sends targets from its current arm epoch.
+  Accepting a Cartesian move clears previously latched joint targets. A new
+  joint command resumes joint streaming.
 
   ## Safety
 
@@ -132,14 +134,14 @@ defmodule BB.Ufactory.Controller do
         default: nil,
         doc:
           "Cartesian workspace fence as `{x_min, x_max, y_min, y_max, z_min, z_max}` in mm. " <>
-            "Activate with `fence_on: true`. Register 0x34, 6× int32 BE. `nil` skips."
+            "Activate with `fence_on: true`. Register 0x34, 6× int32 LE. `nil` skips."
       ],
       fence_on: [
         type: :boolean,
         default: false,
         doc:
           "Enable the Cartesian workspace fence defined by `tcp_boundary`. " <>
-            "Has no effect if `tcp_boundary` is nil (register 0x3B)."
+            "Requires verified tcp_boundary limits (register 0x3B)."
       ],
       report_stale_ms: [
         type: :pos_integer,
@@ -200,6 +202,7 @@ defmodule BB.Ufactory.Controller do
   alias BB.Message
   alias BB.Message.Sensor.JointState
   alias BB.StateMachine.Transition
+  alias BB.Ufactory.Accessory
   alias BB.Ufactory.Message.ArmStatus
   alias BB.Ufactory.Message.CartesianPose
   alias BB.Ufactory.Message.Wrench
@@ -207,6 +210,7 @@ defmodule BB.Ufactory.Controller do
   alias BB.Ufactory.Protocol
   alias BB.Ufactory.Registers
   alias BB.Ufactory.Report
+  alias BB.Ufactory.ReportStream
 
   # Statically-defined joint name atoms so atom creation is never dynamic.
   # All xArm models have at most 7 joints.
@@ -219,6 +223,8 @@ defmodule BB.Ufactory.Controller do
 
   @disarm_response_timeout_ms 500
   @normal_report_port 30_001
+  @response_timeout_ms 500
+  @move_cart Registers.move_cart()
 
   @doc """
   Sends the configured disarm operation over a fresh connection and checks the
@@ -326,7 +332,7 @@ defmodule BB.Ufactory.Controller do
   defp confirm_disarm(socket, <<transaction::16, _::32, register, _::binary>>, action) do
     deadline = System.monotonic_time(:millisecond) + @disarm_response_timeout_ms
 
-    case {action, disarm_response(socket, transaction, register, <<>>, deadline)} do
+    case {action, receive_response(socket, transaction, register, <<>>, deadline)} do
       {_, {:ok, status, _}} when (status &&& 0x48) == 0 ->
         :ok
 
@@ -350,25 +356,25 @@ defmodule BB.Ufactory.Controller do
 
     with :ok <- :gen_tcp.send(socket, Protocol.build_frame(1, register, <<>>)),
          {:ok, status, <<4>>} when (status &&& 0x08) == 0 <-
-           disarm_response(socket, 1, register, <<>>, deadline) do
+           receive_response(socket, 1, register, <<>>, deadline) do
       :ok
     else
       readback -> {:error, {:stop_unconfirmed, stop_response, readback}}
     end
   end
 
-  defp disarm_response(socket, transaction, register, buffer, deadline) do
+  defp receive_response(socket, transaction, register, buffer, deadline) do
     case Protocol.parse_response(buffer) do
       {:ok, {^register, status, params}, _rest}
       when binary_part(buffer, 0, 2) == <<transaction::16>> ->
         {:ok, status, params}
 
       {:ok, _, rest} ->
-        disarm_response(socket, transaction, register, rest, deadline)
+        receive_response(socket, transaction, register, rest, deadline)
 
       {:more} ->
         with {:ok, data} <- receive_before(socket, deadline) do
-          disarm_response(socket, transaction, register, buffer <> data, deadline)
+          receive_response(socket, transaction, register, buffer <> data, deadline)
         end
 
       {:error, reason} ->
@@ -402,20 +408,19 @@ defmodule BB.Ufactory.Controller do
     model_config = Model.get(model)
     controller_name = List.last(bb.path)
 
+    # Subscribe before reconnecting. An arm transition can arrive while a
+    # replacement controller is opening its sockets and verifying configuration.
+    BB.subscribe(bb.robot, [:state_machine])
+
     charlist_host = String.to_charlist(host)
-    tcp_opts = [:binary, active: false, packet: :raw]
+    tcp_opts = [:binary, active: false, packet: :raw, send_timeout: 500, send_timeout_close: true]
 
     # Bounded connect timeouts: the default (:infinity) would let a
     # black-holed host stall the whole robot supervision tree for the OS
     # connect timeout (~75 s+).
     with {:ok, cmd_socket} <- :gen_tcp.connect(charlist_host, port, tcp_opts, @connect_timeout_ms),
          {:ok, report_socket} <-
-           :gen_tcp.connect(
-             charlist_host,
-             report_port,
-             [:binary, active: true, packet: :raw],
-             @connect_timeout_ms
-           ) do
+           ReportStream.connect(charlist_host, report_port, @connect_timeout_ms) do
       ets = create_ets(bb.robot, controller_name, model_config.joints)
 
       BB.Safety.register(__MODULE__,
@@ -429,8 +434,6 @@ defmodule BB.Ufactory.Controller do
           normal_report_port: Keyword.get(opts, :normal_report_port, @normal_report_port)
         ]
       )
-
-      BB.subscribe(bb.robot, [:state_machine])
 
       # BB.Loop schedules against absolute monotonic deadlines, so the
       # control loop holds its configured rate rather than drifting by each
@@ -453,6 +456,9 @@ defmodule BB.Ufactory.Controller do
         cmd_socket: cmd_socket,
         report_socket: report_socket,
         buffer: <<>>,
+        command_buffer: <<>>,
+        pending: %{},
+        polled_codes: {0, 0},
         ets: ets,
         txn_id: 0,
         last_error_code: 0,
@@ -465,7 +471,7 @@ defmodule BB.Ufactory.Controller do
         feedback_stale_logged: false,
         report_stale_ms: Keyword.get(opts, :report_stale_ms, 250),
         feedback_loss_fatal_ms: Keyword.get(opts, :feedback_loss_fatal_ms, 3_000),
-        arm_frames: [],
+        arm_frames: Accessory.registrations(bb.robot, controller_name),
         arm_epoch: nil,
         auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
         error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
@@ -482,9 +488,14 @@ defmodule BB.Ufactory.Controller do
         fence_on: Keyword.get(opts, :fence_on, false)
       }
 
-      state = apply_hardware_config(state)
-
-      {:ok, state}
+      with {:ok, state} <- apply_hardware_config(state),
+           :ok <- :inet.setopts(cmd_socket, active: true) do
+        {:ok, state}
+      else
+        {:error, reason} ->
+          terminate(reason, state)
+          {:stop, reason}
+      end
     else
       {:error, reason} ->
         error = ConnectionError.exception(host: host, port: port, reason: reason)
@@ -517,14 +528,37 @@ defmodule BB.Ufactory.Controller do
 
   # ── Report socket ─────────────────────────────────────────────────────────────
 
-  def handle_info({:tcp, socket, data}, %{report_socket: socket} = state) do
-    buffer = state.buffer <> data
-    state = drain_buffer(buffer, state)
-    {:noreply, state}
+  def handle_info({:report_bytes, socket, data, times}, %{report_socket: socket} = state) do
+    {:noreply, drain_buffer(state.buffer <> data, state, times)}
   end
 
-  # Data from a stale (already replaced or closed) report socket.
-  def handle_info({:tcp, _stale_socket, _data}, state), do: {:noreply, state}
+  def handle_info({:report_bytes, _, _, _}, state), do: {:noreply, state}
+
+  def handle_info({:tcp, socket, data}, %{cmd_socket: socket} = state) do
+    consume_responses(state.command_buffer <> data, state)
+  end
+
+  def handle_info({:tcp, _, _}, state), do: {:noreply, state}
+
+  def handle_info({:tcp_closed, socket}, %{cmd_socket: socket} = state),
+    do: cmd_socket_fatal(:closed, state)
+
+  def handle_info({:tcp_error, socket, reason}, %{cmd_socket: socket} = state),
+    do: cmd_socket_fatal(reason, state)
+
+  def handle_info({:timeout, timer, {:command_timeout, id}}, state) do
+    case state.pending do
+      %{^id => %{timer: ^timer, receiver: receiver}} ->
+        {:noreply,
+         finish_request(receiver, {:error, :timeout}, %{
+           state
+           | pending: Map.delete(state.pending, id)
+         })}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
 
   def handle_info({:tcp_closed, socket}, %{report_socket: socket} = state) do
     Logger.warning("[BB.Ufactory.Controller] Report socket closed for #{state.controller_name}")
@@ -546,12 +580,7 @@ defmodule BB.Ufactory.Controller do
   def handle_info(:reconnect_report, %{report_socket: nil} = state) do
     host = String.to_charlist(state.host)
 
-    case :gen_tcp.connect(
-           host,
-           state.report_port,
-           [:binary, active: true, packet: :raw],
-           @connect_timeout_ms
-         ) do
+    case ReportStream.connect(host, state.report_port, @connect_timeout_ms) do
       {:ok, socket} ->
         Logger.info(
           "[BB.Ufactory.Controller] Report socket reconnected for #{state.controller_name}"
@@ -562,6 +591,7 @@ defmodule BB.Ufactory.Controller do
            state
            | report_socket: socket,
              buffer: <<>>,
+             last_report_at: nil,
              reconnect_attempts: 0,
              report_reconnect_pending: false
          }}
@@ -588,9 +618,8 @@ defmodule BB.Ufactory.Controller do
   # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
   def handle_info(:heartbeat, state) do
-    with {:ok, state} <- send_raw(Protocol.heartbeat(), state),
-         {:ok, state} <- poll_error_code(state) do
-      Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+    with {:ok, state} <- send_command(Protocol.heartbeat(), state),
+         {:ok, state} <- request(Protocol.cmd_get_error(0), :poll, @response_timeout_ms, state) do
       {:noreply, state}
     else
       {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
@@ -645,17 +674,20 @@ defmodule BB.Ufactory.Controller do
 
   # ── handle_call: send_command for actuators/sensors ─────────────────────────
   #
-  # A failed send on the command socket is fatal: the socket is passive, so a
-  # dead peer never surfaces as :tcp_closed — send/recv errors are the only
-  # signal. The caller still gets its {:error, reason} reply, then the
-  # controller stops so bb's supervision and safety escalation take over
-  # (a silently dead command socket would otherwise disable fault detection
-  # and motion while the robot stays armed).
+  # Command socket failure is fatal. Pending callers receive an error before
+  # the controller stops and hands recovery to supervision and BB safety.
 
   @impl BB.Controller
   def handle_call({:send_motion, epoch, frame}, _from, state) do
     if current_arm_epoch?(state, epoch) do
-      reply_to_send(frame, state)
+      case send_command(frame, state) do
+        {:ok, state} ->
+          retire_joint_targets(frame, state)
+          {:reply, :ok, state}
+
+        {:fatal, reason, state} ->
+          {:stop, fatal_stop_reason(reason, state), {:error, reason}, state}
+      end
     else
       {:reply, CommandFailed.reply(:motion, :inactive_arm_epoch), state}
     end
@@ -663,33 +695,21 @@ defmodule BB.Ufactory.Controller do
 
   def handle_call({:send_command, frame}, _from, state), do: reply_to_send(frame, state)
 
-  # While armed, the 100 Hz move stream keeps responses in flight that a
-  # pre-send drain cannot clear, so the reply is matched by REGISTER: frames
-  # for other registers are skipped, and partial frames are accumulated until
-  # the deadline. Without this, an RS485 read could consume a move-ack and
-  # refuse (e.g.) a linear-track Stop on a perfectly healthy link.
-  #
-  # The default timeout is deliberately tick-compatible: this call blocks the
-  # controller GenServer, and a multi-second wait would stall joint streaming
-  # while the robot stays armed.
-  @send_recv_timeout_ms 500
-
   def handle_call({:send_and_recv, frame}, from, state) do
-    handle_call({:send_and_recv, frame, @send_recv_timeout_ms}, from, state)
+    handle_call({:send_and_recv, frame, @response_timeout_ms}, from, state)
   end
 
-  def handle_call({:send_and_recv, frame, timeout}, _from, state) do
-    drain_recv_buffer(state.cmd_socket)
-    state = %{state | txn_id: next_txn(state.txn_id)}
-    <<_txn::16, _proto::16, _len::16, register::8, _::binary>> = frame
+  # Reserve space for the periodic poll and a free sequence number.
+  def handle_call({:send_and_recv, _, _}, _from, state) when map_size(state.pending) >= 65_534,
+    do: {:reply, {:error, :busy}, state}
 
-    case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok ->
-        deadline = System.monotonic_time(:millisecond) + timeout
-        await_matching_response(state, register, <<>>, deadline)
+  def handle_call({:send_and_recv, frame, timeout}, from, state) do
+    case request(frame, from, timeout, state) do
+      {:ok, state} ->
+        {:noreply, state}
 
-      {:error, reason} = error ->
-        {:stop, fatal_stop_reason(reason, state), error, state}
+      {:fatal, reason, state} ->
+        {:stop, fatal_stop_reason(reason, state), {:error, reason}, state}
     end
   end
 
@@ -747,6 +767,16 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
+  # The tick and Cartesian send run in this process. Clear just the target
+  # columns before acknowledging the switch; report values remain intact.
+  defp retire_joint_targets(<<_::48, @move_cart, _::binary>>, state) do
+    for i <- 1..state.model_config.joints do
+      :ets.update_element(state.ets, i, [{4, nil}, {5, nil}, {6, nil}])
+    end
+  end
+
+  defp retire_joint_targets(_frame, _state), do: :ok
+
   defp current_arm_epoch?(state, epoch) do
     is_integer(epoch) and state.arm_epoch == epoch and
       BB.Safety.epoch(state.bb.robot) == {:ok, epoch}
@@ -773,15 +803,17 @@ defmodule BB.Ufactory.Controller do
   # starting.
 
   defp apply_hardware_config(state) do
-    state
-    |> maybe_send_tcp_offset()
-    |> maybe_send_tcp_load()
-    |> maybe_send_reduced_tcp_speed()
-    |> maybe_send_reduced_joint_speed()
-    |> maybe_send_reduced_joint_ranges()
-    |> maybe_send_tcp_boundary()
-    |> maybe_send_fence_on()
-    |> maybe_send_reduced_mode()
+    state =
+      state
+      |> maybe_send_tcp_offset()
+      |> maybe_send_tcp_load()
+      |> maybe_send_reduced_tcp_speed()
+      |> maybe_send_reduced_joint_speed()
+      |> maybe_send_reduced_joint_ranges()
+
+    with {:ok, state} <- configure_fence(state) do
+      {:ok, maybe_send_reduced_mode(state)}
+    end
   end
 
   defp maybe_send_tcp_offset(%{tcp_offset: {x, y, z, roll, pitch, yaw}} = state) do
@@ -826,25 +858,58 @@ defmodule BB.Ufactory.Controller do
 
   defp maybe_send_reduced_joint_ranges(state), do: state
 
-  defp maybe_send_tcp_boundary(
-         %{tcp_boundary: {x_min, x_max, y_min, y_max, z_min, z_max}} = state
-       ) do
-    frame =
-      Protocol.cmd_set_tcp_boundary(state.txn_id, x_min, x_max, y_min, y_max, z_min, z_max)
+  defp configure_fence(%{tcp_boundary: nil, fence_on: false} = state), do: {:ok, state}
 
-    log_config_send("tcp_boundary", :gen_tcp.send(state.cmd_socket, frame), state)
-    %{state | txn_id: next_txn(state.txn_id)}
+  defp configure_fence(%{tcp_boundary: {xmin, xmax, ymin, ymax, zmin, zmax}} = state)
+       when xmin <= xmax and ymin <= ymax and zmin <= zmax do
+    limits = [xmax, xmin, ymax, ymin, zmax, zmin]
+
+    if Enum.all?(limits, &(is_integer(&1) and &1 in -32_768..32_767)) do
+      frame = Protocol.cmd_set_tcp_boundary(state.txn_id, xmin, xmax, ymin, ymax, zmin, zmax)
+      expected = for limit <- limits, into: <<>>, do: <<limit::signed-16>>
+
+      with {:ok, _, state} <- config_exchange(frame, state),
+           {:ok, response, state} <-
+             config_exchange(
+               Protocol.build_frame(state.txn_id, Registers.get_reduced_state(), <<>>),
+               state
+             ),
+           <<_mode, ^expected::binary-size(12), _::binary>> <- response do
+        enable_fence(state)
+      else
+        {:error, reason} -> {:error, reason}
+        _ -> CommandFailed.reply(:tcp_boundary, :readback_mismatch)
+      end
+    else
+      CommandFailed.reply(:tcp_boundary, :invalid_limits)
+    end
   end
 
-  defp maybe_send_tcp_boundary(state), do: state
+  defp configure_fence(_), do: CommandFailed.reply(:tcp_boundary, :invalid_limits)
 
-  defp maybe_send_fence_on(%{fence_on: true} = state) do
-    frame = Protocol.cmd_set_fence_on(state.txn_id, true)
-    log_config_send("fence_on", :gen_tcp.send(state.cmd_socket, frame), state)
-    %{state | txn_id: next_txn(state.txn_id)}
+  defp enable_fence(%{fence_on: false} = state), do: {:ok, state}
+
+  defp enable_fence(state) do
+    with {:ok, _, state} <- config_exchange(Protocol.cmd_set_fence_on(state.txn_id, true), state),
+         do: {:ok, state}
   end
 
-  defp maybe_send_fence_on(state), do: state
+  # During init the command socket is still passive, so verification completes
+  # before any runtime caller can submit a command.
+  defp config_exchange(<<id::16, _::32, register, _::binary>> = frame, state) do
+    deadline = System.monotonic_time(:millisecond) + @response_timeout_ms
+
+    with :ok <- :gen_tcp.send(state.cmd_socket, frame),
+         {:ok, status, params} <- receive_response(state.cmd_socket, id, register, <<>>, deadline) do
+      if (status &&& 0x48) == 0 do
+        {:ok, params, %{state | txn_id: next_txn(id)}}
+      else
+        {:error, CommandRejected.exception(register: register, status_byte: status)}
+      end
+    else
+      {:error, reason} -> CommandFailed.reply(:fence_configuration, reason)
+    end
+  end
 
   defp maybe_send_reduced_mode(%{reduced_mode: true} = state) do
     frame = Protocol.cmd_set_reduced_mode(state.txn_id, true)
@@ -1017,11 +1082,11 @@ defmodule BB.Ufactory.Controller do
     %{state | move_skip_logged: true}
   end
 
-  defp drain_buffer(buffer, state) do
+  defp drain_buffer(buffer, state, times) do
     case Report.parse_report(buffer) do
       {:ok, report, rest} ->
-        state = update_from_report(report, state)
-        drain_buffer(rest, %{state | buffer: rest})
+        state = update_from_report(report, state, times)
+        drain_buffer(rest, %{state | buffer: rest}, times)
 
       {:more} ->
         %{state | buffer: buffer}
@@ -1053,8 +1118,7 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  defp update_from_report(report, state) do
-    timestamps = {System.monotonic_time(:nanosecond), System.system_time(:nanosecond)}
+  defp update_from_report(report, state, timestamps) do
     last_report_at = System.convert_time_unit(elem(timestamps, 0), :nanosecond, :millisecond)
     state = %{state | last_report_at: last_report_at}
     joint_count = state.model_config.joints
@@ -1141,11 +1205,9 @@ defmodule BB.Ufactory.Controller do
   defp maybe_publish_wrench(_report, _state, _timestamps), do: :ok
 
   # Publishes ArmStatus when state, mode, error_code, or warn_code changes.
-  # error_code and warn_code are only present in normal-report frames (>= 133 bytes);
-  # they default to 0 for real-time frames that lack these fields.
+  # The real-time report supplies state and mode; GET_ERROR supplies both codes.
   defp maybe_publish_arm_status(report, state, timestamps) do
-    error_code = Map.get(report, :error_code, 0) || 0
-    warn_code = Map.get(report, :warn_code, 0) || 0
+    {error_code, warn_code} = state.polled_codes
     current = {report.state, report.mode, error_code, warn_code}
 
     if current != state.last_arm_status do
@@ -1166,88 +1228,32 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  # Polls register 0x0F (GET_ERROR) on the command socket. Port 30003 real-time
-  # reports never include error_code, so this is the only way to detect hardware
-  # faults without connecting to port 30001.
-  #
-  # Drains stale responses before sending to prevent desynchronization: fire-and-
-  # forget operations (100Hz cmd_move_joints, RS485 actuator writes) generate
-  # responses nobody reads, and those accumulate in the TCP receive buffer.
-  # Responses that were still in flight when the drain ran (e.g. the reply to
-  # the heartbeat sent just before, or to a recent move frame) can still arrive
-  # ahead of the GET_ERROR reply, so the scanner walks all complete frames in
-  # the stream until it finds register 0x0F instead of requiring it first —
-  # otherwise every in-flight response would silently skip a fault-detection
-  # cycle while moving at 100 Hz.
-  #
-  # Returns {:ok, state} (poll answered or skipped) or {:fatal, reason, state}
-  # when the command socket is dead.
-  @poll_timeout_ms 500
+  defp finish_request(:poll, result, state) do
+    Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+    update_polled_status(result, state)
+  end
 
-  defp poll_error_code(state) do
-    drain_recv_buffer(state.cmd_socket)
-    frame = Protocol.cmd_get_error(state.txn_id)
-    state = %{state | txn_id: next_txn(state.txn_id)}
+  defp finish_request(from, result, state) do
+    GenServer.reply(from, result)
+    state
+  end
 
-    case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok ->
-        deadline = System.monotonic_time(:millisecond) + @poll_timeout_ms
-        await_error_response(state, <<>>, deadline)
+  defp update_polled_status({:ok, {_reg, status, <<error, warn>>}, _}, state)
+       when (status &&& 0x08) == 0 do
+    state = %{state | polled_codes: {error, warn}}
+    state = maybe_report_error(%{error_code: error}, state)
 
-      {:error, reason} ->
-        {:fatal, reason, state}
+    case state.last_arm_status do
+      {arm, mode, _, _} ->
+        times = {System.monotonic_time(:nanosecond), System.system_time(:nanosecond)}
+        maybe_publish_arm_status(%{state: arm, mode: mode}, state, times)
+
+      nil ->
+        state
     end
   end
 
-  defp await_error_response(state, buffer, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      {:ok, state}
-    else
-      case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
-        {:ok, data} ->
-          handle_poll_data(state, buffer <> data, deadline)
-
-        # No response within the budget — skip this cycle.
-        {:error, :timeout} ->
-          {:ok, state}
-
-        {:error, reason} ->
-          {:fatal, reason, state}
-      end
-    end
-  end
-
-  defp handle_poll_data(state, buffer, deadline) do
-    case scan_for_error_response(buffer) do
-      {:found, error_code} ->
-        {:ok, maybe_report_error(%{error_code: error_code}, state)}
-
-      {:more, rest} ->
-        await_error_response(state, rest, deadline)
-
-      # Desynchronized/unparseable stream: skip this cycle; the drain at the
-      # start of the next poll clears the buffer.
-      :desync ->
-        {:ok, state}
-    end
-  end
-
-  # Walks complete response frames, skipping non-GET_ERROR responses.
-  defp scan_for_error_response(buffer) do
-    case scan_for_response(buffer, 0x0F) do
-      {:found, {_reg, _status, <<error_code::8, _rest::binary>>}, _tail} ->
-        {:found, error_code}
-
-      # A GET_ERROR response with an empty params field is malformed.
-      {:found, _malformed, _tail} ->
-        :desync
-
-      other ->
-        other
-    end
-  end
+  defp update_polled_status(_, state), do: state
 
   defp maybe_report_error(%{error_code: error_code} = _report, state)
        when is_integer(error_code) and error_code != 0 and
@@ -1319,23 +1325,68 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  # Sends a frame built with the CURRENT txn_id, bumping the counter after.
-  # Returns {:ok, state} or {:fatal, reason, state} — a send failure on the
-  # command socket means the socket is dead (passive sockets have no
-  # :tcp_closed delivery) and must stop the controller.
-  defp send_command(frame, state) do
-    case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok -> {:ok, %{state | txn_id: next_txn(state.txn_id)}}
-      {:error, reason} -> {:fatal, reason, %{state | txn_id: next_txn(state.txn_id)}}
+  # The controller owns the transaction sequence, including prebuilt
+  # accessory frames. Never reuse an outstanding request's transaction.
+  defp send_command(<<_::16, body::binary>>, state) do
+    id = state.txn_id
+
+    case :gen_tcp.send(state.cmd_socket, <<id::16, body::binary>>) do
+      :ok -> {:ok, %{state | txn_id: available_txn(next_txn(id), state.pending)}}
+      {:error, reason} -> {:fatal, reason, state}
     end
   end
 
-  # Like send_command/2 but for pre-built frames that do not consume a txn_id
-  # (the heartbeat constant).
-  defp send_raw(frame, state) do
-    case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok -> {:ok, state}
-      {:error, reason} -> {:fatal, reason, state}
+  defp request(<<_::48, register, _::binary>> = frame, receiver, timeout, state) do
+    id = state.txn_id
+
+    with {:ok, state} <- send_command(frame, state) do
+      timer = :erlang.start_timer(timeout, self(), {:command_timeout, id})
+
+      entry = %{
+        register: register,
+        receiver: receiver,
+        timer: timer,
+        deadline: System.monotonic_time(:millisecond) + timeout
+      }
+
+      {:ok, %{state | pending: Map.put(state.pending, id, entry)}}
+    end
+  end
+
+  defp available_txn(id, pending) when is_map_key(pending, id),
+    do: available_txn(next_txn(id), pending)
+
+  defp available_txn(id, _pending), do: id
+
+  defp consume_responses(buffer, state) do
+    case Protocol.parse_response(buffer) do
+      {:ok, response, rest} ->
+        <<id::16, _::binary>> = buffer
+        state = complete_transaction(id, response, state)
+        consume_responses(rest, state)
+
+      {:more} ->
+        {:noreply, %{state | command_buffer: buffer}}
+
+      {:error, reason} ->
+        cmd_socket_fatal(reason, state)
+    end
+  end
+
+  defp complete_transaction(id, {register, _, _} = response, state) do
+    case state.pending do
+      %{^id => %{register: ^register} = entry} ->
+        :erlang.cancel_timer(entry.timer)
+
+        result =
+          if System.monotonic_time(:millisecond) < entry.deadline,
+            do: {:ok, response, <<>>},
+            else: {:error, :timeout}
+
+        finish_request(entry.receiver, result, %{state | pending: Map.delete(state.pending, id)})
+
+      _ ->
+        state
     end
   end
 
@@ -1359,6 +1410,10 @@ defmodule BB.Ufactory.Controller do
   # Logs, reports the failure to BB.Safety (triggering disarm escalation), and
   # returns the exception to use as the GenServer stop reason.
   defp fatal_stop_reason(reason, state) do
+    for {_id, %{receiver: from}} <- state.pending, from != :poll do
+      GenServer.reply(from, {:error, reason})
+    end
+
     error = ConnectionError.exception(host: state.host, port: state.port, reason: reason)
 
     Logger.error(
@@ -1372,76 +1427,6 @@ defmodule BB.Ufactory.Controller do
 
   defp cmd_socket_fatal(reason, state) do
     {:stop, fatal_stop_reason(reason, state), state}
-  end
-
-  defp await_matching_response(state, register, buffer, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      {:reply, {:error, :timeout}, state}
-    else
-      recv_and_match(state, register, buffer, deadline, remaining)
-    end
-  end
-
-  defp recv_and_match(state, register, buffer, deadline, remaining) do
-    case :gen_tcp.recv(state.cmd_socket, 0, remaining) do
-      {:ok, data} ->
-        match_response(state, register, buffer <> data, deadline)
-
-      {:error, :timeout} ->
-        {:reply, {:error, :timeout}, state}
-
-      {:error, reason} = error ->
-        {:stop, fatal_stop_reason(reason, state), error, state}
-    end
-  end
-
-  defp match_response(state, register, buffer, deadline) do
-    case scan_for_response(buffer, register) do
-      {:found, response, tail} ->
-        {:reply, {:ok, response, tail}, state}
-
-      {:more, rest} ->
-        await_matching_response(state, register, rest, deadline)
-
-      # Desynchronized stream (corrupt length/protocol id): frame
-      # boundaries cannot be recovered mid-stream. Report it; the
-      # drain at the start of the next request clears the buffer.
-      :desync ->
-        {:reply, {:error, :desync}, state}
-    end
-  end
-
-  # Walks complete response frames, skipping responses for other registers
-  # (in-flight move-acks, heartbeat replies).
-  defp scan_for_response(buffer, register) do
-    case Protocol.parse_response(buffer) do
-      {:ok, {^register, _status, _params} = response, tail} ->
-        {:found, response, tail}
-
-      {:ok, {_other_register, _status, _params}, tail} ->
-        scan_for_response(tail, register)
-
-      {:more} ->
-        {:more, buffer}
-
-      {:error, _reason} ->
-        :desync
-    end
-  end
-
-  # Drains any stale unread responses from a TCP socket's receive buffer.
-  # Fire-and-forget operations (100Hz cmd_move_joints, RS485 actuator writes)
-  # generate responses the controller never reads. Left uncleared, these
-  # desynchronize subsequent recv calls — a send_and_recv for GET_ERROR could
-  # read a stale RS485 response whose host_id byte (0x0B = 11) gets
-  # misinterpreted as error code 11 ("Servo motor 1 error").
-  defp drain_recv_buffer(socket) do
-    case :gen_tcp.recv(socket, 0, 0) do
-      {:ok, _data} -> drain_recv_buffer(socket)
-      {:error, _} -> :ok
-    end
   end
 
   defp next_txn(txn_id), do: rem(txn_id + 1, 65_536)

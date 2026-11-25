@@ -733,27 +733,11 @@ defmodule BB.Ufactory.ProtocolTest do
       assert binary_part(frame, 6, 1) == <<0x34>>
     end
 
-    test "encodes boundary values as signed 32-bit big-endian integers" do
-      frame = Protocol.cmd_set_tcp_boundary(0, -400, 400, -300, 300, 0, 800)
-      params = binary_part(frame, 7, 24)
-
-      <<x_min::signed-32, x_max::signed-32, y_min::signed-32, y_max::signed-32, z_min::signed-32,
-        z_max::signed-32>> = params
-
-      assert x_min == -400
-      assert x_max == 400
-      assert y_min == -300
-      assert y_max == 300
-      assert z_min == 0
-      assert z_max == 800
-    end
-
-    test "handles negative z_min correctly" do
-      frame = Protocol.cmd_set_tcp_boundary(0, 0, 0, 0, 0, -100, 100)
-      params = binary_part(frame, 7, 24)
-      <<_::64, _::64, z_min::signed-32, z_max::signed-32>> = params
-      assert z_min == -100
-      assert z_max == 100
+    test "matches the SDK SET_LIMIT_XYZ payload for asymmetric signed limits" do
+      frame = Protocol.cmd_set_tcp_boundary(0, -400, 400, -300, 300, -100, 800)
+      # SDK set_reduced_tcp_boundary -> set_xyz_limits -> little-endian s32 list.
+      assert Base.encode16(binary_part(frame, 7, 24)) ==
+               "9001000070FEFFFF2C010000D4FEFFFF200300009CFFFFFF"
     end
   end
 

@@ -8,6 +8,11 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
 
   setup :verify_on_exit!
 
+  setup do
+    start_supervised!({Registry, keys: :unique, name: TestRobot.Registry})
+    :ok
+  end
+
   alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
@@ -393,9 +398,9 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       test_pid = self()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_and_recv, frame} ->
         send(test_pid, {:disable_sent, frame})
-        :ok
+        {:ok, {0x7C, 0, binary_part(frame, 7, 7)}, <<>>}
       end)
 
       assert :ok =
@@ -407,11 +412,11 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       assert_receive {:disable_sent, ^expected_frame}, 500
     end
 
-    test "returns :ok when controller call fails" do
+    test "returns an error when controller call fails" do
       BB.Process
       |> stub(:call, fn _robot, _ctrl, _msg -> {:error, :closed} end)
 
-      assert :ok =
+      assert {:error, %CommandFailed{}} =
                LinearTrack.disarm(
                  bb: %{robot: TestRobot, path: [:linear_track]},
                  controller: :xarm

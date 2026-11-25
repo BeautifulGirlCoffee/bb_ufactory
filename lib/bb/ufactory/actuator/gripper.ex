@@ -62,6 +62,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.Ufactory.Accessory
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -75,6 +76,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
     meters_per_pulse = Keyword.get(opts, :meters_per_pulse)
 
     if is_nil(meters_per_pulse) or meters_per_pulse > 0 do
+      BB.Safety.register(__MODULE__, robot: bb.robot, path: bb.path, opts: opts)
       register_arm_frames(bb.robot, controller, speed)
 
       {:ok,
@@ -94,17 +96,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
 
   @impl BB.Actuator
   def disarm(opts) do
-    bb = Keyword.fetch!(opts, :bb)
-    controller = Keyword.fetch!(opts, :controller)
-    frame = Protocol.cmd_gripper_enable(0, false)
-
-    try do
-      BB.Process.call(bb.robot, controller, {:send_command, frame})
-    catch
-      _, _ -> :ok
-    end
-
-    :ok
+    Accessory.disable(opts, Protocol.cmd_gripper_enable(0, false))
   end
 
   # ── Accepted command payloads ────────────────────────────────────────────────
@@ -136,7 +128,7 @@ defmodule BB.Ufactory.Actuator.Gripper do
   defp register_arm_frames(robot, controller, speed) do
     frames = [Protocol.cmd_gripper_enable(0, true), Protocol.cmd_gripper_speed(0, speed)]
 
-    case BB.Process.call(robot, controller, {:register_arm_frames, :gripper, frames}) do
+    case Accessory.register(robot, controller, :gripper, frames) do
       :ok ->
         :ok
 

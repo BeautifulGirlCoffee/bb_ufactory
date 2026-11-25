@@ -180,7 +180,7 @@ BB.subscribe(MyRobot, [:sensor, :collision])
 | `reduced_joint_speed` | float or `nil` | `nil` | Max joint speed in rad/s (reduced mode) |
 | `reduced_joint_ranges` | list or `nil` | `nil` | Per-joint angle limits `[{lower, upper}]` × 7 (reduced mode) |
 | `tcp_boundary` | tuple or `nil` | `nil` | Cartesian workspace fence `{x_min, x_max, y_min, y_max, z_min, z_max}` in mm |
-| `fence_on` | boolean | `false` | Activate the TCP boundary fence |
+| `fence_on` | boolean | `false` | Activate the fence after the controller reads back the configured `tcp_boundary` |
 
 ### Actuators
 
