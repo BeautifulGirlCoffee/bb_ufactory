@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
-## Unreleased
+## v0.2.1 (2026-11-25)
 
 - Require Beam Bots 0.33.2. Synchronous stops use `BB.Actuator.stop/3`
   with `delivery: :pubsub`.

@@ -9,7 +9,7 @@ defmodule BB.Ufactory.MixProject do
   Beam Bots integration for UFactory xArm robotic arms.
   """
 
-  @version "0.2.0"
+  @version "0.2.1"
 
   def project do
     [
