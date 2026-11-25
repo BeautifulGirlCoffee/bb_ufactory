@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## v0.2.1 (2026-11-25)
+
+- Require Beam Bots 0.33.2. Synchronous stops use `BB.Actuator.stop/3`
+  with `delivery: :pubsub`.
+- Fence joint targets and queued Cartesian and accessory motion by arm epoch.
+  Send custom Cartesian commands as epoch-stamped `CartesianMove` messages.
+  The legacy unstamped cast is retired.
+- Confirm disarm using the firmware response or state readback. BB receives
+  a structured error if the controller cannot confirm the operation.
+- Timestamp joint state, TCP pose, and wrench together for historical lookups.
+  Support optional metre-based accessory commands and preserve command IDs in
+  motion feedback.
+
 ## v0.2.0 (2026-09-01)
 
 ### Breaking Changes
@@ -48,8 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{:error, :desync}` on an unrecoverable stream.
 - `Sensor.ForceTorque`'s inert `poll_interval_ms` option is removed (wrench
   data is push-based from report frames; the option was ignored).
-- `Protocol.cmd_move_joints/4` raises for more than 7 angles instead of
-  silently dropping extras; `cmd_set_mode/2` rejects modes outside `0..7`.
+- `BB.Ufactory.Protocol.cmd_move_joints/4` raises for more than 7 angles instead of
+  silently dropping extras; `BB.Ufactory.Protocol.cmd_set_mode/2` rejects modes outside `0..7`.
 - `Actuator.Joint` refuses a topology transmission at init
   (`{:stop, {:unsupported_transmission, name}}`): bb hands the driver
   motor-space values but the firmware receives joint angles, so a
@@ -57,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- **`Protocol.cmd_stop/1` now sends SET_STATE 4 (stop) instead of
+- **`BB.Ufactory.Protocol.cmd_stop/1` now sends SET_STATE 4 (stop) instead of
   SET_STATE 0 (motion state).** State 0 is the firmware's motion-ready
   ("sport") state, so the `:stop` disarm action — including the
   fresh-connection safety disarm — was commanding the arm *into* motion

@@ -4,7 +4,7 @@
 
 defmodule BB.Error.Protocol.Ufactory.CommandRejected do
   @moduledoc """
-  Raised when the xArm returns a non-zero status byte in a command response.
+  Indicates a rejected command reported by the xArm.
 
   The UFactory Modbus-TCP response frame (port 502) has the format:
 
@@ -13,14 +13,9 @@ defmodule BB.Error.Protocol.Ufactory.CommandRejected do
   [Register: u8] [Status: u8] [Params: binary]
   ```
 
-  A `status` of `0x00` means success. Any non-zero status means the arm
-  rejected or failed to execute the command. See the xArm Developer Manual
-  V1.10.0, section 2.1.5 for the full status byte table.
-
-  > **Note:** The controller currently operates in fire-and-forget mode and
-  > does not read back command responses. This error type is provided for use
-  > when synchronous response handling is added (e.g. for gripper position
-  > confirmation or F/T sensor enable acknowledgement).
+  The status byte contains flags for errors, warnings, and readiness. The
+  controller checks them when confirming a disarm response. See the xArm
+  Developer Manual V1.10.0, section 2.1.5 for the status byte table.
   """
 
   use BB.Error, class: :protocol, fields: [:register, :status_byte, :description]

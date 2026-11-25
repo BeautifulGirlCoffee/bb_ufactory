@@ -10,8 +10,8 @@ defmodule BB.Ufactory.Message.Command.CartesianMove do
   which cannot express a 6-DOF end-effector pose. This payload carries the
   full pose and is declared by `BB.Ufactory.Actuator.Cartesian` via
   `c:BB.Actuator.command_payloads/1`, so it travels through the same gated
-  command pipeline as any built-in command — the robot must be armed, and
-  refusals reach a synchronous caller.
+  command pipeline as any built-in command. The command must carry the active
+  arm epoch, and refusals reach a synchronous caller.
 
   ## Fields
 
@@ -33,8 +33,8 @@ defmodule BB.Ufactory.Message.Command.CartesianMove do
         roll: 3.14159, pitch: 0.0, yaw: 0.0
       )
 
-      # Deliver synchronously and learn whether it was accepted:
-      BB.call(MyRobot, :tcp, {:command, msg})
+      {:ok, epoch} = BB.Safety.epoch(MyRobot)
+      BB.call(MyRobot, :tcp, {:command, %{msg | arm_epoch: epoch}})
   """
 
   defstruct [:x, :y, :z, :roll, :pitch, :yaw, :speed, :acceleration, :command_id]

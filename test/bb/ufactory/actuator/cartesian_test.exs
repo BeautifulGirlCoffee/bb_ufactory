@@ -8,6 +8,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
 
   setup :verify_on_exit!
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Ufactory.Actuator.Cartesian
@@ -95,7 +96,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       expected_frame = Protocol.cmd_move_cartesian(0, pose, 100.0, 2000.0)
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         assert frame == expected_frame
         :ok
       end)
@@ -115,7 +116,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
         Protocol.cmd_move_cartesian(0, {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}, 80.0, 2000.0)
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         assert frame == expected_frame
         :ok
       end)
@@ -143,7 +144,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       expected_frame = Protocol.cmd_move_cartesian(0, pose, 50.0, 1000.0)
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         assert frame == expected_frame
         :ok
       end)
@@ -160,7 +161,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       test_pid = self()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> :ok end)
 
       BB
       |> expect(:publish, fn TestRobot, [:actuator | _], %Message{payload: %BeginMotion{} = bm} ->
@@ -179,7 +180,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       state = make_state()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> {:error, :closed} end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> {:error, :closed} end)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg ->
@@ -187,94 +188,9 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       end)
 
       msg = cartesian_move_msg({300.0, 0.0, 200.0, 0.0, 0.0, 0.0})
-      assert {:reply, {:error, :closed}, ^state} = Cartesian.handle_command(msg, state)
-    end
-  end
 
-  # ── handle_cast {:move_cartesian, pose} (legacy interface) ───────────────────
-
-  describe "handle_cast({:move_cartesian, pose}, state)" do
-    setup do
-      # The legacy cast path enforces the armed check itself (bb's command
-      # pipeline never sees casts); these tests exercise the armed case.
-      BB.Safety
-      |> stub(:armed?, fn TestRobot -> true end)
-
-      :ok
-    end
-
-    test "drops the cast when the robot is not armed" do
-      BB.Safety
-      |> expect(:armed?, fn TestRobot -> false end)
-
-      # No :send_command expectation: reaching the controller would fail the
-      # Mimic verification.
-      state = make_state()
-      pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
-
-      assert {:noreply, ^state} = Cartesian.handle_cast({:move_cartesian, pose}, state)
-    end
-
-    test "sends cmd_move_cartesian frame via controller call" do
-      state = make_state()
-      pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
-      expected_frame = Protocol.cmd_move_cartesian(0, pose, 100.0, 2000.0)
-
-      BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        assert frame == expected_frame
-        :ok
-      end)
-
-      BB
-      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
-
-      assert {:noreply, ^state} = Cartesian.handle_cast({:move_cartesian, pose}, state)
-    end
-
-    test "publishes BeginMotion after sending the command" do
-      state = make_state()
-      pose = {300.0, 0.0, 0.0, 0.0, 0.0, 0.0}
-      test_pid = self()
-
-      BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
-
-      BB
-      |> expect(:publish, fn TestRobot,
-                             [:actuator | _path],
-                             %Message{
-                               payload: %BeginMotion{}
-                             } = msg ->
-        send(test_pid, {:published, msg})
-        :ok
-      end)
-
-      Cartesian.handle_cast({:move_cartesian, pose}, state)
-      assert_receive {:published, _msg}, 500
-    end
-
-    test "uses per-command speed and acceleration when provided as 4-tuple" do
-      state = make_state()
-      pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
-      expected_frame = Protocol.cmd_move_cartesian(0, pose, 50.0, 1000.0)
-
-      BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
-        assert frame == expected_frame
-        :ok
-      end)
-
-      BB
-      |> stub(:publish, fn _robot, _path, _msg -> :ok end)
-
-      assert {:noreply, ^state} =
-               Cartesian.handle_cast({:move_cartesian, pose, 50.0, 1000.0}, state)
-    end
-
-    test "ignores unknown casts" do
-      state = make_state()
-      assert {:noreply, ^state} = Cartesian.handle_cast(:unexpected, state)
+      assert {:reply, {:error, %CommandFailed{operation: :cartesian_move, reason: :closed}},
+              ^state} = Cartesian.handle_command(msg, state)
     end
 
     test "BeginMotion target_position is the travel distance in metres" do
@@ -284,7 +200,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       test_pid = self()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> :ok end)
 
       BB
       |> expect(:publish, fn TestRobot, [:actuator | _], %Message{payload: %BeginMotion{} = bm} ->
@@ -292,7 +208,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
         :ok
       end)
 
-      Cartesian.handle_cast({:move_cartesian, pose}, state)
+      Cartesian.handle_command(cartesian_move_msg(pose), state)
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.target_position, 0.3, 1.0e-6
@@ -307,7 +223,7 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
       test_pid = self()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> :ok end)
 
       BB
       |> expect(:publish, fn TestRobot, [:actuator | _], %Message{payload: %BeginMotion{} = bm} ->
@@ -315,30 +231,30 @@ defmodule BB.Ufactory.Actuator.CartesianTest do
         :ok
       end)
 
+      id = make_ref()
       before = System.monotonic_time(:millisecond)
-      Cartesian.handle_cast({:move_cartesian, pose, 10.0, 1000.0}, state)
+      Cartesian.handle_command(cartesian_move_msg(pose, speed: 10.0, command_id: id), state)
 
       assert_receive {:begin_motion, bm}, 500
+      assert bm.command_id == id
       travel_ms = bm.expected_arrival - before
       assert travel_ms >= 29_000
       assert travel_ms <= 31_000
     end
+  end
 
-    test "does not publish BeginMotion when controller call fails" do
+  describe "retired Cartesian casts" do
+    test "ignores both unstamped move forms" do
       state = make_state()
       pose = {300.0, 0.0, 200.0, 0.0, 0.0, 0.0}
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
-        {:error, :closed}
-      end)
-
-      BB
-      |> stub(:publish, fn _robot, _path, _msg ->
-        flunk("publish should not be called on controller error")
-      end)
+      |> stub(:call, fn _, _, _ -> flunk("legacy casts must not reach the controller") end)
 
       assert {:noreply, ^state} = Cartesian.handle_cast({:move_cartesian, pose}, state)
+
+      assert {:noreply, ^state} =
+               Cartesian.handle_cast({:move_cartesian, pose, 10.0, 1000.0}, state)
     end
   end
 

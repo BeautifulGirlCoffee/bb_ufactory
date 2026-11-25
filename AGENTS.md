@@ -106,9 +106,9 @@ BB.Error.Protocol.Ufactory.ConnectionError
   controller `handle_call({:send_command, frame}, ...)`. Declares the custom
   `BB.Ufactory.Message.Command.CartesianMove` payload (6-DOF pose + optional
   speed/acceleration) so pose commands flow through BB's gated pipeline; a
-  legacy `{:move_cartesian, pose}` raw cast is kept for compatibility.
+  legacy `{:move_cartesian, pose}` raw cast is retired.
 
-- **`BB.Ufactory.Actuator.Gripper`** — Gripper G2 position (0–840 mm) via register 0x7C.
+- **`BB.Ufactory.Actuator.Gripper`** — Gripper G2 position (0–850 pulses) via register 0x7C.
 
 - **`BB.Ufactory.Actuator.LinearTrack`** — Linear track (RS485 proxied; int32 BE / 2000 = mm).
 
@@ -116,6 +116,9 @@ BB.Error.Protocol.Ufactory.ConnectionError
   init via `cmd_ft_sensor_enable`. Subscribes to `[:sensor, controller_name, :wrench]`
   and re-publishes to its own sensor-scoped pubsub path. Disarms by sending
   `cmd_ft_sensor_enable(false)`.
+
+- **`BB.Ufactory.Sensor.CartesianPose`** — Forwards the controller's TCP pose
+  to a declared sensor topic for use by BB estimators.
 
 - **`BB.Ufactory.Sensor.Collision`** — Configures collision detection sensitivity,
   rebound behaviour, and self-collision check on init. Subscribes to
@@ -190,7 +193,7 @@ Test files mirror the `lib/` structure:
 
 ## Dependencies
 
-- `bb ~> 0.31` — The Beam Bots robotics framework
+- `bb ~> 0.33.2` — The Beam Bots robotics framework
 
 ## Reference Material
 

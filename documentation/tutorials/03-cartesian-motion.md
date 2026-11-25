@@ -93,7 +93,7 @@ end
 1. A `BB.Ufactory.Message.Command.CartesianMove` command arrives at the
    actuator through BB's gated command pipeline (the actuator declares the
    payload via `c:BB.Actuator.command_payloads/1`, so the framework checks
-   the robot is armed before the driver sees it).
+   the robot is armed and the message belongs to the current arming session).
 2. A `MOVE_LINE` frame (register 0x15) is built immediately with the pose and
    the configured (or per-command) speed/acceleration.
 3. The frame is forwarded **directly** to the controller via `BB.Process.call/3`
@@ -104,19 +104,23 @@ one wire frame, dispatched synchronously before the call returns.
 
 ### Sending a Cartesian command
 
+Read the arm epoch when sending a custom command. The actuator rejects a
+message from an earlier arming session.
+
 ```elixir
 alias BB.Ufactory.Message.Command.CartesianMove
 
 # Move TCP to x=300mm, y=0mm, z=400mm, no rotation
 msg = BB.Message.new!(CartesianMove, :cartesian,
   x: 300.0, y: 0.0, z: 400.0, roll: 0.0, pitch: 0.0, yaw: 0.0)
+{:ok, epoch} = BB.Safety.epoch(robot)
+command = %{msg | arm_epoch: epoch}
 
-# Synchronous: returns {:ok, :accepted} once the arm has taken the frame,
-# or {:error, reason} — including a refusal while the robot is disarmed.
-BB.call(robot, :cartesian, {:command, msg})
+# Wait for actuator acceptance or refusal.
+BB.call(robot, :cartesian, {:command, command})
 
-# Fire-and-forget:
-BB.cast(robot, :cartesian, {:command, msg})
+# Alternatively, send without waiting for acceptance.
+BB.cast(robot, :cartesian, {:command, command, nil})
 ```
 
 Field units:
@@ -132,18 +136,8 @@ msg = BB.Message.new!(CartesianMove, :cartesian,
   speed: 50.0,          # mm/s
   acceleration: 500.0)  # mm/s²
 
-BB.call(robot, :cartesian, {:command, msg})
-```
-
-### Legacy cast interface (deprecated)
-
-The pre-0.2 raw cast still works but is deprecated: it logs a warning on
-every use, and since 0.2.0 it is **dropped when the robot is not armed**
-(previously it would move a disarmed robot). Prefer `CartesianMove`:
-
-```elixir
-BB.Process.cast(robot, :cartesian, {:move_cartesian, {300.0, 0.0, 400.0, 0.0, 0.0, 0.0}})
-BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, 50.0, 500.0})
+{:ok, epoch} = BB.Safety.epoch(robot)
+BB.call(robot, :cartesian, {:command, %{msg | arm_epoch: epoch}})
 ```
 
 ### Reading the current Cartesian pose
@@ -162,6 +156,70 @@ end
 ```
 
 ---
+
+## Command acknowledgement and arm sessions
+
+`BB.Actuator.set_position/4` with the default `delivery: :pubsub` waits for
+the actuator to accept the target. A joint target is staged for the next
+controller tick. A Cartesian or accessory acceptance confirms the TCP send.
+Use joint-state or device feedback to observe completion.
+
+`BB.Error.State.CommandPending` means the actuator did not answer by the
+deadline. The command can still reach the wire in the same arm session.
+Wait for feedback or issue an explicit stop before sending a replacement.
+A `:direct` rejection reply reports BB's authorization result. For driver
+replies, use synchronous delivery.
+
+Disarm invalidates the targets and queued motion sends from that session.
+The legacy `{:move_cartesian, ...}` casts are retired. Use a
+`CartesianMove` message stamped with the arm epoch when you send it.
+
+## Aligning sensor data with joint history
+
+BB records joint configurations from `JointState` reports by default. To
+project a sensor reading through the robot's earlier configuration, use its
+local monotonic timestamp after the relevant joint reports have been processed.
+
+```elixir
+state = BB.Robot.Runtime.get_robot_state(MyRobot)
+
+BB.Robot.State.get_all_configurations_at(state, sensor_message.monotonic_time)
+```
+
+Joint state, TCP pose, and wrench from the same firmware frame share a host
+timestamp. The arm reports do not carry a synchronized device capture time.
+History can return the last sample after a stream stops, so validate freshness
+separately. In a custom BB robot definition, declare pose and wrench as
+sensor sources so BB can resolve them during estimator wiring. Place the
+estimator on the link that consumes those inputs.
+
+```elixir
+sensors do
+  sensor :tool_pose, {BB.Ufactory.Sensor.CartesianPose, controller: :xarm}
+  sensor :tool_wrench, {BB.Ufactory.Sensor.ForceTorque, controller: :xarm}
+end
+
+topology do
+  link :base do
+    estimator :contact_pose, MyApp.ContactPoseEstimator do
+      input :wrench, [:sensor, :tool_wrench], driver?: true,
+        max_input_age: ~u(50 millisecond)
+
+      input :pose, [:sensor, :tool_pose],
+        max_input_age: ~u(50 millisecond)
+
+      sync_tolerance ~u(20 millisecond)
+      lost_after ~u(100 millisecond)
+    end
+
+    # Define the arm's joints here.
+  end
+end
+```
+
+Import `BB.Unit` for the time literals. Tune the intervals to the measured report\nrate and application. BB rejects
+estimator inputs stamped on other BEAM nodes. The robot DSL can also set the
+joint-history retention and interpolation gap.
 
 ## Joint-Space vs Cartesian — When to Use Each
 

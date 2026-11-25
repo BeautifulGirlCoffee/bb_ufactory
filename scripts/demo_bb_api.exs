@@ -404,8 +404,8 @@ if pose do
 
   log.("  Moving TCP +20mm X, +20mm Y...")
 
-  # CartesianMove travels through BB's gated command pipeline: the robot must
-  # be armed, and the synchronous call reports whether the arm accepted it.
+  # The current arm epoch authorizes the command. The synchronous call reports
+  # whether the actuator accepted it.
   move = fn x, y, z, roll, pitch, yaw ->
     msg =
       BB.Message.new!(BB.Ufactory.Message.Command.CartesianMove, :cartesian,
@@ -417,7 +417,9 @@ if pose do
         yaw: yaw
       )
 
-    BB.call(DemoRobot, :cartesian, {:command, msg})
+    with {:ok, epoch} <- BB.Safety.epoch(DemoRobot) do
+      BB.call(DemoRobot, :cartesian, {:command, %{msg | arm_epoch: epoch}})
+    end
   end
 
   move.(pose.x + 20.0, pose.y + 20.0, pose.z, pose.roll, pose.pitch, pose.yaw)

@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# Cartesian, gripper, and track already share the BB.Actuator behaviour.
+# reach:disable-next-line behaviour_candidate
 defmodule BB.Ufactory.Actuator.Cartesian do
   @moduledoc """
   Cartesian-space position actuator for xArm arms.
@@ -18,18 +20,21 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   The actuator declares `BB.Ufactory.Message.Command.CartesianMove` via
   `c:BB.Actuator.command_payloads/1`, so pose commands travel through BB's
-  gated command pipeline (armed check, refusals reaching the caller):
+  gated command pipeline. Stamp the message with the active arm epoch before
+  sending it.
 
       alias BB.Ufactory.Message.Command.CartesianMove
 
       msg = BB.Message.new!(CartesianMove, :tcp,
         x: 300.0, y: 0.0, z: 400.0, roll: 3.14159, pitch: 0.0, yaw: 0.0)
+      {:ok, epoch} = BB.Safety.epoch(MyRobot)
+      command = %{msg | arm_epoch: epoch}
 
-      # Synchronous — learn whether the arm accepted the command:
-      {:ok, :accepted} = BB.call(MyRobot, :tcp, {:command, msg})
+      # Synchronous delivery confirms actuator acceptance.
+      {:ok, :accepted} = BB.call(MyRobot, :tcp, {:command, command})
 
-      # Fire-and-forget:
-      BB.cast(MyRobot, :tcp, {:command, msg})
+      # Alternatively, send without waiting for acceptance.
+      BB.cast(MyRobot, :tcp, {:command, command, nil})
 
   - `x`, `y`, `z` — position in **millimetres**
   - `roll`, `pitch`, `yaw` — orientation in **radians**
@@ -37,14 +42,6 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   `speed` and `acceleration` default to the values configured in
   `options_schema` and can be overridden per-command in the payload.
 
-  ### Legacy cast interface (deprecated)
-
-  The pre-0.2 raw cast is still accepted for backwards compatibility: it
-  logs a deprecation warning on every use and is **dropped when the robot
-  is not armed** — prefer `CartesianMove`:
-
-      BB.Process.cast(robot, :cartesian, {:move_cartesian, {x, y, z, roll, pitch, yaw}})
-      BB.Process.cast(robot, :cartesian, {:move_cartesian, pose, speed, accel})
   """
 
   use BB.Actuator,
@@ -68,6 +65,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
 
   require Logger
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Ufactory.Message.Command.CartesianMove
@@ -115,7 +113,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   # ── handle_command/2 — gated command pipeline ────────────────────────────────
 
   @impl BB.Actuator
-  def handle_command(%Message{payload: %CartesianMove{} = cmd}, state) do
+  def handle_command(%Message{payload: %CartesianMove{} = cmd} = message, state) do
     # The payload accepts integers for ergonomics (`x: 300`); normalize to
     # floats before they reach the fp32 encoders.
     pose = {
@@ -130,9 +128,9 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     speed = :erlang.float(cmd.speed || state.speed)
     accel = :erlang.float(cmd.acceleration || state.acceleration)
 
-    case send_cartesian(pose, speed, accel, state) do
+    case send_cartesian(pose, speed, accel, message, state) do
       :ok -> {:noreply, state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:error, reason} -> {:reply, CommandFailed.reply(:cartesian_move, reason), state}
     end
   end
 
@@ -140,51 +138,18 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     {:reply, {:error, {:unsupported_command, payload.__struct__}}, state}
   end
 
-  # ── Legacy direct cast: {:move_cartesian, pose} ─────────────────────────────
-  #
-  # Deprecated: prefer the CartesianMove payload. bb's command pipeline never
-  # sees these casts, so the armed check is enforced HERE — without it, a
-  # disarmed robot would happily execute a MOVE_LINE (disarm_action :hold
-  # sends no SET_STATE 4, so the firmware remains motion-ready).
-
-  @impl BB.Actuator
-  def handle_cast({:move_cartesian, {_x, _y, _z, _roll, _pitch, _yaw} = pose}, state) do
-    legacy_cast_move(pose, state.speed, state.acceleration, state)
-    {:noreply, state}
-  end
-
-  def handle_cast({:move_cartesian, pose, speed, accel}, state) do
-    legacy_cast_move(pose, speed * 1.0, accel * 1.0, state)
-    {:noreply, state}
-  end
-
-  def handle_cast(_request, state), do: {:noreply, state}
-
-  defp legacy_cast_move(pose, speed, accel, state) do
-    if BB.Safety.armed?(state.bb.robot) do
-      Logger.warning(
-        "[BB.Ufactory.Actuator.Cartesian] {:move_cartesian, ...} casts are deprecated — " <>
-          "send a BB.Ufactory.Message.Command.CartesianMove through the command pipeline"
-      )
-
-      send_cartesian(pose, speed, accel, state)
-    else
-      Logger.warning(
-        "[BB.Ufactory.Actuator.Cartesian] Dropped {:move_cartesian, ...} cast: robot is not armed"
-      )
-
-      :ok
-    end
-  end
-
   # ── Private helpers ──────────────────────────────────────────────────────────
 
-  defp send_cartesian(pose, speed, accel, state) do
+  defp send_cartesian(pose, speed, accel, message, state) do
     frame = Protocol.cmd_move_cartesian(0, pose, speed, accel)
 
-    case BB.Process.call(state.bb.robot, state.controller, {:send_command, frame}) do
+    case BB.Process.call(
+           state.bb.robot,
+           state.controller,
+           {:send_motion, message.arm_epoch, frame}
+         ) do
       :ok ->
-        publish_begin_motion(pose, speed, state)
+        publish_begin_motion(pose, speed, message.payload.command_id, state)
         :ok
 
       {:error, reason} = error ->
@@ -198,7 +163,7 @@ defmodule BB.Ufactory.Actuator.Cartesian do
   # for prismatic-style positions is metres, not millimetres). The arrival
   # estimate uses the speed this command was actually sent with, which may be
   # a per-command override rather than the configured default.
-  defp publish_begin_motion({x, y, z, _roll, _pitch, _yaw}, speed, state) do
+  defp publish_begin_motion({x, y, z, _roll, _pitch, _yaw}, speed, command_id, state) do
     actuator_name = List.last(state.bb.path)
     {cx, cy, cz} = current_position(state)
     dx = x - cx
@@ -208,12 +173,16 @@ defmodule BB.Ufactory.Actuator.Cartesian do
     travel_ms = round(distance_mm / max(speed, 0.001) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
-    case Message.new(BeginMotion, actuator_name,
-           initial_position: 0.0,
-           target_position: distance_mm / 1000.0,
-           expected_arrival: expected_arrival,
-           command_type: :position
-         ) do
+    fields = [
+      initial_position: 0.0,
+      target_position: distance_mm / 1000.0,
+      expected_arrival: expected_arrival,
+      command_type: :position
+    ]
+
+    fields = if command_id, do: Keyword.put(fields, :command_id, command_id), else: fields
+
+    case Message.new(BeginMotion, actuator_name, fields) do
       {:ok, msg} ->
         BB.publish(state.bb.robot, [:actuator | state.bb.path], msg)
 

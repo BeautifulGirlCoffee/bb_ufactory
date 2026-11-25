@@ -38,6 +38,8 @@ defmodule BB.Ufactory.SimulatorTest do
 
   use BB.Ufactory.SimulatorCase
 
+  alias BB.Ufactory.Message.CartesianPose
+  alias BB.Ufactory.Message.Command.CartesianMove
   alias BB.Ufactory.Model
 
   @model String.to_existing_atom(System.get_env("SIM_MODEL", "xarm6"))
@@ -465,6 +467,13 @@ defmodule BB.Ufactory.SimulatorTest do
           actuator(:j1_motor, {BB.Ufactory.Actuator.Joint, joint: 1, controller: :xarm})
 
           link :link1 do
+            joint :cartesian_mount do
+              type(:fixed)
+              actuator(:cartesian, {BB.Ufactory.Actuator.Cartesian, controller: :xarm})
+
+              link :cartesian_body do
+              end
+            end
           end
         end
       end
@@ -523,6 +532,33 @@ defmodule BB.Ufactory.SimulatorTest do
       assert :ok = BB.Safety.disarm(Robot)
     end
 
+    test "Cartesian commands must carry the current arm epoch" do
+      BB.subscribe(Robot, [:sensor, :xarm, :tcp_pose])
+      assert :ok = BB.Safety.arm(Robot)
+
+      assert_receive {:bb, [:sensor, :xarm, :tcp_pose],
+                      %BB.Message{payload: %CartesianPose{} = pose}},
+                     5_000
+
+      message =
+        BB.Message.new!(CartesianMove, :cartesian,
+          x: pose.x,
+          y: pose.y,
+          z: pose.z,
+          roll: pose.roll,
+          pitch: pose.pitch,
+          yaw: pose.yaw
+        )
+
+      assert {:error, %BB.Error.State.StaleEpoch{}} =
+               BB.call(Robot, :cartesian, {:command, message})
+
+      assert {:ok, epoch} = BB.Safety.epoch(Robot)
+
+      assert {:ok, :accepted} =
+               BB.call(Robot, :cartesian, {:command, %{message | arm_epoch: epoch}})
+    end
+
     test "Stop through the actuator brakes J1 short of its target and holds" do
       BB.subscribe(Robot, [:sensor, :xarm])
 
@@ -540,7 +576,7 @@ defmodule BB.Ufactory.SimulatorTest do
       assert await_moved(1, start, 0.1, 20_000), "J1 never started moving"
 
       # Stop latches the current reported position as the loop target.
-      assert {:ok, _accepted} = BB.Actuator.stop_sync(Robot, :j1_motor)
+      assert :ok = BB.Actuator.stop(Robot, :j1_motor, delivery: :pubsub)
 
       # Give the unbraked move more than enough time to have finished
       # (1.0 rad at 0.25 rad/s ≈ 4 s), then sample ~1 s of the stream.

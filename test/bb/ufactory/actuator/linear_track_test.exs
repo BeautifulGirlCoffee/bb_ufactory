@@ -8,6 +8,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
 
   setup :verify_on_exit!
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
@@ -28,6 +29,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
     %{
       bb: %{robot: TestRobot, path: [:linear_track]},
       controller: :xarm,
+      mm_per_unit: Keyword.get(opts, :mm_per_unit, 1.0),
       speed: Keyword.get(opts, :speed, 200),
       stroke_mm: Keyword.get(opts, :stroke_mm, 700)
     }
@@ -175,7 +177,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
           {:send_and_recv, _frame} ->
             track_read_response(0.0)
 
-          {:send_command, frame} ->
+          {:send_motion, nil, frame} ->
             idx = :counters.get(send_calls, 1)
             :counters.add(send_calls, 1, 1)
 
@@ -208,7 +210,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} -> track_read_response(100.0)
-          {:send_command, _frame} -> :ok
+          {:send_motion, nil, _frame} -> :ok
         end
       end)
 
@@ -237,7 +239,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} -> track_read_response(0.0)
-          {:send_command, _frame} -> {:error, :closed}
+          {:send_motion, nil, _frame} -> {:error, :closed}
         end
       end)
 
@@ -247,7 +249,33 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       end)
 
       msg = position_msg(500.0)
-      assert {:reply, {:error, :closed}, ^state} = LinearTrack.handle_command(msg, state)
+
+      assert {:reply, {:error, %CommandFailed{operation: :linear_track_move, reason: :closed}},
+              ^state} = LinearTrack.handle_command(msg, state)
+    end
+
+    test "converts metres at the wire boundary and reports positions in metres" do
+      state = make_state(mm_per_unit: 1000.0)
+      {position_frame, speed_frame} = Protocol.cmd_linear_track_move(0, 500.0, 200)
+      command_id = make_ref()
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_and_recv, _} -> track_read_response(100.0) end)
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, 12, ^speed_frame} -> :ok end)
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, 12, ^position_frame} -> :ok end)
+
+      BB
+      |> expect(:publish, fn TestRobot, [:actuator, :linear_track], %Message{payload: feedback} ->
+        assert %BeginMotion{command_id: ^command_id, initial_position: 0.1, target_position: 0.5} =
+                 feedback
+
+        :ok
+      end)
+
+      message =
+        Message.new!(Command.Position, :linear_track, position: 0.5, command_id: command_id)
+
+      assert {:noreply, ^state} = LinearTrack.handle_command(%{message | arm_epoch: 12}, state)
     end
 
     test "clamps commands beyond the stroke to the stroke limit" do
@@ -261,7 +289,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
           {:send_and_recv, _frame} ->
             track_read_response(0.0)
 
-          {:send_command, frame} ->
+          {:send_motion, nil, frame} ->
             send(test_pid, {:frame_sent, frame})
             :ok
         end
@@ -289,7 +317,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
           {:send_and_recv, _frame} ->
             track_read_response(0.0)
 
-          {:send_command, frame} ->
+          {:send_motion, nil, frame} ->
             send(test_pid, {:frame_sent, frame})
             :ok
         end
@@ -321,7 +349,7 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
           {:send_and_recv, _frame} ->
             track_read_response(320.0)
 
-          {:send_command, frame} ->
+          {:send_motion, nil, frame} ->
             send(test_pid, {:frame_sent, frame})
             :ok
         end
@@ -344,13 +372,15 @@ defmodule BB.Ufactory.Actuator.LinearTrackTest do
       |> stub(:call, fn TestRobot, :xarm, msg ->
         case msg do
           {:send_and_recv, _frame} -> {:error, :timeout}
-          {:send_command, _frame} -> flunk("must not command a move when position is unknown")
+          {:send_motion, nil, _frame} -> flunk("must not command a move when position is unknown")
         end
       end)
 
       msg = Message.new!(Command.Stop, :linear_track, mode: :immediate)
 
-      assert {:reply, {:error, :position_unknown}, ^state} =
+      assert {:reply,
+              {:error, %CommandFailed{operation: :linear_track_stop, reason: :position_unknown}},
+              ^state} =
                LinearTrack.handle_command(msg, state)
     end
   end

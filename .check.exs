@@ -8,8 +8,10 @@
     # --warnings-as-errors also covers TEST-file compilation, which the
     # compiler task (lib only) cannot see.
     {:excoveralls, "mix coveralls --warnings-as-errors"},
+    {:sobelow, "mix sobelow --exit --skip"},
     # Architecture policy (.reach.exs) + strict cross-function smell checks.
     {:reach, "mix reach.check --arch --smells --strict"},
-    {:reuse, command: ["docker", "run", "--rm", "-v", "#{File.cwd!()}:/data", "fsfe/reuse", "lint"]}
+    {:reuse,
+     command: ["docker", "run", "--rm", "-v", "#{File.cwd!()}:/data", "fsfe/reuse:6.3.0", "lint"]}
   ]
 ]

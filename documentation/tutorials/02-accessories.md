@@ -70,6 +70,14 @@ crash — the gripper has no independent connection of its own.)
 
 ---
 
+For a gripper mounted on a custom prismatic joint, set `meters_per_pulse`
+to a positive, calibrated scale if pulse position is linear over the
+range you intend to use. Commands and `BeginMotion` positions will then use
+metres. The default preserves pulse units, and the speed option stays in
+pulses per second. Track and gripper `BeginMotion` messages are estimates.
+A kinematic model that needs measured accessory position requires feedback
+for those joints.
+
 ## Force/Torque Sensor
 
 The UFactory F/T sensor attaches to the tool flange and reports six-axis wrench
@@ -142,16 +150,22 @@ end
 
 ### Commanding the Linear Track
 
-Position is given in millimetres:
+Position is given in millimetres by default.
 
 ```elixir
 # Move track to 500 mm from the home position (synchronous)
 :ok = BB.Actuator.set_position(MyRobot, :track, 500.0)
 ```
 
-`BB.Actuator.stop(MyRobot, :track)` brakes the carriage by re-targeting its
-current position (read over RS485); the stop is refused with
-`{:error, :position_unknown}` if the read fails.
+Use `BB.Actuator.stop(MyRobot, :track, delivery: :pubsub)` to brake the
+carriage and receive the driver result. The driver reads the current
+position over RS485 and re-targets it. If the read fails, it returns
+`{:error, %BB.Error.Protocol.Ufactory.CommandFailed{reason: :position_unknown}}`.
+
+On a custom prismatic joint driven through `BB.Motion`, configure the track
+with `position_unit: :meter`. The driver converts position commands to
+millimetres for the wire and reports `BeginMotion` positions in metres.
+The `speed` and `stroke_mm` driver options still use mm/s and mm.
 
 Under the hood, the actuator sends two sequential frames: a speed-set frame
 followed by a position-set frame. Speed must arrive first so the arm uses the

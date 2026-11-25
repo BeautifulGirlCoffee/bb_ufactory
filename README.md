@@ -57,7 +57,7 @@ end
 ## Requirements
 
 - UFactory xArm arm connected via Ethernet
-- BB framework (`~> 0.31`)
+- BB framework (`~> 0.33.2`)
 
 ## Usage
 
@@ -119,12 +119,12 @@ end
 ### Joint-Space Motion
 
 ```elixir
-# Synchronous (bb >= 0.30): returns :ok, or {:error, reason} on refusal
+# Returns :ok on acceptance or {:error, reason} on refusal
 :ok = BB.Actuator.set_position(MyRobot, :j1_motor, 0.5)
 
 # Brake a joint at its current position / actively hold it there
-BB.Actuator.stop(MyRobot, :j1_motor)
-BB.Actuator.hold(MyRobot, :j1_motor)
+BB.Actuator.stop(MyRobot, :j1_motor, delivery: :pubsub)
+BB.Actuator.hold(MyRobot, :j1_motor, delivery: :pubsub)
 ```
 
 ### Cartesian Motion
@@ -135,7 +135,8 @@ alias BB.Ufactory.Message.Command.CartesianMove
 msg = BB.Message.new!(CartesianMove, :cartesian,
   x: 300.0, y: 0.0, z: 400.0, roll: 0.0, pitch: 0.0, yaw: 0.0)
 
-BB.call(MyRobot, :cartesian, {:command, msg})
+{:ok, epoch} = BB.Safety.epoch(MyRobot)
+BB.call(MyRobot, :cartesian, {:command, %{msg | arm_epoch: epoch}})
 ```
 
 ### Subscribing to State
@@ -171,7 +172,7 @@ BB.subscribe(MyRobot, [:sensor, :collision])
 | `model` | atom | `:xarm6` | Arm model (`:xarm5`, `:xarm6`, `:xarm7`, `:lite6`, `:xarm850`) |
 | `loop_hz` | integer | `100` | Control loop frequency in Hz |
 | `heartbeat_interval_ms` | integer | `1000` | Heartbeat interval in ms |
-| `disarm_action` | atom | `:stop` | Action on disarm: `:stop` clears motion, `:hold` holds position |
+| `disarm_action` | atom | `:stop` | Action on disarm. `:stop` clears queued motion. `:hold` disables joint motors |
 | `tcp_offset` | tuple or `nil` | `nil` | TCP offset `{x_mm, y_mm, z_mm, roll_rad, pitch_rad, yaw_rad}` |
 | `tcp_load` | tuple or `nil` | `nil` | Tool payload `{mass_kg, com_x_mm, com_y_mm, com_z_mm}` |
 | `reduced_mode` | boolean | `false` | Enable firmware reduced mode (lower speed limits + optional fence) |
@@ -195,6 +196,7 @@ BB.subscribe(MyRobot, [:sensor, :collision])
 | Module | Description |
 |--------|-------------|
 | `BB.Ufactory.Sensor.ForceTorque` | 6-axis F/T streamed from report socket (Fx/Fy/Fz/Tx/Ty/Tz) |
+| `BB.Ufactory.Sensor.CartesianPose` | Declared TCP pose source for BB estimators |
 | `BB.Ufactory.Sensor.Collision` | Collision detection with configurable sensitivity (0–5); publishes on error codes 22, 31, 35 |
 
 ### Messages

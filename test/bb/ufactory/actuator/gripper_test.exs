@@ -8,6 +8,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
 
   setup :verify_on_exit!
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
@@ -19,6 +20,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       bb: %{robot: TestRobot, path: [:gripper]},
       controller: :xarm,
       speed: Keyword.get(opts, :speed, 1500),
+      meters_per_pulse: Keyword.get(opts, :meters_per_pulse),
       last_commanded: Keyword.get(opts, :last_commanded)
     }
   end
@@ -105,7 +107,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       expected_frame = Protocol.cmd_gripper_position(0, 420)
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         assert frame == expected_frame
         :ok
       end)
@@ -123,7 +125,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       test_pid = self()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> :ok end)
 
       BB
       |> expect(:publish, fn TestRobot, [:actuator, :gripper], msg ->
@@ -142,7 +144,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         expected = Protocol.cmd_gripper_position(0, 421)
         assert frame == expected
         :ok
@@ -159,7 +161,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         expected = Protocol.cmd_gripper_position(0, 850)
         assert frame == expected
         :ok
@@ -176,7 +178,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, frame} ->
         expected = Protocol.cmd_gripper_position(0, 0)
         assert frame == expected
         :ok
@@ -194,7 +196,7 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       test_pid = self()
 
       BB.Process
-      |> stub(:call, fn TestRobot, :xarm, {:send_command, _frame} -> :ok end)
+      |> stub(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} -> :ok end)
 
       BB
       |> expect(:publish, fn TestRobot,
@@ -217,12 +219,35 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       state = make_state()
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, nil, _frame} ->
         {:error, :closed}
       end)
 
       msg = position_msg(300.0)
-      assert {:reply, {:error, :closed}, ^state} = Gripper.handle_command(msg, state)
+
+      assert {:reply, {:error, %CommandFailed{operation: :gripper_move, reason: :closed}}, ^state} =
+               Gripper.handle_command(msg, state)
+    end
+
+    test "converts calibrated metres to pulses and echoes the command ID in feedback" do
+      state = make_state(meters_per_pulse: 0.0001)
+      command_id = make_ref()
+      frame = Protocol.cmd_gripper_position(0, 400)
+
+      BB.Process
+      |> expect(:call, fn TestRobot, :xarm, {:send_motion, 12, ^frame} -> :ok end)
+
+      BB
+      |> expect(:publish, fn TestRobot, [:actuator, :gripper], %Message{payload: feedback} ->
+        assert %BeginMotion{command_id: ^command_id} = feedback
+        assert_in_delta feedback.target_position, 0.04, 1.0e-8
+        :ok
+      end)
+
+      message = Message.new!(Command.Position, :gripper, position: 0.04, command_id: command_id)
+
+      assert {:noreply, %{last_commanded: 400}} =
+               Gripper.handle_command(%{message | arm_epoch: 12}, state)
     end
   end
 
