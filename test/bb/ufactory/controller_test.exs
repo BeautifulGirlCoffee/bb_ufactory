@@ -8,6 +8,7 @@ defmodule BB.Ufactory.ControllerTest do
 
   import Bitwise
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.Command
   alias BB.Message.Sensor.JointState
@@ -17,6 +18,8 @@ defmodule BB.Ufactory.ControllerTest do
   alias BB.Ufactory.Message.CartesianPose
   alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Protocol
+
+  @epoch 42
 
   setup :verify_on_exit!
 
@@ -35,7 +38,7 @@ defmodule BB.Ufactory.ControllerTest do
   end
 
   # Receives all pending bytes from `socket` within `timeout_ms`.
-  defp recv_all(socket, timeout_ms \\ 100) do
+  defp recv_all(socket, timeout_ms) do
     :gen_tcp.recv(socket, 0, timeout_ms)
   end
 
@@ -107,7 +110,7 @@ defmodule BB.Ufactory.ControllerTest do
   defp make_state(cmd_socket, extra \\ %{}) do
     ets = :ets.new(:test_controller_ets, [:public, :set])
     # Pre-populate 6-joint rows (xarm6)
-    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil})
+    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
 
     base = %{
@@ -136,6 +139,7 @@ defmodule BB.Ufactory.ControllerTest do
       report_stale_ms: 250,
       feedback_loss_fatal_ms: 3_000,
       arm_frames: [],
+      arm_epoch: nil,
       tcp_offset: nil,
       tcp_load: nil,
       reduced_mode: false,
@@ -227,58 +231,95 @@ defmodule BB.Ufactory.ControllerTest do
   # ── disarm/1 ────────────────────────────────────────────────────────────────
 
   describe "disarm/1" do
-    test "sends cmd_stop on a fresh TCP connection" do
-      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
-      {:ok, port} = :inet.port(listen)
+    test "matches a fragmented stop acknowledgement by transaction and register" do
+      assert :ok =
+               disarm_exchange(:stop, fn socket ->
+                 assert {:ok, data} = recv_at_least(socket, 8)
+                 assert data == Protocol.cmd_stop(0)
+                 :ok = :gen_tcp.send(socket, <<9::16, 2::16, 2::16, 0x0C, 0, 0::16, 2::16>>)
+                 :ok = :gen_tcp.send(socket, <<2::16, 0x0C, 0x10>>)
+               end)
+    end
 
-      task =
+    test "matches the disable acknowledgement for hold" do
+      assert :ok =
+               disarm_exchange(:hold, fn socket ->
+                 frame = Protocol.cmd_enable(0, false)
+                 assert {:ok, ^frame} = recv_at_least(socket, byte_size(frame))
+                 :gen_tcp.send(socket, <<0::16, 2::16, 2::16, 0x0B, 0>>)
+               end)
+    end
+
+    test "confirms an unacknowledged hold from a fresh normal motor report" do
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+      {:ok, port} = :inet.port(listener)
+
+      report_task =
         Task.async(fn ->
-          {:ok, server} = :gen_tcp.accept(listen, 2_000)
-          {:ok, data} = recv_all(server)
-          data
+          {:ok, report_socket} = :gen_tcp.accept(listener, 1_000)
+          <<_size::32, base::binary>> = build_87_byte_frame()
+          # The two high bits do not correspond to joints on an xArm6.
+          :gen_tcp.send(report_socket, <<133::32, base::binary, 0, 0xC0, 0::352>>)
         end)
 
-      opts = [host: "127.0.0.1", port: port, disarm_action: :stop]
-      assert :ok = Controller.disarm(opts)
+      assert :ok =
+               disarm_exchange(:hold, [normal_report_port: port], fn socket ->
+                 frame = Protocol.cmd_enable(0, false)
+                 assert {:ok, ^frame} = recv_at_least(socket, byte_size(frame))
+                 :ok
+               end)
 
-      received = Task.await(task, 3_000)
-      expected_frame = Protocol.cmd_stop(0)
-      assert received == expected_frame
-
-      :gen_tcp.close(listen)
+      assert :ok = Task.await(report_task)
+      :gen_tcp.close(listener)
     end
 
-    test "sends cmd_enable(false) when disarm_action is :hold" do
-      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
-      {:ok, port} = :inet.port(listen)
-
-      task =
-        Task.async(fn ->
-          {:ok, server} = :gen_tcp.accept(listen, 2_000)
-          {:ok, data} = recv_all(server)
-          data
-        end)
-
-      opts = [host: "127.0.0.1", port: port, disarm_action: :hold]
-      assert :ok = Controller.disarm(opts)
-
-      received = Task.await(task, 3_000)
-      expected_frame = Protocol.cmd_enable(0, false)
-      assert received == expected_frame
-
-      :gen_tcp.close(listen)
+    test "checks stopped state when the arm returns an existing error" do
+      assert :ok =
+               disarm_exchange(:stop, fn socket ->
+                 assert {:ok, _stop} = recv_at_least(socket, 8)
+                 :ok = :gen_tcp.send(socket, <<0::16, 2::16, 2::16, 0x0C, 0x40>>)
+                 request = Protocol.build_frame(1, 0x0D, <<>>)
+                 assert {:ok, ^request} = recv_at_least(socket, byte_size(request))
+                 :gen_tcp.send(socket, <<1::16, 2::16, 3::16, 0x0D, 0x40, 4>>)
+               end)
     end
 
-    test "returns :ok even when TCP connection fails" do
-      # Port 1 is privileged and will be refused on loopback
-      opts = [host: "127.0.0.1", port: 1, disarm_action: :stop]
-      assert :ok = Controller.disarm(opts)
+    test "reports an unconfirmed stop when a wrong transaction is followed by a ready state" do
+      assert {:error, %CommandFailed{operation: :disarm, reason: {:stop_unconfirmed, _, _}}} =
+               disarm_exchange(:stop, fn socket ->
+                 assert {:ok, _stop} = recv_at_least(socket, 8)
+                 :ok = :gen_tcp.send(socket, <<3::16, 2::16, 2::16, 0x0C, 0>>)
+                 assert {:ok, _get_state} = recv_at_least(socket, 7, 1_000)
+                 :gen_tcp.send(socket, <<1::16, 2::16, 3::16, 0x0D, 0, 0>>)
+               end)
     end
 
-    test "returns :ok even when host is unreachable" do
-      opts = [host: "192.0.2.1", port: 502, disarm_action: :stop]
-      assert :ok = Controller.disarm(opts)
+    test "reports connection failure" do
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+      {:ok, port} = :inet.port(listener)
+      :ok = :gen_tcp.close(listener)
+
+      assert {:error, %CommandFailed{operation: :disarm, reason: {:connect, :econnrefused}}} =
+               Controller.disarm(host: "127.0.0.1", port: port)
     end
+  end
+
+  defp disarm_exchange(action, readback_opts \\ [], exchange) do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false])
+    {:ok, port} = :inet.port(listen)
+
+    task =
+      Task.async(fn ->
+        {:ok, socket} = :gen_tcp.accept(listen, 1_000)
+        :ok = exchange.(socket)
+        :gen_tcp.close(socket)
+      end)
+
+    opts = [host: "127.0.0.1", port: port, disarm_action: action] ++ readback_opts
+    result = Controller.disarm(opts)
+    :ok = Task.await(task, 2_000)
+    :ok = :gen_tcp.close(listen)
+    result
   end
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -362,7 +403,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       # xArm6 has 6 joints
       for i <- 1..6 do
-        assert [{^i, nil, nil, nil, nil}] = :ets.lookup(state.ets, i)
+        assert [{^i, nil, nil, nil, nil, nil}] = :ets.lookup(state.ets, i)
       end
 
       assert [{:arm, 0, 0, nil}] = :ets.lookup(state.ets, :arm)
@@ -479,7 +520,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert new_state.buffer == <<>>
 
       for {angle, i} <- Enum.with_index(Enum.take(angles, 6), 1) do
-        [{^i, read_pos, _torq, _set, _vel}] = :ets.lookup(new_state.ets, i)
+        [{^i, read_pos, _torq, _set, _vel, nil}] = :ets.lookup(new_state.ets, i)
         assert_in_delta read_pos, angle, 1.0e-5
       end
     end
@@ -491,7 +532,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
 
       for {torque, i} <- Enum.with_index(Enum.take(torques, 6), 1) do
-        [{^i, _pos, read_torq, _set, _vel}] = :ets.lookup(new_state.ets, i)
+        [{^i, _pos, read_torq, _set, _vel, nil}] = :ets.lookup(new_state.ets, i)
         assert_in_delta read_torq, torque, 1.0e-5
       end
     end
@@ -520,13 +561,13 @@ defmodule BB.Ufactory.ControllerTest do
     end
 
     test "preserves set_position in ETS when report arrives", %{state: state} do
-      :ets.insert(state.ets, {1, nil, nil, 1.57, nil})
+      :ets.insert(state.ets, {1, nil, nil, 1.57, nil, @epoch})
 
       frame = build_87_byte_frame(angles: [0.1 | List.duplicate(0.0, 6)])
 
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
 
-      [{1, _cur, _torq, set_pos, _set_vel}] = :ets.lookup(new_state.ets, 1)
+      [{1, _cur, _torq, set_pos, _set_vel, @epoch}] = :ets.lookup(new_state.ets, 1)
       assert set_pos == 1.57
     end
 
@@ -567,8 +608,10 @@ defmodule BB.Ufactory.ControllerTest do
         target = i / 10_000
         msg = Message.new!(Command.Position, :motor, position: target)
 
-        assert {:noreply, _} = JointActuator.handle_command(msg, joint_state)
-        assert [{1, _cur, _torq, ^target, _vel}] = :ets.lookup(state.ets, 1)
+        assert {:noreply, _} =
+                 JointActuator.handle_command(%{msg | arm_epoch: @epoch}, joint_state)
+
+        assert [{1, _cur, _torq, ^target, _vel, @epoch}] = :ets.lookup(state.ets, 1)
       end
 
       Task.await(reporter, 30_000)
@@ -631,6 +674,27 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+    end
+
+    test "joint, TCP, and wrench messages from one frame share their timestamps", %{state: state} do
+      recipient = self()
+
+      BB
+      |> stub(:publish, fn TestRobot, path, message ->
+        send(recipient, {path, message})
+        :ok
+      end)
+
+      assert {:noreply, _state} =
+               Controller.handle_info({:tcp, nil, build_135_byte_frame([])}, state)
+
+      assert_receive {[:sensor, :xarm], %Message{monotonic_time: monotonic, wall_time: wall}}
+
+      assert_receive {[:sensor, :xarm, :tcp_pose],
+                      %Message{monotonic_time: ^monotonic, wall_time: ^wall}}
+
+      assert_receive {[:sensor, :xarm, :wrench],
+                      %Message{monotonic_time: ^monotonic, wall_time: ^wall}}
     end
 
     test "does not publish Wrench when ft_filtered is absent (87-byte frame)", %{state: state} do
@@ -785,7 +849,7 @@ defmodule BB.Ufactory.ControllerTest do
       assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, valid_frame}, state)
       assert new_state.buffer == <<>>
 
-      [{1, pos, _torq, _set, _vel}] = :ets.lookup(new_state.ets, 1)
+      [{1, pos, _torq, _set, _vel, nil}] = :ets.lookup(new_state.ets, 1)
       assert_in_delta pos, 0.1, 1.0e-5
     end
   end
@@ -960,6 +1024,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | error_report_grace_until: nil, error_report_grace_ms: 5_000}
 
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
       bb_msg = {:bb, [:state_machine], msg}
 
@@ -976,6 +1041,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | auto_clear_errors: false, error_report_grace_until: nil}
 
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
       bb_msg = {:bb, [:state_machine], msg}
 
@@ -1208,13 +1274,14 @@ defmodule BB.Ufactory.ControllerTest do
       {cmd_client, cmd_server} = tcp_pair()
 
       BB.Safety
-      |> stub(:armed?, fn _robot -> true end)
+      |> stub(:epoch, fn _robot -> {:ok, @epoch} end)
 
       # Healthy report feedback: the loop refuses to dispatch on a downed
       # report socket or stale last_report_at (see the freshness-gate tests).
       state =
         make_state(cmd_client, %{
           report_socket: :fake_report_socket,
+          arm_epoch: @epoch,
           last_report_at: System.monotonic_time(:millisecond)
         })
 
@@ -1230,7 +1297,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
       state = %{state | report_socket: nil}
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
@@ -1243,7 +1310,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
       state = %{state | last_report_at: System.monotonic_time(:millisecond) - 1_000}
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
@@ -1259,7 +1326,7 @@ defmodule BB.Ufactory.ControllerTest do
         :ok
       end)
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
 
       state = %{
         state
@@ -1275,7 +1342,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
 
       stale = %{state | report_socket: nil}
       assert {:noreply, stale_state} = Controller.handle_info(:tick, stale)
@@ -1284,6 +1351,7 @@ defmodule BB.Ufactory.ControllerTest do
       fresh = %{
         stale_state
         | report_socket: :fake_report_socket,
+          arm_epoch: @epoch,
           last_report_at: System.monotonic_time(:millisecond)
       }
 
@@ -1296,7 +1364,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "sends cmd_move_joints when set_positions are pending and robot is armed",
          %{state: state, cmd_server: cmd_server} do
       # Write set_position for all 6 joints
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
 
@@ -1317,9 +1385,9 @@ defmodule BB.Ufactory.ControllerTest do
     } do
       # Two hints (0.9 and 0.3 rad/s): the batch moves at the SLOWEST one —
       # a joint can be as slow as asked, never faster than allowed.
-      :ets.insert(state.ets, {1, 0.0, 0.0, 0.5, 0.9})
-      :ets.insert(state.ets, {2, 0.0, 0.0, 0.5, 0.3})
-      for i <- 3..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil})
+      :ets.insert(state.ets, {1, 0.0, 0.0, 0.5, 0.9, @epoch})
+      :ets.insert(state.ets, {2, 0.0, 0.0, 0.5, 0.3, @epoch})
+      for i <- 3..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, nil, @epoch})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1332,7 +1400,7 @@ defmodule BB.Ufactory.ControllerTest do
       state: state,
       cmd_server: cmd_server
     } do
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, 100.0})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 0.5, 100.0, @epoch})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1354,9 +1422,9 @@ defmodule BB.Ufactory.ControllerTest do
 
     test "does not send when robot is not armed", %{state: state, cmd_server: cmd_server} do
       BB.Safety
-      |> expect(:armed?, fn TestRobot -> false end)
+      |> expect(:epoch, fn TestRobot -> :error end)
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil, @epoch})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1366,9 +1434,9 @@ defmodule BB.Ufactory.ControllerTest do
     test "uses current_position for joints where set_position is nil",
          %{state: state, cmd_server: cmd_server} do
       # Only joint 1 has a pending set_position; others have current from report
-      :ets.insert(state.ets, {1, 0.1, 0.0, 0.5, nil})
+      :ets.insert(state.ets, {1, 0.1, 0.0, 0.5, nil, @epoch})
 
-      for i <- 2..6, do: :ets.insert(state.ets, {i, 0.2, 0.0, nil, nil})
+      for i <- 2..6, do: :ets.insert(state.ets, {i, 0.2, 0.0, nil, nil, nil})
 
       assert {:noreply, _new_state} = Controller.handle_info(:tick, state)
 
@@ -1390,7 +1458,7 @@ defmodule BB.Ufactory.ControllerTest do
       # position nor a set_position (fresh ETS after a controller restart).
       # Sending would command those joints to a substituted default — an
       # uncommanded sweep on real hardware — so the tick must be skipped.
-      :ets.insert(state.ets, {1, nil, nil, 0.5, nil})
+      :ets.insert(state.ets, {1, nil, nil, 0.5, nil, @epoch})
 
       assert {:noreply, new_state} = Controller.handle_info(:tick, state)
       assert new_state.move_skip_logged
@@ -1488,16 +1556,17 @@ defmodule BB.Ufactory.ControllerTest do
 
     test "joint-move send failure stops the controller", %{state: state} do
       BB.Safety
-      |> stub(:armed?, fn TestRobot -> true end)
+      |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
 
       state = %{
         state
         | report_socket: :fake_report_socket,
+          arm_epoch: @epoch,
           last_report_at: System.monotonic_time(:millisecond)
       }
 
-      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil})
+      for i <- 1..6, do: :ets.insert(state.ets, {i, 0.0, 0.0, 1.0, nil, @epoch})
 
       assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
                Controller.handle_info(:tick, state)
@@ -1507,6 +1576,7 @@ defmodule BB.Ufactory.ControllerTest do
       BB.Safety
       |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
 
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
 
       assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
@@ -1580,7 +1650,7 @@ defmodule BB.Ufactory.ControllerTest do
   describe "handle_call({:register_arm_frames, label, frames})" do
     setup do
       {cmd_client, cmd_server} = tcp_pair()
-      state = make_state(cmd_client)
+      state = make_state(cmd_client, %{arm_epoch: @epoch})
 
       on_exit(fn ->
         :gen_tcp.close(cmd_client)
@@ -1593,7 +1663,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "stores frames without sending when the robot is not armed",
          %{state: state, cmd_server: cmd_server} do
       BB.Safety
-      |> expect(:armed?, fn TestRobot -> false end)
+      |> expect(:epoch, fn TestRobot -> :error end)
 
       frame = Protocol.cmd_gripper_enable(0, true)
 
@@ -1611,7 +1681,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "sends frames immediately when the robot is already armed",
          %{state: state, cmd_server: cmd_server} do
       BB.Safety
-      |> expect(:armed?, fn TestRobot -> true end)
+      |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
 
       frame = Protocol.cmd_gripper_enable(0, true)
 
@@ -1629,7 +1699,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "replies with the error when an armed-time send fails",
          %{state: state, cmd_server: cmd_server} do
       BB.Safety
-      |> expect(:armed?, fn TestRobot -> true end)
+      |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       |> expect(:report_error, fn TestRobot, [:xarm], _error -> :ok end)
 
       :gen_tcp.close(cmd_server)
@@ -1650,7 +1720,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "re-registration under the same label replaces the previous frames",
          %{state: state} do
       BB.Safety
-      |> stub(:armed?, fn TestRobot -> false end)
+      |> stub(:epoch, fn TestRobot -> :error end)
 
       frame_a = Protocol.cmd_gripper_enable(0, true)
       frame_b = Protocol.cmd_gripper_enable(0, false)
@@ -1677,6 +1747,8 @@ defmodule BB.Ufactory.ControllerTest do
       accessory_frame = Protocol.cmd_gripper_enable(0, true)
       state = %{state | arm_frames: [gripper: [accessory_frame]]}
 
+      state = %{state | arm_epoch: nil}
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
 
       assert {:noreply, new_state} = Controller.handle_info({:bb, [:state_machine], msg}, state)
@@ -1711,6 +1783,7 @@ defmodule BB.Ufactory.ControllerTest do
 
     test "sends clean_error + enable + set_mode(0) + set_state(0) on transition to :armed",
          %{state: state, cmd_server: cmd_server} do
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
       bb_msg = {:bb, [:state_machine], msg}
 
@@ -1734,6 +1807,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "skips clean_error when auto_clear_errors is false",
          %{state: state, cmd_server: cmd_server} do
       state = %{state | auto_clear_errors: false}
+      BB.Safety |> stub(:epoch, fn TestRobot -> {:ok, @epoch} end)
       {:ok, msg} = Transition.new(:disarmed, from: :disarmed, to: :armed)
       bb_msg = {:bb, [:state_machine], msg}
 
@@ -1999,7 +2073,7 @@ defmodule BB.Ufactory.ControllerTest do
       {cmd_client, cmd_server} = tcp_pair()
 
       BB.Safety
-      |> stub(:armed?, fn _robot -> true end)
+      |> stub(:epoch, fn _robot -> {:ok, @epoch} end)
 
       state = make_state(cmd_client, %{txn_id: 65_535})
 

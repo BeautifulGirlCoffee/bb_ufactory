@@ -20,7 +20,7 @@ defmodule BB.Ufactory.Controller do
   actuators. Per-joint rows are keyed by joint index (1-based integer):
 
       {joint_index, current_position :: float | nil, current_torque :: float | nil,
-       set_position :: float | nil, set_velocity :: float | nil}
+       set_position :: float | nil, set_velocity :: float | nil, arm_epoch :: integer | nil}
 
   The arm-level row is keyed by `:arm`:
 
@@ -28,7 +28,7 @@ defmodule BB.Ufactory.Controller do
 
   Actuators write `set_position` into the ETS table. The 100 Hz control loop
   reads all pending positions and batches them into a single `cmd_move_joints`
-  frame per tick.
+  frame per tick. The controller only sends targets from its current arm epoch.
 
   ## Safety
 
@@ -57,6 +57,12 @@ defmodule BB.Ufactory.Controller do
         type: :pos_integer,
         default: 30_003,
         doc: "Real-time report socket port (default: 30003)"
+      ],
+      normal_report_port: [
+        type: :pos_integer,
+        default: 30_001,
+        doc:
+          "Normal report port used to confirm motor disable if the command has no acknowledgement"
       ],
       model: [
         type: {:in, [:xarm5, :xarm6, :xarm7, :lite6, :xarm850]},
@@ -182,8 +188,12 @@ defmodule BB.Ufactory.Controller do
       ]
     ]
 
+  import Bitwise
+
   require Logger
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
+  alias BB.Error.Protocol.Ufactory.CommandRejected
   alias BB.Error.Protocol.Ufactory.ConnectionError
   alias BB.Error.Protocol.Ufactory.HardwareFault
   alias BB.Loop
@@ -195,6 +205,7 @@ defmodule BB.Ufactory.Controller do
   alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Model
   alias BB.Ufactory.Protocol
+  alias BB.Ufactory.Registers
   alias BB.Ufactory.Report
 
   # Statically-defined joint name atoms so atom creation is never dynamic.
@@ -206,52 +217,173 @@ defmodule BB.Ufactory.Controller do
 
   # ── Safety callback ─────────────────────────────────────────────────────────
 
-  @doc """
-  Opens a fresh TCP connection and sends a stop command.
+  @disarm_response_timeout_ms 500
+  @normal_report_port 30_001
 
-  This runs outside the GenServer process so it is safe even if the controller
-  has crashed. It never raises — any TCP failure is silently swallowed and `:ok`
-  is returned regardless.
+  @doc """
+  Sends the configured disarm operation over a fresh connection and checks the
+  firmware response. A transport failure or unconfirmed result is returned to
+  BB Safety even when the controller process is unavailable.
   """
   @impl BB.Controller
   def disarm(opts) do
     host = Keyword.fetch!(opts, :host)
     port = Keyword.get(opts, :port, 502)
-    disarm_action = Keyword.get(opts, :disarm_action, :stop)
+    action = Keyword.get(opts, :disarm_action, :stop)
 
-    try do
-      case :gen_tcp.connect(String.to_charlist(host), port, [:binary, active: false], 2_000) do
-        {:ok, sock} ->
-          frame =
-            case disarm_action do
-              :stop -> Protocol.cmd_stop(0)
-              :hold -> Protocol.cmd_enable(0, false)
-            end
-
-          # Last-resort safety path: wait briefly for the firmware's response
-          # so the log distinguishes a delivered stop from a dropped one.
-          # Failures are still swallowed — this callback must never raise.
-          with :ok <- :gen_tcp.send(sock, frame),
-               {:ok, _ack} <- :gen_tcp.recv(sock, 0, 500) do
-            :ok
-          else
-            {:error, reason} ->
-              Logger.warning(
-                "[BB.Ufactory.Controller] Out-of-band disarm (#{disarm_action}) to " <>
-                  "#{host}:#{port} unconfirmed: #{inspect(reason)}"
-              )
+    case :gen_tcp.connect(
+           String.to_charlist(host),
+           port,
+           [:binary, active: false],
+           @connect_timeout_ms
+         ) do
+      {:ok, socket} ->
+        result =
+          try do
+            send_disarm(socket, action)
+          after
+            :gen_tcp.close(socket)
           end
 
-          :gen_tcp.close(sock)
+        finish_disarm(result, action, host, opts)
 
-        {:error, _reason} ->
-          :ok
-      end
-    catch
-      _, _ -> :ok
+      {:error, reason} ->
+        CommandFailed.reply(:disarm, {:connect, reason})
     end
+  end
 
-    :ok
+  defp finish_disarm({:error, %CommandFailed{reason: reason}}, :hold, host, opts) do
+    case verify_motors_disabled(host, opts) do
+      :ok -> :ok
+      {:error, readback} -> CommandFailed.reply(:disarm, {:hold_unconfirmed, reason, readback})
+    end
+  end
+
+  defp finish_disarm(result, _action, _host, _opts), do: result
+
+  # Some firmware does not acknowledge MOTION_EN. Read the motor-enable bits
+  # from a fresh normal-report connection, independent of the controller.
+  defp verify_motors_disabled(host, opts) do
+    port = Keyword.get(opts, :normal_report_port, @normal_report_port)
+    joints = Model.joint_count(Keyword.get(opts, :model, :xarm6))
+    deadline = System.monotonic_time(:millisecond) + @disarm_response_timeout_ms
+
+    case :gen_tcp.connect(
+           String.to_charlist(host),
+           port,
+           [:binary, active: false],
+           @disarm_response_timeout_ms
+         ) do
+      {:ok, socket} ->
+        try do
+          await_motors_disabled(socket, joints, <<>>, deadline)
+        after
+          :gen_tcp.close(socket)
+        end
+
+      {:error, reason} ->
+        {:error, {:report_connect, reason}}
+    end
+  end
+
+  defp await_motors_disabled(socket, joints, buffer, deadline) do
+    case Report.parse_report(buffer, :normal) do
+      {:ok, %{mtable: enabled}, rest} ->
+        if Enum.all?(Enum.take(enabled, joints), &(&1 == 0)) do
+          :ok
+        else
+          await_motors_disabled(socket, joints, rest, deadline)
+        end
+
+      {:ok, _report, rest} ->
+        await_motors_disabled(socket, joints, rest, deadline)
+
+      {:more} ->
+        with {:ok, data} <- receive_before(socket, deadline) do
+          await_motors_disabled(socket, joints, buffer <> data, deadline)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp send_disarm(socket, action) do
+    frame =
+      case action do
+        :stop -> Protocol.cmd_stop(0)
+        :hold -> Protocol.cmd_enable(0, false)
+      end
+
+    with :ok <- :gen_tcp.send(socket, frame),
+         :ok <- confirm_disarm(socket, frame, action) do
+      :ok
+    else
+      {:error, reason} -> CommandFailed.reply(:disarm, reason)
+    end
+  end
+
+  defp confirm_disarm(socket, <<transaction::16, _::32, register, _::binary>>, action) do
+    deadline = System.monotonic_time(:millisecond) + @disarm_response_timeout_ms
+
+    case {action, disarm_response(socket, transaction, register, <<>>, deadline)} do
+      {_, {:ok, status, _}} when (status &&& 0x48) == 0 ->
+        :ok
+
+      {:stop, response} ->
+        confirm_stopped(socket, response)
+
+      {:hold, {:ok, status, _}} ->
+        {:error, CommandRejected.exception(register: register, status_byte: status)}
+
+      {:hold, {:error, reason}} ->
+        {:error, reason}
+    end
+  end
+
+  # A stopped controller can still report an existing arm error. In that case,
+  # and when no stop acknowledgement arrived, verify the stopped state itself.
+  defp confirm_stopped(socket, stop_response) do
+    deadline = System.monotonic_time(:millisecond) + @disarm_response_timeout_ms
+
+    register = Registers.get_state()
+
+    with :ok <- :gen_tcp.send(socket, Protocol.build_frame(1, register, <<>>)),
+         {:ok, status, <<4>>} when (status &&& 0x08) == 0 <-
+           disarm_response(socket, 1, register, <<>>, deadline) do
+      :ok
+    else
+      readback -> {:error, {:stop_unconfirmed, stop_response, readback}}
+    end
+  end
+
+  defp disarm_response(socket, transaction, register, buffer, deadline) do
+    case Protocol.parse_response(buffer) do
+      {:ok, {^register, status, params}, _rest}
+      when binary_part(buffer, 0, 2) == <<transaction::16>> ->
+        {:ok, status, params}
+
+      {:ok, _, rest} ->
+        disarm_response(socket, transaction, register, rest, deadline)
+
+      {:more} ->
+        with {:ok, data} <- receive_before(socket, deadline) do
+          disarm_response(socket, transaction, register, buffer <> data, deadline)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp receive_before(socket, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, :timeout}
+    else
+      :gen_tcp.recv(socket, 0, remaining)
+    end
   end
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -289,7 +421,13 @@ defmodule BB.Ufactory.Controller do
       BB.Safety.register(__MODULE__,
         robot: bb.robot,
         path: bb.path,
-        opts: [host: host, port: port, disarm_action: disarm_action]
+        opts: [
+          host: host,
+          port: port,
+          disarm_action: disarm_action,
+          model: model,
+          normal_report_port: Keyword.get(opts, :normal_report_port, @normal_report_port)
+        ]
       )
 
       BB.subscribe(bb.robot, [:state_machine])
@@ -328,6 +466,7 @@ defmodule BB.Ufactory.Controller do
         report_stale_ms: Keyword.get(opts, :report_stale_ms, 250),
         feedback_loss_fatal_ms: Keyword.get(opts, :feedback_loss_fatal_ms, 3_000),
         arm_frames: [],
+        arm_epoch: nil,
         auto_clear_errors: Keyword.get(opts, :auto_clear_errors, true),
         error_report_grace_ms: Keyword.get(opts, :error_report_grace_ms, 3_000),
         error_report_grace_until: nil,
@@ -464,9 +603,19 @@ defmodule BB.Ufactory.Controller do
         {:bb, [:state_machine], %Message{payload: %Transition{to: :armed}}},
         state
       ) do
-    case arm_init_sequence(state) do
-      {:ok, state} -> {:noreply, state}
-      {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
+    case BB.Safety.epoch(state.bb.robot) do
+      {:ok, epoch} when epoch == state.arm_epoch ->
+        {:noreply, state}
+
+      {:ok, epoch} ->
+        case arm_init_sequence(state, epoch) do
+          {:ok, state} -> {:noreply, %{state | arm_epoch: epoch}}
+          {:inactive, state} -> {:noreply, %{state | arm_epoch: nil}}
+          {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
+        end
+
+      :error ->
+        {:noreply, %{state | arm_epoch: nil}}
     end
   end
 
@@ -477,7 +626,7 @@ defmodule BB.Ufactory.Controller do
         :hold -> Protocol.cmd_enable(state.txn_id, false)
       end
 
-    case send_command(frame, state) do
+    case send_command(frame, %{state | arm_epoch: nil}) do
       {:ok, state} -> {:noreply, state}
       {:fatal, reason, state} -> cmd_socket_fatal(reason, state)
     end
@@ -504,17 +653,15 @@ defmodule BB.Ufactory.Controller do
   # and motion while the robot stays armed).
 
   @impl BB.Controller
-  def handle_call({:send_command, frame}, _from, state) do
-    state = %{state | txn_id: next_txn(state.txn_id)}
-
-    case :gen_tcp.send(state.cmd_socket, frame) do
-      :ok ->
-        {:reply, :ok, state}
-
-      {:error, reason} = error ->
-        {:stop, fatal_stop_reason(reason, state), error, state}
+  def handle_call({:send_motion, epoch, frame}, _from, state) do
+    if current_arm_epoch?(state, epoch) do
+      reply_to_send(frame, state)
+    else
+      {:reply, CommandFailed.reply(:motion, :inactive_arm_epoch), state}
     end
   end
+
+  def handle_call({:send_command, frame}, _from, state), do: reply_to_send(frame, state)
 
   # While armed, the 100 Hz move stream keeps responses in flight that a
   # pre-send drain cannot clear, so the reply is matched by REGISTER: frames
@@ -563,9 +710,9 @@ defmodule BB.Ufactory.Controller do
     arm_frames = List.keystore(state.arm_frames, label, 0, {label, frames})
     state = %{state | arm_frames: arm_frames}
 
-    if BB.Safety.armed?(state.bb.robot) do
-      case send_frames(frames, state) do
-        {:ok, state} ->
+    if current_arm_epoch?(state, state.arm_epoch) do
+      case send_arm_frames(frames, state, state.arm_epoch) do
+        {result, state} when result in [:ok, :inactive] ->
           {:reply, :ok, state}
 
         # The frames did NOT reach the arm — the accessory must not believe
@@ -588,6 +735,21 @@ defmodule BB.Ufactory.Controller do
 
   def handle_call(:get_model_config, _from, state) do
     {:reply, state.model_config, state}
+  end
+
+  defp reply_to_send(frame, state) do
+    case send_command(frame, state) do
+      {:ok, state} ->
+        {:reply, :ok, state}
+
+      {:fatal, reason, state} ->
+        {:stop, fatal_stop_reason(reason, state), {:error, reason}, state}
+    end
+  end
+
+  defp current_arm_epoch?(state, epoch) do
+    is_integer(epoch) and state.arm_epoch == epoch and
+      BB.Safety.epoch(state.bb.robot) == {:ok, epoch}
   end
 
   # ── terminate ─────────────────────────────────────────────────────────────────
@@ -700,8 +862,10 @@ defmodule BB.Ufactory.Controller do
     )
   end
 
+  # The robot module and controller name come from the robot definition, so
+  # this creates one name per configured controller and reuses it on restart.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp create_ets(robot, controller_name, joint_count) do
-    # Build the ETS table name from known module atoms to avoid dynamic atom creation.
     table_name = Module.concat([robot, "Controller", controller_name])
 
     # Always hand out the NAME, not a tid: actuators cache this handle, and
@@ -716,7 +880,7 @@ defmodule BB.Ufactory.Controller do
 
     # Pre-populate per-joint rows
     for i <- 1..joint_count do
-      :ets.insert(ets, {i, nil, nil, nil, nil})
+      :ets.insert(ets, {i, nil, nil, nil, nil, nil})
     end
 
     # Arm-level row
@@ -727,14 +891,18 @@ defmodule BB.Ufactory.Controller do
 
   defp maybe_send_joint_move(state) do
     joint_count = state.model_config.joints
-    rows = for i <- 1..joint_count, do: :ets.lookup(state.ets, i)
-    rows = List.flatten(rows)
+    epoch = state.arm_epoch
 
-    pending? =
-      Enum.any?(rows, fn {_i, _cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos != nil end)
+    rows =
+      for i <- 1..joint_count,
+          {^i, position, _torque, target, speed, target_epoch} <- :ets.lookup(state.ets, i) do
+        if target_epoch == epoch, do: {position, target, speed}, else: {position, nil, nil}
+      end
+
+    pending? = Enum.any?(rows, fn {_position, target, _speed} -> target != nil end)
 
     cond do
-      not (pending? and BB.Safety.armed?(state.bb.robot)) ->
+      not (pending? and length(rows) == joint_count and current_arm_epoch?(state, epoch)) ->
         {:ok, %{state | feedback_stale_since: nil}}
 
       feedback_stale?(state) ->
@@ -748,7 +916,7 @@ defmodule BB.Ufactory.Controller do
 
   defp dispatch_joint_move(rows, state) do
     positions =
-      Enum.map(rows, fn {_i, cur_pos, _cur_torq, set_pos, _set_vel} -> set_pos || cur_pos end)
+      Enum.map(rows, fn {position, target, _speed} -> target || position end)
 
     # Never substitute a default for an unknown joint position: commanding
     # 0.0 for joints whose current angle has not yet been reported would
@@ -763,7 +931,12 @@ defmodule BB.Ufactory.Controller do
       accel = speed * 10.0
 
       frame = Protocol.cmd_move_joints(state.txn_id, positions, speed, accel)
-      send_command(frame, %{state | move_skip_logged: false})
+
+      if current_arm_epoch?(state, state.arm_epoch) do
+        send_command(frame, %{state | move_skip_logged: false})
+      else
+        {:ok, state}
+      end
     end
   end
 
@@ -772,7 +945,7 @@ defmodule BB.Ufactory.Controller do
   # asked, never faster than allowed). Hints are clamped into (0, max_speed].
   defp batch_speed(rows, max_speed) do
     rows
-    |> Enum.map(fn {_i, _cur_pos, _cur_torq, _set_pos, set_vel} -> set_vel end)
+    |> Enum.map(fn {_position, _target, speed} -> speed end)
     |> Enum.filter(&is_number/1)
     |> case do
       [] -> max_speed
@@ -881,7 +1054,9 @@ defmodule BB.Ufactory.Controller do
   end
 
   defp update_from_report(report, state) do
-    state = %{state | last_report_at: System.monotonic_time(:millisecond)}
+    timestamps = {System.monotonic_time(:nanosecond), System.system_time(:nanosecond)}
+    last_report_at = System.convert_time_unit(elem(timestamps, 0), :nanosecond, :millisecond)
+    state = %{state | last_report_at: last_report_at}
     joint_count = state.model_config.joints
     angles = Enum.take(report.angles, joint_count)
     torques = Enum.take(report.torques, joint_count)
@@ -897,7 +1072,7 @@ defmodule BB.Ufactory.Controller do
     |> Enum.with_index(1)
     |> Enum.each(fn {{angle, torque}, idx} ->
       :ets.update_element(state.ets, idx, [{2, angle}, {3, torque}]) ||
-        :ets.insert(state.ets, {idx, angle, torque, nil, nil})
+        :ets.insert(state.ets, {idx, angle, torque, nil, nil, nil})
     end)
 
     # Update arm-level row
@@ -905,96 +1080,85 @@ defmodule BB.Ufactory.Controller do
     :ets.insert(state.ets, {:arm, report.state, report.mode, {x, y, z, roll, pitch, yaw}})
 
     joint_names = Enum.take(@all_joint_names, joint_count)
-    publish_joint_state(joint_names, angles, torques, state)
-    publish_cartesian_pose(x, y, z, roll, pitch, yaw, state)
-    maybe_publish_wrench(report, state)
+
+    publish_report_message(
+      state,
+      timestamps,
+      [],
+      JointState,
+      names: joint_names,
+      positions: angles,
+      efforts: torques
+    )
+
+    publish_report_message(
+      state,
+      timestamps,
+      [:tcp_pose],
+      CartesianPose,
+      x: x,
+      y: y,
+      z: z,
+      roll: roll,
+      pitch: pitch,
+      yaw: yaw
+    )
+
+    maybe_publish_wrench(report, state, timestamps)
 
     state = maybe_report_error(report, state)
-    maybe_publish_arm_status(report, state)
+    maybe_publish_arm_status(report, state, timestamps)
   end
 
-  defp publish_joint_state(joint_names, angles, torques, state) do
-    case JointState.new(state.controller_name,
-           names: joint_names,
-           positions: angles,
-           efforts: torques
-         ) do
-      {:ok, msg} ->
-        BB.publish(state.bb.robot, [:sensor, state.controller_name], msg)
+  defp publish_report_message(state, {monotonic_time, wall_time}, suffix, payload, fields) do
+    case Message.new(payload, state.controller_name, fields) do
+      {:ok, message} ->
+        message = %{message | monotonic_time: monotonic_time, wall_time: wall_time}
+        BB.publish(state.bb.robot, [:sensor, state.controller_name | suffix], message)
 
       {:error, reason} ->
         Logger.warning(
-          "[BB.Ufactory.Controller] Failed to build JointState message: #{inspect(reason)}"
+          "[BB.Ufactory.Controller] Failed to build #{inspect(payload)} message: #{inspect(reason)}"
         )
     end
   end
 
-  defp publish_cartesian_pose(x, y, z, roll, pitch, yaw, state) do
-    case CartesianPose.new(state.controller_name,
-           x: x,
-           y: y,
-           z: z,
-           roll: roll,
-           pitch: pitch,
-           yaw: yaw
-         ) do
-      {:ok, msg} ->
-        BB.publish(state.bb.robot, [:sensor, state.controller_name, :tcp_pose], msg)
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Controller] Failed to build CartesianPose message: #{inspect(reason)}"
-        )
-    end
+  defp maybe_publish_wrench(%{ft_filtered: [fx, fy, fz, tx, ty, tz]}, state, timestamps) do
+    publish_report_message(
+      state,
+      timestamps,
+      [:wrench],
+      Wrench,
+      fx: fx,
+      fy: fy,
+      fz: fz,
+      tx: tx,
+      ty: ty,
+      tz: tz
+    )
   end
 
-  # Publishes a Wrench message when ft_filtered data is present in the real-time
-  # report. ft_filtered is only populated when the arm firmware sends 135+ byte
-  # frames, which requires the F/T sensor to be enabled via cmd_ft_sensor_enable/2.
-  defp maybe_publish_wrench(%{ft_filtered: [fx, fy, fz, tx, ty, tz]}, state) do
-    case Wrench.new(state.controller_name,
-           fx: fx,
-           fy: fy,
-           fz: fz,
-           tx: tx,
-           ty: ty,
-           tz: tz
-         ) do
-      {:ok, msg} ->
-        BB.publish(state.bb.robot, [:sensor, state.controller_name, :wrench], msg)
-
-      {:error, reason} ->
-        Logger.warning(
-          "[BB.Ufactory.Controller] Failed to build Wrench message: #{inspect(reason)}"
-        )
-    end
-  end
-
-  defp maybe_publish_wrench(_report, _state), do: :ok
+  defp maybe_publish_wrench(_report, _state, _timestamps), do: :ok
 
   # Publishes ArmStatus when state, mode, error_code, or warn_code changes.
   # error_code and warn_code are only present in normal-report frames (>= 133 bytes);
   # they default to 0 for real-time frames that lack these fields.
-  defp maybe_publish_arm_status(report, state) do
+  defp maybe_publish_arm_status(report, state, timestamps) do
     error_code = Map.get(report, :error_code, 0) || 0
     warn_code = Map.get(report, :warn_code, 0) || 0
     current = {report.state, report.mode, error_code, warn_code}
 
     if current != state.last_arm_status do
-      case ArmStatus.new(state.controller_name,
-             state: report.state,
-             mode: report.mode,
-             error_code: error_code,
-             warn_code: warn_code
-           ) do
-        {:ok, msg} ->
-          BB.publish(state.bb.robot, [:sensor, state.controller_name, :arm_status], msg)
-
-        {:error, reason} ->
-          Logger.warning(
-            "[BB.Ufactory.Controller] Failed to build ArmStatus message: #{inspect(reason)}"
-          )
-      end
+      publish_report_message(
+        state,
+        timestamps,
+        [:arm_status],
+        ArmStatus,
+        state: report.state,
+        mode: report.mode,
+        error_code: error_code,
+        warn_code: warn_code
+      )
 
       %{state | last_arm_status: current}
     else
@@ -1133,23 +1297,23 @@ defmodule BB.Ufactory.Controller do
   # after recovering from faults. Registered accessory arm frames (gripper /
   # linear track enable, F/T sensor enable) are sent last, once the arm is in
   # mode 0 / state 0.
-  defp arm_init_sequence(state) do
-    with {:ok, state} <- maybe_clean_error(state),
-         {:ok, state} <- send_command(Protocol.cmd_enable(state.txn_id, true), state),
-         {:ok, state} <- send_command(Protocol.cmd_set_mode(state.txn_id, 0), state),
-         {:ok, state} <- send_command(Protocol.cmd_set_state(state.txn_id, 0), state) do
+  defp arm_init_sequence(state, epoch) do
+    with {:ok, state} <- maybe_clean_error(state, epoch),
+         {:ok, state} <- send_arm_frame(Protocol.cmd_enable(state.txn_id, true), state, epoch),
+         {:ok, state} <- send_arm_frame(Protocol.cmd_set_mode(state.txn_id, 0), state, epoch),
+         {:ok, state} <- send_arm_frame(Protocol.cmd_set_state(state.txn_id, 0), state, epoch) do
       state.arm_frames
       |> Enum.flat_map(fn {_label, frames} -> frames end)
-      |> send_frames(state)
+      |> send_arm_frames(state, epoch)
     end
   end
 
-  defp maybe_clean_error(%{auto_clear_errors: false} = state), do: {:ok, state}
+  defp maybe_clean_error(%{auto_clear_errors: false} = state, _epoch), do: {:ok, state}
 
-  defp maybe_clean_error(state) do
+  defp maybe_clean_error(state, epoch) do
     grace_until = System.monotonic_time(:millisecond) + state.error_report_grace_ms
 
-    case send_command(Protocol.cmd_clean_error(state.txn_id), state) do
+    case send_arm_frame(Protocol.cmd_clean_error(state.txn_id), state, epoch) do
       {:ok, state} -> {:ok, %{state | error_report_grace_until: grace_until}}
       fatal -> fatal
     end
@@ -1175,13 +1339,21 @@ defmodule BB.Ufactory.Controller do
     end
   end
 
-  defp send_frames(frames, state) do
+  defp send_arm_frames(frames, state, epoch) do
     Enum.reduce_while(frames, {:ok, state}, fn frame, {:ok, state} ->
-      case send_command(frame, state) do
+      case send_arm_frame(frame, state, epoch) do
         {:ok, state} -> {:cont, {:ok, state}}
-        fatal -> {:halt, fatal}
+        failure -> {:halt, failure}
       end
     end)
+  end
+
+  defp send_arm_frame(frame, state, epoch) do
+    if BB.Safety.epoch(state.bb.robot) == {:ok, epoch} do
+      send_command(frame, state)
+    else
+      {:inactive, state}
+    end
   end
 
   # Logs, reports the failure to BB.Safety (triggering disarm escalation), and

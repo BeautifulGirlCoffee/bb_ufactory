@@ -54,6 +54,11 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
         required: true,
         doc: "Name of the xArm controller in the robot's registry"
       ],
+      position_unit: [
+        type: {:in, [:millimeter, :meter]},
+        default: :millimeter,
+        doc: "Position command and feedback units. Use :meter for BB.Motion on a prismatic joint."
+      ],
       speed: [
         type: :pos_integer,
         default: 200,
@@ -71,6 +76,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   require Logger
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
@@ -84,10 +90,18 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     controller = Keyword.fetch!(opts, :controller)
     speed = Keyword.get(opts, :speed, 200)
     stroke_mm = Keyword.get(opts, :stroke_mm, 700)
+    mm_per_unit = if Keyword.get(opts, :position_unit) == :meter, do: 1000.0, else: 1.0
 
     register_arm_frames(bb.robot, controller)
 
-    {:ok, %{bb: bb, controller: controller, speed: speed, stroke_mm: stroke_mm}}
+    {:ok,
+     %{
+       bb: bb,
+       controller: controller,
+       speed: speed,
+       stroke_mm: stroke_mm,
+       mm_per_unit: mm_per_unit
+     }}
   end
 
   # ── disarm/1 — disable track motor when arm disarms ──────────────────────────
@@ -115,16 +129,16 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   # ── handle_command/2 — all transports converge here ─────────────────────────
 
   @impl BB.Actuator
-  def handle_command(%Message{payload: %Command.Position{position: pos_mm}}, state) do
+  def handle_command(%Message{payload: %Command.Position{position: position}} = message, state) do
     initial =
       case read_track_position(state.bb.robot, state.controller) do
         {:ok, pos} -> pos
         :error -> nil
       end
 
-    case apply_track_position(pos_mm, initial, state) do
+    case apply_track_position(position * state.mm_per_unit, initial, message, state) do
       :ok -> {:noreply, state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:error, reason} -> {:reply, CommandFailed.reply(:linear_track_move, reason), state}
     end
   end
 
@@ -134,12 +148,12 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   # (e.g. 0.0) would MOVE the track rather than stop it. The read doubles as
   # BeginMotion's initial position so a Stop performs exactly one RS485
   # round-trip — braking latency must not pay for a second read.
-  def handle_command(%Message{payload: %Command.Stop{}}, state) do
+  def handle_command(%Message{payload: %Command.Stop{}} = message, state) do
     case read_track_position(state.bb.robot, state.controller) do
       {:ok, pos_mm} ->
-        case apply_track_position(pos_mm, pos_mm, state) do
+        case apply_track_position(pos_mm, pos_mm, message, state) do
           :ok -> {:noreply, state}
-          {:error, reason} -> {:reply, {:error, reason}, state}
+          {:error, reason} -> {:reply, CommandFailed.reply(:linear_track_stop, reason), state}
         end
 
       :error ->
@@ -148,7 +162,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
             "the carriage may still be moving"
         )
 
-        {:reply, {:error, :position_unknown}, state}
+        {:reply, CommandFailed.reply(:linear_track_stop, :position_unknown), state}
     end
   end
 
@@ -158,7 +172,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   # ── Private helpers ──────────────────────────────────────────────────────────
 
-  defp apply_track_position(pos_mm, initial_position, state) do
+  defp apply_track_position(pos_mm, initial_position, message, state) do
     clamped = pos_mm |> max(0.0) |> min(state.stroke_mm)
 
     if clamped != pos_mm do
@@ -173,9 +187,19 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     {pos_frame, spd_frame} = Protocol.cmd_linear_track_move(0, pos_mm, state.speed)
 
     # Speed must be set before position so the arm uses the new speed for this move.
-    with :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, spd_frame}),
-         :ok <- BB.Process.call(state.bb.robot, state.controller, {:send_command, pos_frame}) do
-      publish_begin_motion(pos_mm, initial_position, state)
+    with :ok <-
+           BB.Process.call(
+             state.bb.robot,
+             state.controller,
+             {:send_motion, message.arm_epoch, spd_frame}
+           ),
+         :ok <-
+           BB.Process.call(
+             state.bb.robot,
+             state.controller,
+             {:send_motion, message.arm_epoch, pos_frame}
+           ) do
+      publish_begin_motion(pos_mm, initial_position, message.payload.command_id, state)
       :ok
     else
       {:error, reason} = error ->
@@ -220,19 +244,23 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   # A failed initial-position read falls back to the target (zero travel
   # estimate) rather than fabricating a 0.0 start the carriage never held.
-  defp publish_begin_motion(pos_mm, initial_position, state) do
+  defp publish_begin_motion(pos_mm, initial_position, command_id, state) do
     actuator_name = List.last(state.bb.path)
     initial_position = initial_position || pos_mm
     travel_distance = abs(pos_mm - initial_position)
     travel_ms = round(travel_distance / max(state.speed, 1) * 1000)
     expected_arrival = System.monotonic_time(:millisecond) + travel_ms
 
-    case Message.new(BeginMotion, actuator_name,
-           initial_position: initial_position * 1.0,
-           target_position: pos_mm * 1.0,
-           expected_arrival: expected_arrival,
-           command_type: :position
-         ) do
+    fields = [
+      initial_position: initial_position / state.mm_per_unit,
+      target_position: pos_mm / state.mm_per_unit,
+      expected_arrival: expected_arrival,
+      command_type: :position
+    ]
+
+    fields = if command_id, do: Keyword.put(fields, :command_id, command_id), else: fields
+
+    case Message.new(BeginMotion, actuator_name, fields) do
       {:ok, msg} ->
         BB.publish(state.bb.robot, [:actuator | state.bb.path], msg)
 

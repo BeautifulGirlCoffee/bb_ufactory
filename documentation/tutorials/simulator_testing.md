@@ -163,11 +163,11 @@ simulator:
     matrix:
       model: [xarm6, lite6]   # whichever models you target
   steps:
-    - uses: actions/checkout@v4
-    - uses: erlef/setup-beam@v1
+    - uses: actions/checkout@v7.0.1
+    - uses: erlef/setup-beam@v1.24.1
       with:
-        elixir-version: "1.20.2"
-        otp-version: "29"
+        elixir-version: "1.20.5"
+        otp-version: "29.1.3"
     - run: mix deps.get
     - run: MIX_ENV=test mix compile
     - run: MIX_ENV=test mix bb_ufactory.sim start ${{ matrix.model }}

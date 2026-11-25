@@ -6,8 +6,11 @@ defmodule BB.Ufactory.Actuator.JointTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  @epoch 42
+
   setup :verify_on_exit!
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
@@ -36,7 +39,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
 
   defp make_ets do
     ets = :ets.new(:joint_test_ets, [:public, :set])
-    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil})
+    for i <- 1..6, do: :ets.insert(ets, {i, nil, nil, nil, nil, nil})
     :ets.insert(ets, {:arm, 0, 0, nil})
     ets
   end
@@ -220,30 +223,30 @@ defmodule BB.Ufactory.Actuator.JointTest do
   describe "handle_command(%Command.Position{}, state)" do
     test "writes set_position to ETS for an in-range position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.5, 0.1, nil, nil})
+      :ets.insert(ets, {2, 0.5, 0.1, nil, nil, nil})
       state = make_state(ets)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(1.0)
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      assert [{2, 0.5, 0.1, 1.0, nil}] = :ets.lookup(ets, 2)
+      assert [{2, 0.5, 0.1, 1.0, nil, @epoch}] = :ets.lookup(ets, 2)
     end
 
     test "preserves current_position and current_torque when writing set_position" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.3, 0.05, nil, nil})
+      :ets.insert(ets, {2, 0.3, 0.05, nil, nil, nil})
       state = make_state(ets)
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(1.5)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      [{2, cur_pos, cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
+      [{2, cur_pos, cur_torq, set_pos, _set_vel, @epoch}] = :ets.lookup(ets, 2)
       assert cur_pos == 0.3
       assert cur_torq == 0.05
       assert set_pos == 1.5
@@ -257,9 +260,9 @@ defmodule BB.Ufactory.Actuator.JointTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(@j2_upper + 1.0)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel, @epoch}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_upper, 0.0001
     end
 
@@ -271,15 +274,15 @@ defmodule BB.Ufactory.Actuator.JointTest do
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
       msg = position_msg(@j2_lower - 1.0)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      [{2, _cur_pos, _cur_torq, set_pos, _set_vel}] = :ets.lookup(ets, 2)
+      [{2, _cur_pos, _cur_torq, set_pos, _set_vel, @epoch}] = :ets.lookup(ets, 2)
       assert_in_delta set_pos, @j2_lower, 0.0001
     end
 
     test "publishes BeginMotion with correct initial_position, target_position, expected_arrival" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil, nil})
       state = make_state(ets)
 
       test_pid = self()
@@ -295,7 +298,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = position_msg(1.0)
 
       before_ms = System.monotonic_time(:millisecond)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
       after_ms = System.monotonic_time(:millisecond)
 
       assert_receive {:begin_motion, bm}, 500
@@ -320,7 +323,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       end)
 
       msg = position_msg(0.5)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert_in_delta bm.initial_position, 0.5, 0.0001
@@ -340,7 +343,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       end)
 
       msg = position_msg(0.5, command_id: ref)
-      Joint.handle_command(msg, state)
+      Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
       assert_receive {:begin_motion, bm}, 500
       assert bm.command_id == ref
@@ -357,36 +360,37 @@ defmodule BB.Ufactory.Actuator.JointTest do
 
     test "stores the velocity hint alongside the target" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, nil, nil})
+      :ets.insert(ets, {2, 0.0, 0.0, nil, nil, nil})
       state = make_state(ets)
 
       msg = position_msg(1.0, velocity: 0.25)
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      assert [{2, +0.0, +0.0, 1.0, 0.25}] = :ets.lookup(ets, 2)
+      assert [{2, +0.0, +0.0, 1.0, 0.25, @epoch}] = :ets.lookup(ets, 2)
     end
 
     test "a hint-less command clears a previous velocity hint" do
       ets = make_ets()
-      :ets.insert(ets, {2, 0.0, 0.0, 0.5, 0.25})
+      :ets.insert(ets, {2, 0.0, 0.0, 0.5, 0.25, @epoch})
       state = make_state(ets)
 
-      assert {:noreply, ^state} = Joint.handle_command(position_msg(1.0), state)
+      assert {:noreply, ^state} =
+               Joint.handle_command(%{position_msg(1.0) | arm_epoch: @epoch}, state)
 
-      assert [{2, +0.0, +0.0, 1.0, nil}] = :ets.lookup(ets, 2)
+      assert [{2, +0.0, +0.0, 1.0, nil, @epoch}] = :ets.lookup(ets, 2)
     end
 
     test "Stop's brake latch clears the velocity hint" do
       ets = make_ets()
       # Slow move in progress: braking must happen at full model speed, not
       # at the leisurely pace the interrupted move requested.
-      :ets.insert(ets, {2, 0.7, 0.1, 1.5, 0.1})
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, 0.1, @epoch})
       state = make_state(ets)
 
       msg = Message.new!(Command.Stop, :motor, mode: :immediate)
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+      assert [{2, 0.7, 0.1, 0.7, nil, @epoch}] = :ets.lookup(ets, 2)
     end
   end
 
@@ -398,7 +402,7 @@ defmodule BB.Ufactory.Actuator.JointTest do
       msg = Message.new!(Command.Velocity, :motor, velocity: 1.0)
 
       assert {:reply, {:error, {:unsupported_command, Command.Velocity}}, ^state} =
-               Joint.handle_command(msg, state)
+               Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
     end
   end
 
@@ -408,27 +412,27 @@ defmodule BB.Ufactory.Actuator.JointTest do
     test "latches the current reported position as the target" do
       ets = make_ets()
       # Joint travelling: current 0.7, commanded target 1.5
-      :ets.insert(ets, {2, 0.7, 0.1, 1.5, nil})
+      :ets.insert(ets, {2, 0.7, 0.1, 1.5, nil, @epoch})
       state = make_state(ets)
 
       msg = Message.new!(Command.Stop, :motor, mode: :immediate)
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
       # Target becomes the current position, so the 100 Hz loop brakes there.
-      assert [{2, 0.7, 0.1, 0.7, nil}] = :ets.lookup(ets, 2)
+      assert [{2, 0.7, 0.1, 0.7, nil, @epoch}] = :ets.lookup(ets, 2)
     end
 
     test "clears the pending target when no report frame has arrived yet" do
       ets = make_ets()
       # set_position written, but current_position never reported: the loop
       # has been skipping ticks, so nothing was dispatched.
-      :ets.insert(ets, {2, nil, nil, 1.5, nil})
+      :ets.insert(ets, {2, nil, nil, 1.5, nil, @epoch})
       state = make_state(ets)
 
       msg = Message.new!(Command.Stop, :motor, mode: :immediate)
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
+      assert [{2, nil, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
     end
   end
 
@@ -437,13 +441,13 @@ defmodule BB.Ufactory.Actuator.JointTest do
   describe "handle_command(%Command.Hold{}, state)" do
     test "latches the current reported position as the target" do
       ets = make_ets()
-      :ets.insert(ets, {2, -0.4, 0.0, 1.0, nil})
+      :ets.insert(ets, {2, -0.4, 0.0, 1.0, nil, @epoch})
       state = make_state(ets)
 
       msg = Message.new!(Command.Hold, :motor, [])
-      assert {:noreply, ^state} = Joint.handle_command(msg, state)
+      assert {:noreply, ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
-      assert [{2, -0.4, +0.0, -0.4, nil}] = :ets.lookup(ets, 2)
+      assert [{2, -0.4, +0.0, -0.4, nil, @epoch}] = :ets.lookup(ets, 2)
     end
 
     test "refuses when the current position is unknown" do
@@ -451,10 +455,12 @@ defmodule BB.Ufactory.Actuator.JointTest do
       state = make_state(ets)
 
       msg = Message.new!(Command.Hold, :motor, [])
-      assert {:reply, {:error, :position_unknown}, ^state} = Joint.handle_command(msg, state)
+
+      assert {:reply, {:error, %CommandFailed{operation: :hold, reason: :position_unknown}},
+              ^state} = Joint.handle_command(%{msg | arm_epoch: @epoch}, state)
 
       # Nothing written
-      assert [{2, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
+      assert [{2, nil, nil, nil, nil, nil}] = :ets.lookup(ets, 2)
     end
   end
 

@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ELIXIR_VERSION: "1.20.4"
-  OTP_VERSION: "29"
+  ELIXIR_VERSION: "1.20.5"
+  OTP_VERSION: "29.1.3"
 
 jobs:
   check:
@@ -23,17 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up BEAM
         id: beam
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             deps
@@ -47,7 +47,7 @@ jobs:
 
       # Runs the full ex_check suite: compiler (warnings-as-errors), formatter,
       # credo --strict, dialyzer, doctor, ex_doc, unit tests with coverage,
-      # mix_audit, sobelow, reach (architecture policy + strict smell checks,
+      # hex_audit, mix_audit, sobelow, reach (architecture policy + strict smell checks,
       # per .reach.exs), unused_deps, and reuse (via the fsfe/reuse Docker
       # image, per .check.exs). Dialyzer PLTs live in _build and are cached.
       - name: Run mix check
@@ -62,17 +62,17 @@ jobs:
       matrix:
         model: [xarm5, xarm6, xarm7, lite6, xarm850]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up BEAM
         id: beam
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             deps
@@ -85,13 +85,17 @@ jobs:
         run: mix deps.get
 
       - name: Compile tests
-        run: MIX_ENV=test mix compile
+        env:
+          MIX_ENV: test
+        run: mix compile
 
       # Pulls UFACTORY's firmware simulator (~1.2 GB, amd64-native on these
       # runners), starts this model's firmware inside it, and blocks until
       # the firmware passes a protocol-level readiness probe.
       - name: Start firmware simulator (${{ matrix.model }})
-        run: MIX_ENV=test mix bb_ufactory.sim start ${{ matrix.model }}
+        env:
+          MIX_ENV: test
+        run: mix bb_ufactory.sim start ${{ matrix.model }}
 
       # --warnings-as-errors: simulator-tagged tests are excluded from local
       # runs, so a call to an API that no longer exists only surfaces as a
@@ -105,7 +109,9 @@ jobs:
 
       - name: Stop simulator
         if: always()
-        run: MIX_ENV=test mix bb_ufactory.sim stop
+        env:
+          MIX_ENV: test
+        run: mix bb_ufactory.sim stop
 
   publish:
     name: Publish to Hex
@@ -118,17 +124,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up BEAM
         id: beam
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             deps

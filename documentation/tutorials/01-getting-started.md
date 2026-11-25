@@ -22,7 +22,7 @@ Add `bb_ufactory` to your `mix.exs` dependencies:
 ```elixir
 def deps do
   [
-    {:bb, "~> 0.31"},
+    {:bb, "~> 0.33.2"},
     {:bb_ufactory, "~> 0.2"}
   ]
 end
@@ -176,7 +176,7 @@ Before connecting real hardware, verify the robot definition is correct by
 starting in kinematic simulation mode. No arm required:
 
 ```elixir
-{:ok, robot} = MyRobot.start_link(simulation: :kinematic)
+{:ok, _pid} = MyRobot.start_link(simulation: :kinematic)
 ```
 
 The controller, all actuators, and any sensors will start. Commands are accepted
@@ -186,33 +186,37 @@ and `BeginMotion` messages are published, but no TCP connections are opened.
 
 ```elixir
 # 1. Arm the robot (enables the joint motors on hardware)
-:ok = BB.arm(robot)
+:ok = BB.Safety.arm(MyRobot)
 
 # 2. Move joint 1 to 45° (in radians: π/4 ≈ 0.785 rad)
-BB.Process.cast(robot, :j1_motor, {:command,
-  BB.Message.new!(BB.Message.Actuator.Command.Position, :j1_motor,
-    position: :math.pi() / 4
-  )
-})
+:ok = BB.Actuator.set_position(MyRobot, :j1_motor, :math.pi() / 4)
 
 # 3. Disarm when done
-:ok = BB.disarm(robot)
+:ok = BB.Safety.disarm(MyRobot)
 ```
 
-On hardware, `BB.arm` sends the enable command over port 502 and the arm
-transitions from idle to ready. `BB.disarm` sends stop and disables the motors.
+On hardware, `BB.Safety.arm/1` sends the enable command over port 502 and the arm
+transitions from idle to ready. `BB.Safety.disarm/1` requests the configured stop
+or motor disable.
+
+If BB reports `{:error, {:disarm_failed, failures}}`, the driver could not
+confirm disarm. Use the reported failure to diagnose the command connection
+or firmware state. After verifying the hardware is safe and restoring
+connectivity, an operator can call `BB.Safety.force_disarm/1` to acknowledge
+the fault. BB 0.33.2 restarts a stopped topology and returns it to
+`:disarmed` when reconnect succeeds.
 
 ## Subscribing to Joint State
 
-The controller publishes `BB.Message.Sensor.JointState` for each joint on every
-report frame (~100 Hz on port 30003). Subscribe from any process:
+The controller publishes a `BB.Message.Sensor.JointState` with all joint
+positions on every report frame (~100 Hz on port 30003). Subscribe from any process:
 
 ```elixir
-BB.subscribe(robot, [:sensor, :xarm, :j1])
+BB.subscribe(MyRobot, [:sensor, :xarm])
 
 receive do
-  {:bb, [:sensor, :xarm, :j1], %BB.Message{payload: %BB.Message.Sensor.JointState{} = js}} ->
-    IO.inspect(js.position, label: "J1 position (rad)")
+  {:bb, [:sensor, :xarm], %BB.Message{payload: %BB.Message.Sensor.JointState{} = js}} ->
+    IO.inspect(hd(js.positions), label: "J1 position (rad)")
 end
 ```
 

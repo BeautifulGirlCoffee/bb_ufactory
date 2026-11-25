@@ -80,9 +80,7 @@ defmodule BB.Ufactory.MixProject do
 
   defp deps do
     [
-      # 0.31+ required: see CHANGELOG — tracks the BB.Message envelope,
-      # compile-time component behaviour enforcement, Localize-based units.
-      {:bb, "~> 0.31"},
+      {:bb, "~> 0.33.2"},
 
       # dev/test
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

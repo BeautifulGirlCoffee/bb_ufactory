@@ -69,6 +69,7 @@ defmodule BB.Ufactory.Actuator.Joint do
 
   require Logger
 
+  alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
@@ -135,15 +136,15 @@ defmodule BB.Ufactory.Actuator.Joint do
   # ── handle_command/2 — all transports converge here ─────────────────────────
 
   @impl BB.Actuator
-  def handle_command(%Message{payload: %Command.Position{} = cmd}, state) do
-    {:noreply, apply_position_command(cmd, state)}
+  def handle_command(%Message{payload: %Command.Position{} = cmd, arm_epoch: epoch}, state) do
+    {:noreply, apply_position_command(cmd, epoch, state)}
   end
 
   # Both :immediate and :decelerate stop modes brake at the current position —
   # the firmware's own planner always decelerates smoothly, so the distinction
   # has no hardware expression here.
-  def handle_command(%Message{payload: %Command.Stop{}}, state) do
-    case brake_at_current(state) do
+  def handle_command(%Message{payload: %Command.Stop{}, arm_epoch: epoch}, state) do
+    case brake_at_current(state, epoch) do
       :ok ->
         {:noreply, state}
 
@@ -156,8 +157,8 @@ defmodule BB.Ufactory.Actuator.Joint do
     end
   end
 
-  def handle_command(%Message{payload: %Command.Hold{}}, state) do
-    case brake_at_current(state) do
+  def handle_command(%Message{payload: %Command.Hold{}, arm_epoch: epoch}, state) do
+    case brake_at_current(state, epoch) do
       :ok ->
         {:noreply, state}
 
@@ -168,7 +169,7 @@ defmodule BB.Ufactory.Actuator.Joint do
           "[BB.Ufactory.Actuator.Joint] J#{state.joint} Hold refused: current position unknown"
         )
 
-        {:reply, {:error, :position_unknown}, state}
+        {:reply, CommandFailed.reply(:hold, :position_unknown), state}
     end
   end
 
@@ -207,7 +208,7 @@ defmodule BB.Ufactory.Actuator.Joint do
       )
   end
 
-  defp apply_position_command(%Command.Position{position: position} = cmd, state) do
+  defp apply_position_command(%Command.Position{position: position} = cmd, epoch, state) do
     {lower, upper} = state.limits
     clamped = position |> max(lower) |> min(upper)
 
@@ -219,7 +220,7 @@ defmodule BB.Ufactory.Actuator.Joint do
 
     # The velocity hint travels with the target; cmd_move_joints takes one
     # speed for the whole batch, so the loop uses the slowest pending hint.
-    cur_pos = write_set_position(state.ets, state.joint, clamped, cmd.velocity)
+    cur_pos = write_set_position(state.ets, state.joint, clamped, cmd.velocity, epoch)
     publish_begin_motion(cmd, clamped, cur_pos, state)
     state
   end
@@ -229,10 +230,10 @@ defmodule BB.Ufactory.Actuator.Joint do
   # happen at the model's full speed, not at a leisurely pace a previous move
   # requested. Returns :no_feedback when no report frame has populated
   # current_position yet.
-  defp brake_at_current(state) do
+  defp brake_at_current(state, epoch) do
     case :ets.lookup(state.ets, state.joint) do
-      [{_joint, cur_pos, _cur_torq, _sp, _sv}] when is_number(cur_pos) ->
-        write_set_position(state.ets, state.joint, cur_pos, nil)
+      [{_joint, cur_pos, _cur_torq, _sp, _sv, _epoch}] when is_number(cur_pos) ->
+        write_set_position(state.ets, state.joint, cur_pos, nil, epoch)
         :ok
 
       _ ->
@@ -247,7 +248,7 @@ defmodule BB.Ufactory.Actuator.Joint do
   # update and clobber a fresh angle (or let the controller resurrect a stale
   # target). :ets.update_element/3 is atomic per row.
   defp clear_set_position(ets, joint) do
-    :ets.update_element(ets, joint, [{4, nil}, {5, nil}])
+    :ets.update_element(ets, joint, [{4, nil}, {5, nil}, {6, nil}])
     :ok
   end
 
@@ -255,15 +256,15 @@ defmodule BB.Ufactory.Actuator.Joint do
   # current_position (may be nil); the read is advisory (BeginMotion's
   # initial-position estimate), so a report frame landing between the lookup
   # and the update is harmless.
-  defp write_set_position(ets, joint, set_pos, set_vel) do
+  defp write_set_position(ets, joint, set_pos, set_vel, epoch) do
     cur_pos =
       case :ets.lookup(ets, joint) do
-        [{^joint, cp, _ct, _sp, _sv}] -> cp
+        [{^joint, cp, _ct, _sp, _sv, _epoch}] -> cp
         [] -> nil
       end
 
-    :ets.update_element(ets, joint, [{4, set_pos}, {5, set_vel}]) ||
-      :ets.insert(ets, {joint, nil, nil, set_pos, set_vel})
+    :ets.update_element(ets, joint, [{4, set_pos}, {5, set_vel}, {6, epoch}]) ||
+      :ets.insert(ets, {joint, nil, nil, set_pos, set_vel, epoch})
 
     cur_pos
   end
