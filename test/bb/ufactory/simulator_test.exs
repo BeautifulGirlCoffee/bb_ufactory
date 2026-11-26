@@ -65,6 +65,35 @@ defmodule BB.Ufactory.SimulatorTest do
     xarm850: {5, 2.1, 2.5}
   }
 
+  test "firmware reads back the requested workspace limits in millimetres" do
+    {:ok, cmd} = connect_command()
+    get_limits = Protocol.build_frame(0, 0x35, <<>>)
+
+    try do
+      assert {:ok,
+              {0x35, _,
+               <<_mode, xmax::signed-16, xmin::signed-16, ymax::signed-16, ymin::signed-16,
+                 zmax::signed-16, zmin::signed-16, _::binary>>}, _} =
+               command(cmd, get_limits)
+
+      try do
+        frame = Protocol.cmd_set_tcp_boundary(1, -601, 602, -603, 604, -205, 806)
+        assert {:ok, {0x34, _, _}, _} = command(cmd, frame)
+
+        assert {:ok,
+                {0x35, _,
+                 <<_mode, 602::signed-16, -601::signed-16, 604::signed-16, -603::signed-16,
+                   806::signed-16, -205::signed-16, _::binary>>}, _} =
+                 command(cmd, get_limits)
+      after
+        original = Protocol.cmd_set_tcp_boundary(2, xmin, xmax, ymin, ymax, zmin, zmax)
+        assert {:ok, {0x34, _, _}, _} = command(cmd, original)
+      end
+    after
+      :gen_tcp.close(cmd)
+    end
+  end
+
   # ── Connection & heartbeat ──────────────────────────────────────────────────
 
   describe "command socket" do

@@ -52,6 +52,7 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
 
   require Logger
 
+  alias BB.Ufactory.Accessory
   alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Protocol
 
@@ -77,11 +78,7 @@ defmodule BB.Ufactory.Sensor.ForceTorque do
     # disarm/1 disables the hardware sensor, so the enable frame must be
     # re-sent on every :armed transition — registered with the controller's
     # arm sequence so it happens after mode/state setup.
-    case call_controller(
-           bb.robot,
-           controller,
-           {:register_arm_frames, :force_torque, [enable_frame]}
-         ) do
+    case Accessory.register(bb.robot, controller, :force_torque, [enable_frame]) do
       :ok ->
         :ok
 

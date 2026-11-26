@@ -8,6 +8,11 @@ defmodule BB.Ufactory.Sensor.ForceTorqueTest do
 
   setup :verify_on_exit!
 
+  setup do
+    start_supervised!({Registry, keys: :unique, name: TestRobot.Registry})
+    :ok
+  end
+
   alias BB.Message
   alias BB.Ufactory.Message.Wrench
   alias BB.Ufactory.Protocol

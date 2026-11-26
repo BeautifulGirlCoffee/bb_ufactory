@@ -80,6 +80,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
   alias BB.Message.Actuator.Command
+  alias BB.Ufactory.Accessory
   alias BB.Ufactory.Protocol
 
   # ── init/1 ──────────────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
     stroke_mm = Keyword.get(opts, :stroke_mm, 700)
     mm_per_unit = if Keyword.get(opts, :position_unit) == :meter, do: 1000.0, else: 1.0
 
+    BB.Safety.register(__MODULE__, robot: bb.robot, path: bb.path, opts: opts)
     register_arm_frames(bb.robot, controller)
 
     {:ok,
@@ -108,17 +110,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
 
   @impl BB.Actuator
   def disarm(opts) do
-    bb = Keyword.fetch!(opts, :bb)
-    controller = Keyword.fetch!(opts, :controller)
-    frame = Protocol.cmd_linear_track_enable(0, false)
-
-    try do
-      BB.Process.call(bb.robot, controller, {:send_command, frame})
-    catch
-      _, _ -> :ok
-    end
-
-    :ok
+    Accessory.disable(opts, Protocol.cmd_linear_track_enable(0, false))
   end
 
   # ── Accepted command payloads ────────────────────────────────────────────────
@@ -216,7 +208,7 @@ defmodule BB.Ufactory.Actuator.LinearTrack do
   defp register_arm_frames(robot, controller) do
     frames = [Protocol.cmd_linear_track_enable(0, true)]
 
-    case BB.Process.call(robot, controller, {:register_arm_frames, :linear_track, frames}) do
+    case Accessory.register(robot, controller, :linear_track, frames) do
       :ok ->
         :ok
 

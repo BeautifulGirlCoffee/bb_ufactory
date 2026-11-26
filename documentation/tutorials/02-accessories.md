@@ -62,11 +62,10 @@ Positions outside 0–850 are automatically clamped by the actuator.
 
 ### Disarm Behaviour
 
-When the robot is disarmed, `Actuator.Gripper` sends
-`cmd_gripper_enable(false)` through the controller, best-effort: if the
-controller is down the attempt is swallowed. (The controller's own `disarm/1`
-is the layer that opens a fresh TCP connection to stop the *arm* even after a
-crash — the gripper has no independent connection of its own.)
+The gripper and linear track each register a BB disarm callback. BB waits for
+the accessory to acknowledge its disable write. An unavailable controller, a
+timeout, or an unexpected reply produces a disarm failure for that accessory.
+The arm controller verifies its own stop on a separate connection.
 
 ---
 

@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## v0.2.2 (2026-11-25)
+
+- Encode workspace fences in firmware order and verify all six limits through
+  readback before enabling the fence. `fence_on: true` requires `tcp_boundary`.
+- Register gripper and track shutdown with BB safety and verify each device's
+  RS485 acknowledgement. Restore accessory setup after a controller restart.
+- Retire cached joint targets when switching to Cartesian motion.
+- Publish polled error and warning codes in arm status, including fault clears.
+- Match asynchronous command replies by transaction and register, preserve TCP
+  frame fragments, and timestamp feedback in the report socket reader.
+
 ## v0.2.1 (2026-11-25)
 
 - Require Beam Bots 0.33.2. Synchronous stops use `BB.Actuator.stop/3`

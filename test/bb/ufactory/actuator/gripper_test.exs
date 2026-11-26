@@ -8,6 +8,11 @@ defmodule BB.Ufactory.Actuator.GripperTest do
 
   setup :verify_on_exit!
 
+  setup do
+    start_supervised!({Registry, keys: :unique, name: TestRobot.Registry})
+    :ok
+  end
+
   alias BB.Error.Protocol.Ufactory.CommandFailed
   alias BB.Message
   alias BB.Message.Actuator.BeginMotion
@@ -258,33 +263,33 @@ defmodule BB.Ufactory.Actuator.GripperTest do
       expected_frame = Protocol.cmd_gripper_enable(0, false)
 
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_and_recv, frame} ->
         assert frame == expected_frame
-        :ok
+        {:ok, {0x7C, 0, binary_part(frame, 7, 7)}, <<>>}
       end)
 
       opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
       assert :ok = Gripper.disarm(opts)
     end
 
-    test "returns :ok even when controller call fails" do
+    test "returns an error even when controller call fails" do
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_and_recv, _frame} ->
         {:error, :noproc}
       end)
 
       opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
-      assert :ok = Gripper.disarm(opts)
+      assert {:error, %CommandFailed{}} = Gripper.disarm(opts)
     end
 
-    test "returns :ok even when controller process is down" do
+    test "returns an error even when controller process is down" do
       BB.Process
-      |> expect(:call, fn TestRobot, :xarm, {:send_command, _frame} ->
+      |> expect(:call, fn TestRobot, :xarm, {:send_and_recv, _frame} ->
         raise "process down"
       end)
 
       opts = [bb: %{robot: TestRobot, path: [:gripper]}, controller: :xarm]
-      assert :ok = Gripper.disarm(opts)
+      assert {:error, %CommandFailed{}} = Gripper.disarm(opts)
     end
   end
 end

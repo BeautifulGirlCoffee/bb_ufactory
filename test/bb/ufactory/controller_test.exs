@@ -23,6 +23,11 @@ defmodule BB.Ufactory.ControllerTest do
 
   setup :verify_on_exit!
 
+  setup do
+    start_supervised!({Registry, keys: :unique, name: TestRobot.Registry})
+    :ok
+  end
+
   # ── TCP socket pair helper ───────────────────────────────────────────────────
   # Creates two connected TCP sockets over the loopback interface.
   # `client` is the controller's end; `server` is the test's end.
@@ -35,6 +40,50 @@ defmodule BB.Ufactory.ControllerTest do
     {:ok, server} = :gen_tcp.accept(listen, 1_000)
     :gen_tcp.close(listen)
     {client, server}
+  end
+
+  defp deliver_report(bytes, state) do
+    times = {System.monotonic_time(:nanosecond), System.system_time(:nanosecond)}
+    Controller.handle_info({:report_bytes, state.report_socket, bytes, times}, state)
+  end
+
+  defp heartbeat_exchange(state) do
+    case Controller.handle_info(:heartbeat, state) do
+      {:noreply, state} -> {:noreply, pump_responses(state)}
+      stopped -> stopped
+    end
+  end
+
+  defp command_exchange(request, state) do
+    tag = make_ref()
+
+    case Controller.handle_call(request, {self(), tag}, state) do
+      {:noreply, state} ->
+        state = pump_responses(state)
+        assert_receive {^tag, reply}
+        {:reply, reply, state}
+
+      stopped ->
+        stopped
+    end
+  end
+
+  defp pump_responses(%{pending: pending} = state) when map_size(pending) == 0, do: state
+
+  defp pump_responses(state) do
+    :ok = :inet.setopts(state.cmd_socket, active: true)
+
+    receive do
+      {:tcp, _, _} = msg ->
+        {:noreply, state} = Controller.handle_info(msg, state)
+        pump_responses(state)
+
+      {:timeout, _, {:command_timeout, _}} = msg ->
+        {:noreply, state} = Controller.handle_info(msg, state)
+        pump_responses(state)
+    after
+      2000 -> flunk("missing command reply or timeout")
+    end
   end
 
   # Receives all pending bytes from `socket` within `timeout_ms`.
@@ -126,6 +175,9 @@ defmodule BB.Ufactory.ControllerTest do
       cmd_socket: cmd_socket,
       report_socket: nil,
       buffer: <<>>,
+      command_buffer: <<>>,
+      pending: %{},
+      polled_codes: {0, 0},
       ets: ets,
       txn_id: 0,
       last_error_code: 0,
@@ -160,11 +212,8 @@ defmodule BB.Ufactory.ControllerTest do
   # Starts stub TCP listeners for both cmd and report ports, calls Controller.init/1
   # with `extra_opts`, and returns all bytes received by the cmd server during init.
   #
-  # Since apply_hardware_config/1 runs synchronously inside init/1, all config frames
-  # have been sent by the time Controller.init returns. We accept the connection in a
-  # background task (so the listener is ready before init connects), then drain the
-  # server socket after init returns to collect everything at once.
-  defp init_for_config_test(extra_opts) do
+  # The loopback peer records writes and answers fence verification requests.
+  defp init_for_config_test(extra_opts, readback \\ {-400, 400, -400, 400, 0, 800}) do
     {:ok, cmd_listen} =
       :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
 
@@ -175,17 +224,10 @@ defmodule BB.Ufactory.ControllerTest do
 
     {:ok, report_port} = :inet.port(report_listen)
 
-    # Accept both connections asynchronously; return the cmd server socket so we can
-    # drain it after init has finished sending all config frames.
-    # We transfer controlling_process to the parent before the Task exits so the
-    # socket is not closed when the task process terminates.
-    parent = self()
-
     cmd_accept_task =
       Task.async(fn ->
         {:ok, server} = :gen_tcp.accept(cmd_listen, 2_000)
-        :ok = :gen_tcp.controlling_process(server, parent)
-        server
+        record_config(server, readback, <<>>)
       end)
 
     Task.start(fn -> :gen_tcp.accept(report_listen, 2_000) end)
@@ -204,27 +246,49 @@ defmodule BB.Ufactory.ControllerTest do
       model: :xarm6
     ]
 
-    assert {:ok, state} = Controller.init(base_opts ++ extra_opts)
+    result = Controller.init(base_opts ++ extra_opts)
 
-    # init has returned — all config frames have been sent synchronously
-    cmd_server = Task.await(cmd_accept_task, 3_000)
+    case result do
+      {:ok, state} -> Controller.terminate(:normal, state)
+      _ -> :ok
+    end
 
-    # Drain the server socket with a short timeout; loop until nothing arrives.
-    received = drain_socket(cmd_server, <<>>, 100)
-
-    :gen_tcp.close(cmd_server)
+    received = Task.await(cmd_accept_task)
     :gen_tcp.close(cmd_listen)
     :gen_tcp.close(report_listen)
-    :gen_tcp.close(state.cmd_socket)
-    :gen_tcp.close(state.report_socket)
 
-    received
+    case result do
+      {:ok, _} -> received
+      {:stop, reason} -> {:stop, reason, received}
+    end
   end
 
-  defp drain_socket(socket, acc, timeout_ms) do
-    case :gen_tcp.recv(socket, 0, timeout_ms) do
-      {:ok, data} -> drain_socket(socket, acc <> data, timeout_ms)
-      {:error, _} -> acc
+  defp record_config(socket, readback, bytes) do
+    case :gen_tcp.recv(socket, 6, 1000) do
+      {:ok, <<id::16, 2::16, size::16>> = header} ->
+        {:ok, <<register, _::binary>> = body} = :gen_tcp.recv(socket, size, 1000)
+
+        case register do
+          0x35 ->
+            {xmin, xmax, ymin, ymax, zmin, zmax} = readback
+
+            params =
+              <<0, 0, xmax::signed-16, xmin::signed-16, ymax::signed-16, ymin::signed-16,
+                zmax::signed-16, zmin::signed-16, 0::64>>
+
+            :gen_tcp.send(socket, Protocol.build_frame(id, register, params))
+
+          reg when reg in [0x34, 0x3B] ->
+            :gen_tcp.send(socket, Protocol.build_frame(id, register, <<0>>))
+
+          _ ->
+            :ok
+        end
+
+        record_config(socket, readback, bytes <> header <> body)
+
+      {:error, _} ->
+        bytes
     end
   end
 
@@ -516,7 +580,7 @@ defmodule BB.Ufactory.ControllerTest do
       angles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
       frame = build_87_byte_frame(angles: angles)
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, new_state} = deliver_report(frame, state)
       assert new_state.buffer == <<>>
 
       for {angle, i} <- Enum.with_index(Enum.take(angles, 6), 1) do
@@ -529,7 +593,7 @@ defmodule BB.Ufactory.ControllerTest do
       torques = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7]
       frame = build_87_byte_frame(torques: torques)
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, new_state} = deliver_report(frame, state)
 
       for {torque, i} <- Enum.with_index(Enum.take(torques, 6), 1) do
         [{^i, _pos, read_torq, _set, _vel, nil}] = :ets.lookup(new_state.ets, i)
@@ -540,7 +604,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "updates arm-level ETS row with state and mode", %{state: state} do
       frame = build_87_byte_frame(state: 4, mode: 1)
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, new_state} = deliver_report(frame, state)
 
       assert [{:arm, 4, 1, _pose}] = :ets.lookup(new_state.ets, :arm)
     end
@@ -549,7 +613,7 @@ defmodule BB.Ufactory.ControllerTest do
       pose = [100.0, 200.0, 300.0, 0.1, 0.2, 0.3]
       frame = build_87_byte_frame(pose: pose)
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, new_state} = deliver_report(frame, state)
 
       [{:arm, _st, _mode, {x, y, z, roll, pitch, yaw}}] = :ets.lookup(new_state.ets, :arm)
       assert_in_delta x, 100.0, 1.0e-3
@@ -565,7 +629,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       frame = build_87_byte_frame(angles: [0.1 | List.duplicate(0.0, 6)])
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, new_state} = deliver_report(frame, state)
 
       [{1, _cur, _torq, set_pos, _set_vel, @epoch}] = :ets.lookup(new_state.ets, 1)
       assert set_pos == 1.57
@@ -596,7 +660,7 @@ defmodule BB.Ufactory.ControllerTest do
           end
 
           Enum.each(1..1_000, fn _ ->
-            Controller.handle_info({:tcp, nil, frame}, state)
+            deliver_report(frame, state)
           end)
         end)
 
@@ -632,7 +696,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
 
-      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, _state} = deliver_report(frame, state)
     end
 
     test "publishes CartesianPose message", %{state: state} do
@@ -651,7 +715,7 @@ defmodule BB.Ufactory.ControllerTest do
           :ok
       end)
 
-      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, _state} = deliver_report(frame, state)
     end
 
     test "publishes Wrench message when ft_filtered data is present", %{state: state} do
@@ -673,7 +737,7 @@ defmodule BB.Ufactory.ControllerTest do
           :ok
       end)
 
-      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, _state} = deliver_report(frame, state)
     end
 
     test "joint, TCP, and wrench messages from one frame share their timestamps", %{state: state} do
@@ -686,7 +750,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       assert {:noreply, _state} =
-               Controller.handle_info({:tcp, nil, build_135_byte_frame([])}, state)
+               deliver_report(build_135_byte_frame([]), state)
 
       assert_receive {[:sensor, :xarm], %Message{monotonic_time: monotonic, wall_time: wall}}
 
@@ -709,7 +773,7 @@ defmodule BB.Ufactory.ControllerTest do
           :ok
       end)
 
-      assert {:noreply, _state} = Controller.handle_info({:tcp, nil, frame}, state)
+      assert {:noreply, _state} = deliver_report(frame, state)
     end
 
     test "accumulates partial frames in buffer", %{state: state} do
@@ -717,12 +781,12 @@ defmodule BB.Ufactory.ControllerTest do
       <<first_half::binary-size(40), second_half::binary>> = frame
 
       assert {:noreply, partial_state} =
-               Controller.handle_info({:tcp, nil, first_half}, state)
+               deliver_report(first_half, state)
 
       assert byte_size(partial_state.buffer) == 40
 
       assert {:noreply, full_state} =
-               Controller.handle_info({:tcp, nil, second_half}, partial_state)
+               deliver_report(second_half, partial_state)
 
       assert full_state.buffer == <<>>
     end
@@ -736,7 +800,7 @@ defmodule BB.Ufactory.ControllerTest do
       BB
       |> expect(:publish, 5, fn TestRobot, _path, %Message{} -> :ok end)
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, two_frames}, state)
+      assert {:noreply, new_state} = deliver_report(two_frames, state)
       assert new_state.buffer == <<>>
     end
   end
@@ -827,7 +891,7 @@ defmodule BB.Ufactory.ControllerTest do
       # is dropped and a reconnect is scheduled instead of buffering forever.
       garbage = <<0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x10>>
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, garbage}, state)
+      assert {:noreply, new_state} = deliver_report(garbage, state)
       assert new_state.buffer == <<>>
       assert new_state.report_socket == nil
       assert new_state.report_reconnect_pending
@@ -838,7 +902,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state} do
       garbage = <<0, 0, 0, 10, 1, 2, 3, 4, 5, 6>>
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, garbage}, state)
+      assert {:noreply, new_state} = deliver_report(garbage, state)
       assert new_state.buffer == <<>>
       assert new_state.report_reconnect_pending
     end
@@ -846,7 +910,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "valid frame after partial garbage is processed normally", %{state: state} do
       valid_frame = build_87_byte_frame(angles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
 
-      assert {:noreply, new_state} = Controller.handle_info({:tcp, nil, valid_frame}, state)
+      assert {:noreply, new_state} = deliver_report(valid_frame, state)
       assert new_state.buffer == <<>>
 
       [{1, pos, _torq, _set, _vel, nil}] = :ets.lookup(new_state.ets, 1)
@@ -873,7 +937,7 @@ defmodule BB.Ufactory.ControllerTest do
 
     test "calls BB.Safety.report_error when heartbeat poll returns non-zero error code",
          %{state: state, cmd_server: cmd_server} do
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> expect(:report_error, fn TestRobot, [:xarm], error ->
@@ -887,7 +951,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
 
@@ -895,7 +959,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | last_error_code: 22}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> reject(:report_error, 3)
@@ -905,7 +969,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
 
@@ -913,14 +977,14 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | last_error_code: 22}
 
-      ok_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0, 0x00>>
+      ok_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 0, 0x00>>
 
       spawn_link(fn ->
         {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
         :gen_tcp.send(cmd_server, ok_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 0
     end
   end
@@ -946,7 +1010,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) + 60_000}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> reject(:report_error, 3)
@@ -956,7 +1020,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       # The suppressed code must NOT be recorded as last_error_code: recording
       # it would permanently silence a fault that persists past the grace
       # window (the reporting guard skips codes equal to last_error_code).
@@ -968,7 +1032,7 @@ defmodule BB.Ufactory.ControllerTest do
       # Phase 1: fault appears during grace — suppressed.
       state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) + 200}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       # A single expectation for the whole test: if phase 1 wrongly reported
       # the suppressed fault, phase 2's call would exceed it and fail.
@@ -983,7 +1047,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, state} = heartbeat_exchange(state)
       assert state.last_error_code == 0
 
       # Phase 2: grace expires while the same fault persists — it must be
@@ -992,10 +1056,10 @@ defmodule BB.Ufactory.ControllerTest do
 
       spawn_link(fn ->
         {:ok, _data} = recv_at_least(cmd_server, 7 + 7, 1_000)
-        :gen_tcp.send(cmd_server, error_response)
+        :gen_tcp.send(cmd_server, Protocol.build_frame(3, 0x0F, <<0, 22, 0>>))
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
 
@@ -1003,7 +1067,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | error_report_grace_until: System.monotonic_time(:millisecond) - 5_000}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> expect(:report_error, fn TestRobot, [:xarm], error ->
@@ -1016,7 +1080,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
 
@@ -1073,7 +1137,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | ignore_error_codes: [11, 22]}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 11, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 11, 0x00>>
 
       BB.Safety
       |> reject(:report_error, 3)
@@ -1083,7 +1147,7 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 11
     end
 
@@ -1091,7 +1155,7 @@ defmodule BB.Ufactory.ControllerTest do
          %{state: state, cmd_server: cmd_server} do
       state = %{state | ignore_error_codes: [11], error_report_grace_until: nil}
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> expect(:report_error, fn TestRobot, [:xarm], error ->
@@ -1104,19 +1168,12 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
   end
 
-  # ── Response buffer draining ──────────────────────────────────────────────────
-  #
-  # Fire-and-forget operations (100Hz cmd_move_joints, RS485 actuator writes)
-  # generate responses the controller never reads. These accumulate in the TCP
-  # receive buffer and desynchronize subsequent recv calls. The drain_recv_buffer
-  # function clears stale data before every send-and-recv operation.
-
-  describe "response buffer draining" do
+  describe "command response correlation" do
     setup do
       {cmd_client, cmd_server} = tcp_pair()
 
@@ -1133,16 +1190,58 @@ defmodule BB.Ufactory.ControllerTest do
       %{state: state, cmd_server: cmd_server}
     end
 
-    test "drains stale RS485 responses so poll_error_code reads the correct response",
+    test "retains split frames and routes overlapping RS485 reads by transaction", %{state: state} do
+      frame = Protocol.cmd_linear_track_read_position(0)
+      first = make_ref()
+      second = make_ref()
+      {:noreply, state} = Controller.handle_call({:send_and_recv, frame}, {self(), first}, state)
+      {:noreply, state} = Controller.handle_call({:send_and_recv, frame}, {self(), second}, state)
+      stale = Protocol.build_frame(99, 0x7C, <<0, 99>>)
+      foreign = Protocol.build_frame(0, 0x0F, <<0, 0, 0>>)
+      <<head::binary-4, tail::binary>> = Protocol.build_frame(1, 0x7C, <<0, 2>>)
+
+      {:noreply, state} =
+        Controller.handle_info({:tcp, state.cmd_socket, stale <> foreign <> head}, state)
+
+      assert map_size(state.pending) == 2
+      final = Protocol.build_frame(0, 0x7C, <<0, 1>>)
+      {:noreply, state} = Controller.handle_info({:tcp, state.cmd_socket, tail <> final}, state)
+      assert_receive {^second, {:ok, {0x7C, 0, <<2>>}, <<>>}}
+      assert_receive {^first, {:ok, {0x7C, 0, <<1>>}, <<>>}}
+      assert state.pending == %{}
+      assert state.command_buffer == <<>>
+    end
+
+    test "polled collision and clear are published once despite intervening real-time reports", %{
+      state: state
+    } do
+      parent = self()
+      BB |> stub(:publish, fn _, path, msg -> send(parent, {path, msg.payload}) end)
+      BB.Safety |> expect(:report_error, fn _, _, %{error_code: 31} -> :ok end)
+      {:noreply, state} = deliver_report(build_87_byte_frame(), state)
+      assert_receive {[:sensor, :xarm, :arm_status], %{error_code: 0, warn_code: 0}}
+      {:noreply, state} = Controller.handle_info(:heartbeat, state)
+      poll = Protocol.build_frame(1, 0x0F, <<0x40, 31, 9>>)
+      {:noreply, state} = Controller.handle_info({:tcp, state.cmd_socket, poll}, state)
+      assert_receive {[:sensor, :xarm, :arm_status], %{error_code: 31, warn_code: 9}}
+      {:noreply, state} = deliver_report(build_87_byte_frame(), state)
+      refute_receive {[:sensor, :xarm, :arm_status], _}, 10
+      {:noreply, state} = Controller.handle_info(:heartbeat, state)
+      clear = Protocol.build_frame(3, 0x0F, <<0, 0, 0>>)
+      {:noreply, _} = Controller.handle_info({:tcp, state.cmd_socket, clear}, state)
+      assert_receive {[:sensor, :xarm, :arm_status], %{error_code: 0, warn_code: 0}}
+    end
+
+    test "poll ignores earlier RS485 responses",
          %{state: state, cmd_server: cmd_server} do
       # Pre-load the buffer with a stale RS485 response. Register 0x7C, params
-      # starting with host_id 0x0B (= decimal 11). Without draining + register
-      # validation, this would be misinterpreted as error code 11.
+      # starting with host_id 0x0B (= decimal 11). Without transaction and register
+      # matching, this would be misinterpreted as error code 11.
       stale_rs485_response = Protocol.build_frame(0, 0x7C, <<0x00, 0x0B, 0x01, 0x10>>)
       :gen_tcp.send(cmd_server, stale_rs485_response)
       Process.sleep(10)
 
-      ok_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
+      ok_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
 
       BB.Safety
       |> reject(:report_error, 3)
@@ -1152,11 +1251,11 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, ok_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 0
     end
 
-    test "drains multiple stale responses accumulated from 100Hz loop",
+    test "skips multiple responses accumulated from the 100 Hz loop",
          %{state: state, cmd_server: cmd_server} do
       # Simulate several cmd_move_joints responses sitting in the buffer
       for _ <- 1..10 do
@@ -1166,7 +1265,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       Process.sleep(10)
 
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB.Safety
       |> expect(:report_error, fn TestRobot, [:xarm], error ->
@@ -1179,11 +1278,11 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
 
-    test "drains stale data before send_and_recv for actuator commands",
+    test "ignores earlier responses during an actuator read",
          %{state: state, cmd_server: cmd_server} do
       # Pre-load buffer with stale data
       stale_response = Protocol.build_frame(0, 0x17, <<0x00>>)
@@ -1200,7 +1299,7 @@ defmodule BB.Ufactory.ControllerTest do
         end)
 
       assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, _rest}, _new_state} =
-               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, frame}, state)
 
       Task.await(task, 2_000)
     end
@@ -1208,7 +1307,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "send_and_recv skips in-flight responses for other registers",
          %{state: state, cmd_server: cmd_server} do
       # An RS485 read racing the 100 Hz move stream: a move-ack (0x1D) lands
-      # after the drain but before the RS485 (0x7C) response. The reply must
+      # before the RS485 (0x7C) response. The reply must
       # be the 0x7C frame, not the move-ack.
       rs485_frame = Protocol.build_frame(0, 0x7C, <<0x0B, 0x01, 0x03>>)
       move_ack = Protocol.build_frame(0, 0x1D, <<0x00>>)
@@ -1224,7 +1323,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       assert {:reply, {:ok, {0x7C, 0x00, <<0x0B, 0x01, 0x03, 0x04, _::binary>>}, <<>>},
               _new_state} =
-               Controller.handle_call({:send_and_recv, rs485_frame}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, rs485_frame}, state)
 
       Task.await(task, 2_000)
     end
@@ -1244,7 +1343,7 @@ defmodule BB.Ufactory.ControllerTest do
         end)
 
       assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, <<>>}, _new_state} =
-               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, frame}, state)
 
       Task.await(task, 2_000)
     end
@@ -1261,7 +1360,7 @@ defmodule BB.Ufactory.ControllerTest do
         end)
 
       assert {:reply, {:error, :timeout}, _new_state} =
-               Controller.handle_call({:send_and_recv, frame, 150}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, frame, 150}, state)
 
       Task.await(task, 2_000)
     end
@@ -1484,7 +1583,7 @@ defmodule BB.Ufactory.ControllerTest do
     test "sends the heartbeat frame and polls error code over the command socket",
          %{state: state, cmd_server: cmd_server} do
       # Respond to the GET_ERROR poll with a zero error/warn code
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 0x00, 0x00>>
 
       spawn_link(fn ->
         # Wait for heartbeat + error poll frames to arrive
@@ -1492,17 +1591,17 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
-      assert new_state.txn_id == 1
+      assert {:noreply, new_state} = heartbeat_exchange(state)
+      assert new_state.txn_id == 2
     end
 
     test "still finds the GET_ERROR reply behind an in-flight stale response",
          %{state: state, cmd_server: cmd_server} do
       # A response to the heartbeat (or a recent move frame) can land after
-      # the drain but before the GET_ERROR reply; the scanner must walk past
+      # the poll is sent but before its reply; the scanner must walk past
       # it rather than dropping the fault-detection cycle.
       stale = Protocol.build_frame(0, 0x0D, <<0x00, 0x02>>)
-      error_response = <<0, 0, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
+      error_response = <<0, 1, 0, 2, 0, 4, 0x0F, 0x00, 22, 0x00>>
 
       BB
       |> stub(:publish, fn _robot, _path, _msg -> :ok end)
@@ -1518,19 +1617,13 @@ defmodule BB.Ufactory.ControllerTest do
         :gen_tcp.send(cmd_server, stale <> error_response)
       end)
 
-      assert {:noreply, new_state} = Controller.handle_info(:heartbeat, state)
+      assert {:noreply, new_state} = heartbeat_exchange(state)
       assert new_state.last_error_code == 22
     end
   end
 
   # ── Command socket failure ───────────────────────────────────────────────────
   #
-  # The command socket is passive, so a dead peer never surfaces as
-  # :tcp_closed. Send/recv errors are the only signal, and they must stop the
-  # controller (after reporting to BB.Safety) — a silently dead command
-  # socket would disable fault detection and motion while the robot stays
-  # armed.
-
   describe "command socket failure" do
     setup do
       {cmd_client, cmd_server} = tcp_pair()
@@ -1551,7 +1644,7 @@ defmodule BB.Ufactory.ControllerTest do
       end)
 
       assert {:stop, %BB.Error.Protocol.Ufactory.ConnectionError{}, _state} =
-               Controller.handle_info(:heartbeat, state)
+               heartbeat_exchange(state)
     end
 
     test "joint-move send failure stops the controller", %{state: state} do
@@ -1608,7 +1701,7 @@ defmodule BB.Ufactory.ControllerTest do
 
       # Server never responds; a slow arm must not kill the controller.
       assert {:reply, {:error, :timeout}, _state} =
-               Controller.handle_call({:send_and_recv, frame, 50}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, frame, 50}, state)
     end
   end
 
@@ -1758,7 +1851,7 @@ defmodule BB.Ufactory.ControllerTest do
           Protocol.cmd_enable(1, true) <>
           Protocol.cmd_set_mode(2, 0) <>
           Protocol.cmd_set_state(3, 0) <>
-          accessory_frame
+          Protocol.cmd_gripper_enable(4, true)
 
       assert {:ok, data} = recv_at_least(cmd_server, byte_size(expected))
       assert data == expected
@@ -1874,7 +1967,7 @@ defmodule BB.Ufactory.ControllerTest do
                Controller.handle_call({:send_command, frame}, {self(), make_ref()}, state)
 
       assert {:ok, data} = recv_all(cmd_server, 200)
-      assert data == frame
+      assert data == Protocol.cmd_gripper_position(0, 420)
       assert new_state.txn_id == 1
     end
 
@@ -1919,7 +2012,7 @@ defmodule BB.Ufactory.ControllerTest do
         end)
 
       assert {:reply, {:ok, {0x0F, 0x00, <<0x00>>}, _rest}, new_state} =
-               Controller.handle_call({:send_and_recv, frame}, {self(), make_ref()}, state)
+               command_exchange({:send_and_recv, frame}, state)
 
       Task.await(task, 2_000)
       assert new_state.txn_id == 1
@@ -1937,11 +2030,7 @@ defmodule BB.Ufactory.ControllerTest do
         end)
 
       assert {:reply, {:ok, {0x0F, 0x00, _params}, _rest}, _new_state} =
-               Controller.handle_call(
-                 {:send_and_recv, frame, 10_000},
-                 {self(), make_ref()},
-                 state
-               )
+               command_exchange({:send_and_recv, frame, 10_000}, state)
 
       Task.await(task, 2_000)
     end
@@ -2037,11 +2126,20 @@ defmodule BB.Ufactory.ControllerTest do
       assert binary_part(received, 0, byte_size(expected)) == expected
     end
 
-    test "sends cmd_set_fence_on when fence_on is true" do
-      received = init_for_config_test(fence_on: true)
+    test "verifies configured limits before enabling the fence" do
+      opts = [fence_on: true, tcp_boundary: {-400, 400, -400, 400, 0, 800}]
 
-      expected = Protocol.cmd_set_fence_on(0, true)
-      assert binary_part(received, 0, byte_size(expected)) == expected
+      prefix =
+        Protocol.cmd_set_tcp_boundary(0, -400, 400, -400, 400, 0, 800) <>
+          Protocol.build_frame(1, 0x35, <<>>)
+
+      assert init_for_config_test(opts) == prefix <> Protocol.cmd_set_fence_on(2, true)
+
+      assert {:stop, %CommandFailed{reason: :readback_mismatch}, ^prefix} =
+               init_for_config_test(opts, {-400, 400, -400, 400, 0, 700})
+
+      assert {:stop, %CommandFailed{reason: :invalid_limits}, <<>>} =
+               init_for_config_test(fence_on: true)
     end
 
     test "sends cmd_set_reduced_mode last, after speed limits, when reduced_mode is true" do
